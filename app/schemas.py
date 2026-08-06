@@ -93,12 +93,21 @@ class DepositRequest(BaseModel):
     # the contract's self-explaining, per-item rejection instead of a
     # generic 422 validation error -- same reasoning as `EventIn.kind` above.
     knowledge: list[dict[str, Any]] = Field(default_factory=list)
+    # Mirrored ADRs/docs (contracts-v1.md §5): {path, kind, title, content}.
+    # Kept as untyped dicts, same reasoning as `knowledge` above.
+    documents: list[dict[str, Any]] = Field(default_factory=list)
+    # Optional project registry write, applied atomically with the deposit
+    # (contracts-v1.md §5). Kept as an untyped dict (not a pydantic model)
+    # so unknown keys / bad status can produce the contract's self-explaining
+    # rejection instead of a generic 422 -- same reasoning as `knowledge`.
+    project_update: dict[str, Any] | None = None
 
 
 class DepositCounts(BaseModel):
     events: int
     handoff: bool
     knowledge: int
+    documents: int
 
 
 class DepositProjectInfo(BaseModel):
@@ -117,6 +126,16 @@ class KnowledgeAckItem(BaseModel):
     title: str
 
 
+class DocumentAckItem(BaseModel):
+    """Per-item documents[] acknowledgment detail (contracts-v1.md §5),
+    consistent with the `knowledge_ack` replay pattern.
+    """
+
+    path: str
+    version: int
+    id: str
+
+
 class DepositResponse(BaseModel):
     deposit_id: str
     received_at: datetime
@@ -124,6 +143,7 @@ class DepositResponse(BaseModel):
     counts: DepositCounts
     project: DepositProjectInfo
     knowledge: list[KnowledgeAckItem] = Field(default_factory=list)
+    documents: list[DocumentAckItem] = Field(default_factory=list)
 
 
 # --- Library (contracts-v1.md §3, §7) ---
@@ -173,11 +193,14 @@ class LibraryEntryResponse(BaseModel):
 
 
 class SearchResultItem(BaseModel):
-    type: Literal["library", "handoff", "event"]
+    type: Literal["library", "handoff", "event", "decision", "document"]
     id: str
     snippet: str
     project: str | None
     rank: float
+    # Set only for type 'decision'/'document' (mirrored ADR/doc results).
+    path: str | None = None
+    version: int | None = None
 
 
 class SearchResponse(BaseModel):
@@ -279,3 +302,78 @@ class ProposalDecisionResponse(BaseModel):
     id: str
     decision: str
     decided_at: datetime
+
+
+# --- Projects (contracts-v1.md §5, §7) ---
+
+
+class ProjectMachineInfo(BaseModel):
+    """A machine that has deposited on a project -- server-derived, never
+    written directly (contracts-v1.md §5: "`machines` (server-derived from
+    deposits)").
+    """
+
+    id: str
+    name: str
+    last_deposit_at: datetime
+
+
+class ProjectHandoffOut(BaseModel):
+    id: str
+    stands: str
+    in_flight: str
+    blocked: str
+    next_steps: str
+    notes: str | None
+    received_at: datetime
+    deposit_id: str
+
+
+class ProjectDocumentCounts(BaseModel):
+    adr: int
+    doc: int
+
+
+class ProjectCounts(BaseModel):
+    active_library_entries: int
+    mirrored_documents: ProjectDocumentCounts
+    total_deposits: int
+
+
+class ProjectDetailResponse(BaseModel):
+    name: str
+    description: str | None
+    status: str
+    created_at: datetime
+    machines: list[ProjectMachineInfo]
+    overlay_version: int | None
+    latest_handoff: ProjectHandoffOut | None
+    counts: ProjectCounts
+
+
+class ProjectListItem(BaseModel):
+    name: str
+    status: str
+    description: str | None
+    created_at: datetime
+    # Server-derived "activity" signal used to order the list (contracts-v1.md
+    # §7 lists GET /v1/projects/{name} and .../handoffs; this list endpoint
+    # itself is a surface addition beyond the literal spec -- see
+    # app/routers/projects.py module docstring).
+    latest_deposit_at: datetime | None
+
+
+class ProjectListResponse(BaseModel):
+    results: list[ProjectListItem]
+    next_cursor: str | None
+
+
+class ProjectPatchResponse(BaseModel):
+    name: str
+    description: str | None
+    status: str
+
+
+class HandoffListResponse(BaseModel):
+    results: list[ProjectHandoffOut]
+    next_cursor: str | None

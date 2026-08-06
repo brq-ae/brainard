@@ -1,9 +1,14 @@
 """Checkpoint deposit flow -- POST /v1/deposits (contracts-v1.md §2)."""
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
-from app.models import Deposit, Event, Flag, Handoff, KnowledgeEntry, Machine, OwnerToken, Project
+from app.db import AsyncSessionLocal
+from app.models import Deposit, Event, Flag, Handoff, KnowledgeEntry, Machine, MirroredDocument, OwnerToken, Project
+from app.routers import deposits as deposits_module
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
 
@@ -100,7 +105,7 @@ async def test_daily_deposit_with_events_happy_path(client, db_session):
     data = resp.json()
     assert data["deposit_id"] == body["deposit_id"]
     assert data["replayed"] is False
-    assert data["counts"] == {"events": 3, "handoff": False, "knowledge": 0}
+    assert data["counts"] == {"events": 3, "handoff": False, "knowledge": 0, "documents": 0}
     assert data["project"] == {"name": "brain", "stub_created": True}
 
     events = (await db_session.scalars(select(Event).where(Event.deposit_id == body["deposit_id"]))).all()
@@ -124,7 +129,7 @@ async def test_session_end_with_handoff(client, db_session):
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["counts"] == {"events": 1, "handoff": True, "knowledge": 0}
+    assert data["counts"] == {"events": 1, "handoff": True, "knowledge": 0, "documents": 0}
 
     handoff = await db_session.scalar(select(Handoff).where(Handoff.deposit_id == body["deposit_id"]))
     assert handoff is not None
@@ -142,7 +147,7 @@ async def test_session_end_with_no_handoff_waiver(client, db_session):
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["counts"] == {"events": 0, "handoff": False, "knowledge": 0}
+    assert data["counts"] == {"events": 0, "handoff": False, "knowledge": 0, "documents": 0}
 
     deposit = await db_session.get(Deposit, body["deposit_id"])
     assert deposit.no_handoff == "trivial session, nothing to report"
@@ -300,7 +305,7 @@ async def test_idempotent_replay_returns_original_ack_and_stores_nothing_new(cli
     assert ack2["replayed"] is True
     assert ack2["deposit_id"] == deposit_id
     assert ack2["received_at"] == ack1["received_at"]
-    assert ack2["counts"] == ack1["counts"] == {"events": 2, "handoff": False, "knowledge": 0}
+    assert ack2["counts"] == ack1["counts"] == {"events": 2, "handoff": False, "knowledge": 0, "documents": 0}
     assert ack2["project"] == ack1["project"]
 
     events = (await db_session.scalars(select(Event).where(Event.deposit_id == deposit_id))).all()
@@ -355,11 +360,129 @@ async def test_replay_with_invalid_retry_body_still_returns_original_ack(client,
     assert ack2["replayed"] is True
     assert ack2["deposit_id"] == deposit_id
     assert ack2["received_at"] == ack1["received_at"]
-    assert ack2["counts"] == ack1["counts"] == {"events": 2, "handoff": False, "knowledge": 0}
+    assert ack2["counts"] == ack1["counts"] == {"events": 2, "handoff": False, "knowledge": 0, "documents": 0}
     assert ack2["project"] == ack1["project"]
 
     events = (await db_session.scalars(select(Event).where(Event.deposit_id == deposit_id))).all()
     assert len(events) == 2  # original rows only -- unchanged
+
+
+# --- insert-conflict retry (contracts-v1.md §2, §5): IntegrityError from a
+# concurrent *different* deposit colliding on something else (e.g. two
+# deposits computing the same mirrored-document version for the same
+# (project, path), see ix_mirrored_documents_project_path_version in
+# app/models.py) must retry in-server, bounded, and never surface a raw 500.
+# `_insert_deposit` is monkeypatched to raise IntegrityError deterministically
+# -- real concurrent-transaction timing is not something a single-process
+# test can reproduce reliably, and the retry loop in create_deposit doesn't
+# care *why* IntegrityError fired, only what it does in response.
+# ---
+
+
+async def test_insert_conflict_retries_and_succeeds_after_transient_collisions(client, db_session, monkeypatch):
+    headers = await _machine_headers(db_session)
+    real_insert = deposits_module._insert_deposit
+    calls = {"n": 0}
+
+    async def flaky_insert(db, body, principal):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise IntegrityError("simulated version collision", {}, Exception("simulated"))
+        return await real_insert(db, body, principal)
+
+    monkeypatch.setattr(deposits_module, "_insert_deposit", flaky_insert)
+
+    body = _deposit_body(
+        project="brain",
+        documents=[{"path": "docs/adr/flaky.md", "kind": "adr", "title": "Flaky ADR", "content": "content"}],
+    )
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["replayed"] is False
+    assert data["documents"] == [{"path": "docs/adr/flaky.md", "version": 1, "id": data["documents"][0]["id"]}]
+    assert calls["n"] == 3  # failed twice, succeeded on the third (bounded) attempt
+
+    deposits = (await db_session.scalars(select(Deposit).where(Deposit.deposit_id == body["deposit_id"]))).all()
+    assert len(deposits) == 1
+    docs = (
+        await db_session.scalars(select(MirroredDocument).where(MirroredDocument.deposit_id == body["deposit_id"]))
+    ).all()
+    assert len(docs) == 1
+
+
+async def test_insert_conflict_exhausts_retries_returns_enveloped_503(client, db_session, monkeypatch):
+    calls = {"n": 0}
+    headers = await _machine_headers(db_session)
+
+    async def always_flaky_insert(db, body, principal):
+        calls["n"] += 1
+        raise IntegrityError("simulated persistent collision", {}, Exception("simulated"))
+
+    monkeypatch.setattr(deposits_module, "_insert_deposit", always_flaky_insert)
+
+    body = _deposit_body(project="brain")
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+
+    assert resp.status_code == 503
+    error = resp.json()["error"]
+    assert error["code"] == "deposit_conflict_retry"
+    assert "resend the same deposit_id unchanged" in error["detail"]
+    assert calls["n"] == deposits_module.MAX_INSERT_ATTEMPTS == 3
+
+    # atomicity preserved through exhausted retries: nothing stored
+    assert await db_session.get(Deposit, body["deposit_id"]) is None
+
+
+async def test_insert_conflict_with_existing_deposit_id_returns_replay_not_retry(client, db_session, monkeypatch):
+    """The pre-existing (phase 2) race path must be untouched by the new
+    retry loop: if the IntegrityError turns out to be a concurrent identical
+    retry (same deposit_id) that committed first, the very first attempt
+    returns the replay immediately -- it never retries the insert.
+    """
+    headers = await _machine_headers(db_session)
+    deposit_id = str(ULID())
+
+    db_session.add(Project(name="race-proj", status="active", created_at=datetime.now(UTC)))
+    await db_session.commit()
+
+    calls = {"n": 0}
+
+    async def racing_insert(db, body, principal):
+        calls["n"] += 1
+        # Deterministic stand-in for real concurrency: a fully independent
+        # session commits the "winning" deposit under the same deposit_id
+        # before this attempt raises its own collision.
+        async with AsyncSessionLocal() as other:
+            other.add(
+                Deposit(
+                    deposit_id=deposit_id,
+                    machine_id=principal.machine.id,
+                    tool="winning-concurrent-retry",
+                    session=body.session,
+                    project=body.project,
+                    reason=body.reason,
+                    client_ts=body.client_ts,
+                    received_at=datetime.now(UTC),
+                    stub_created=False,
+                )
+            )
+            await other.commit()
+        raise IntegrityError("simulated pk collision", {}, Exception("simulated"))
+
+    monkeypatch.setattr(deposits_module, "_insert_deposit", racing_insert)
+
+    body = _deposit_body(deposit_id=deposit_id, project="race-proj")
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["replayed"] is True
+    assert calls["n"] == 1  # short-circuited on the first attempt -- no retry
+
+    winning = await db_session.get(Deposit, deposit_id)
+    assert winning.tool == "winning-concurrent-retry"
 
 
 # --- knowledge[] (contracts-v1.md §3) ---

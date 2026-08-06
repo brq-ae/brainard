@@ -1,20 +1,21 @@
 """Full-text search -- GET /v1/search (contracts-v1.md §6 note, §7).
 
 Machine OR owner token. FTS via `websearch_to_tsquery` against the generated
-`search_vector` columns added in migration 0003.
+`search_vector` columns added in migrations 0003 and 0005.
 """
 
 import base64
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, literal, select, tuple_, union_all
+from sqlalchemy import Integer, Text, cast, func, literal, null, select, tuple_, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import Principal, require_machine_or_owner
 from app.db import get_db
+from app.documents import latest_mirrored_document_ids
 from app.errors import ApiError
-from app.models import Event, Handoff, KnowledgeEntry
+from app.models import Event, Handoff, KnowledgeEntry, MirroredDocument
 from app.schemas import SearchResponse, SearchResultItem
 
 router = APIRouter(prefix="/v1/search", tags=["search"])
@@ -44,7 +45,7 @@ def _decode_cursor(cursor: str) -> tuple[float, str]:
 @router.get("", response_model=SearchResponse)
 async def search(
     q: str = Query(..., min_length=1),
-    scope: Literal["default", "journal", "all", "proposals"] = "default",
+    scope: Literal["default", "journal", "all", "proposals", "decisions"] = "default",
     include_history: bool = False,
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
@@ -53,19 +54,29 @@ async def search(
 ) -> SearchResponse:
     query_expr = func.websearch_to_tsquery("english", q)
 
+    # Every branch below carries the same six columns (type, id, snippet,
+    # project, rank, path, version) so they can be `union_all`'d; branches
+    # with no notion of path/version (library, handoff, event) fill those
+    # with a typed NULL.
+    no_path = cast(null(), Text).label("path")
+    no_version = cast(null(), Integer).label("version")
+
     lib_stmt = select(
         literal("library").label("type"),
         KnowledgeEntry.id.label("id"),
         KnowledgeEntry.title.label("snippet"),
         KnowledgeEntry.project.label("project"),
         func.ts_rank(KnowledgeEntry.search_vector, query_expr).label("rank"),
+        no_path,
+        no_version,
     ).where(KnowledgeEntry.search_vector.op("@@")(query_expr))
     if not include_history:
         # Readers see `active` content by default; history on request
         # (contracts-v1.md Principles).
         lib_stmt = lib_stmt.where(KnowledgeEntry.status == "active")
     # Doctrine proposals (§4) are inert library entries: never served by
-    # default/journal/all, only surfaced via the explicit 'proposals' scope.
+    # default/journal/all/decisions, only surfaced via the explicit
+    # 'proposals' scope.
     if scope == "proposals":
         lib_stmt = lib_stmt.where(KnowledgeEntry.is_doctrine_proposal.is_(True))
     else:
@@ -77,6 +88,8 @@ async def search(
         func.left(Handoff.stands, SNIPPET_TRUNCATE_CHARS).label("snippet"),
         Handoff.project.label("project"),
         func.ts_rank(Handoff.search_vector, query_expr).label("rank"),
+        no_path,
+        no_version,
     ).where(Handoff.search_vector.op("@@")(query_expr))
 
     event_stmt = select(
@@ -85,23 +98,61 @@ async def search(
         Event.summary.label("snippet"),
         Event.project.label("project"),
         func.ts_rank(Event.search_vector, query_expr).label("rank"),
+        no_path,
+        no_version,
     ).where(Event.search_vector.op("@@")(query_expr))
 
-    # Search default scope: library + handoffs (contracts-v1.md §7). Mirrored
-    # decisions join the default scope in phase 5 (not implemented yet);
-    # 'journal' opts the journal (events) in; 'all' is everything -- for now
-    # identical to 'journal' since decisions don't exist yet. 'proposals' is
-    # its own lane: only doctrine-proposal library entries, never mixed with
-    # handoffs/events.
+    # Mirrored decisions/docs (contracts-v1.md §5, §7): only the latest
+    # version per (project, path) is ever searchable -- superseded versions
+    # stay in the table (supersede-never-erase) but drop out of search.
+    # Snippet is the title, per the contract's "results carry type
+    # 'decision'|'document' with project+path+version".
+    latest_doc_ids = latest_mirrored_document_ids()
+    decision_stmt = select(
+        literal("decision").label("type"),
+        MirroredDocument.id.label("id"),
+        MirroredDocument.title.label("snippet"),
+        MirroredDocument.project.label("project"),
+        func.ts_rank(MirroredDocument.search_vector, query_expr).label("rank"),
+        MirroredDocument.path.label("path"),
+        MirroredDocument.version.label("version"),
+    ).where(
+        MirroredDocument.search_vector.op("@@")(query_expr),
+        MirroredDocument.kind == "adr",
+        MirroredDocument.id.in_(latest_doc_ids),
+    )
+    document_stmt = select(
+        literal("document").label("type"),
+        MirroredDocument.id.label("id"),
+        MirroredDocument.title.label("snippet"),
+        MirroredDocument.project.label("project"),
+        func.ts_rank(MirroredDocument.search_vector, query_expr).label("rank"),
+        MirroredDocument.path.label("path"),
+        MirroredDocument.version.label("version"),
+    ).where(
+        MirroredDocument.search_vector.op("@@")(query_expr),
+        MirroredDocument.kind == "doc",
+        MirroredDocument.id.in_(latest_doc_ids),
+    )
+
+    # Scopes (contracts-v1.md §7): 'default' = library + decisions (latest
+    # ADR mirrors) + handoffs. 'journal' adds the events journal on top of
+    # default. 'all' is everything: default + journal + doc-kind mirrors.
+    # 'proposals' and 'decisions' are their own isolated lanes -- never mixed
+    # with the others.
     if scope == "proposals":
         statements = [lib_stmt]
+    elif scope == "decisions":
+        statements = [decision_stmt]
     else:
-        statements = [lib_stmt, handoff_stmt]
+        statements = [lib_stmt, handoff_stmt, decision_stmt]
         if scope in ("journal", "all"):
             statements.append(event_stmt)
+        if scope == "all":
+            statements.append(document_stmt)
 
     subq = union_all(*statements).subquery("search_results")
-    outer = select(subq.c.type, subq.c.id, subq.c.snippet, subq.c.project, subq.c.rank)
+    outer = select(subq.c.type, subq.c.id, subq.c.snippet, subq.c.project, subq.c.rank, subq.c.path, subq.c.version)
 
     if cursor is not None:
         cursor_rank, cursor_id = _decode_cursor(cursor)
@@ -117,7 +168,9 @@ async def search(
     page_rows = rows[:limit]
 
     results = [
-        SearchResultItem(type=r.type, id=r.id, snippet=r.snippet, project=r.project, rank=float(r.rank))
+        SearchResultItem(
+            type=r.type, id=r.id, snippet=r.snippet, project=r.project, rank=float(r.rank), path=r.path, version=r.version
+        )
         for r in page_rows
     ]
 

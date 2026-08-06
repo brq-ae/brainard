@@ -99,15 +99,22 @@ def _operating_instructions_markdown() -> str:
         "never double-applied, and a retry with a materially different body is still ignored in favor of "
         "the original.\n\n"
         "**Search**: `GET /v1/search?q=&scope=` (machine or owner token). Scopes: `default` (library + "
-        "handoffs), `journal` (adds the events journal), `all` (library + handoffs + events), `proposals` "
-        "(doctrine-proposal library entries only, for reviewing what's pending). `include_history=true` "
-        "surfaces superseded/retired entries too (readers see `active` content by default). Results "
-        "paginate via `cursor`/`next_cursor`. Fetch a full entry (with its supersession chain and "
-        "duplicate hints) via `GET /v1/library/{id}`.\n\n"
+        "decisions + handoffs), `journal` (adds the events journal on top of default), `all` (default + "
+        "journal + doc-kind mirrors -- everything), `decisions` (mirrored ADRs only, latest version per "
+        "path), `proposals` (doctrine-proposal library entries only, for reviewing what's pending). "
+        "`include_history=true` surfaces superseded/retired library entries too (readers see `active` "
+        "content by default; mirrored-document search always shows only the latest version per path -- "
+        "prior versions stay stored, supersede-never-erase, but drop out of search). Results paginate via "
+        "`cursor`/`next_cursor`, and carry `type`: `library`, `handoff`, `event`, `decision`, or "
+        "`document` (the latter two also carry `path`/`version`). Fetch a full library entry (with its "
+        "supersession chain and duplicate hints) via `GET /v1/library/{id}`.\n\n"
         "**Filing a lesson/howto/reference**: add to a deposit's `knowledge[]` compartment: "
         '`{"title", "namespace": "lessons"|"howto"|"reference", "body", "tags"?, "project"?, '
         '"supersedes"?}`. To retire a wrong/obsolete entry with no replacement (never to reopen a '
-        'terminal decision): `{"retire": "<entry id>", "reason": "<why>"}`.\n\n'
+        'terminal decision): `{"retire": "<entry id>", "reason": "<why>"}`. Supersession never crosses '
+        "the proposal boundary in either direction -- an ordinary entry can't supersede a proposal, and a "
+        "proposal can't supersede an ordinary entry; proposals are closed via the owner's approve/reject, "
+        "not by supersession.\n\n"
         "**Filing a doctrine proposal**: the same `knowledge[]` shape as a lesson, plus "
         '`"doctrine_proposal": true`. Proposals are stored as ordinary library entries but are never '
         "served at bootstrap and never appear in default/journal/all search -- fetch them explicitly with "
@@ -115,6 +122,22 @@ def _operating_instructions_markdown() -> str:
         "/v1/proposals/{id}/approve` or `/reject`; approval only *records* the decision, it does not "
         "change doctrine by itself -- promotion into doctrine is the owner's own separate, deliberate "
         "`POST /v1/doctrine/global` or `/v1/doctrine/overlays/{project}`.\n\n"
+        "**Mirroring an ADR or project doc**: doctrine mandates ADR written -> next deposit carries it. "
+        'Add to a deposit\'s `documents[]` compartment: `{"path": "<repo-relative path, e.g. '
+        'docs/adr/0003-choose-db.md>", "kind": "adr"|"doc", "title", "content"}` (markdown, capped at 1 '
+        "MB). The project's own git repo stays canonical; the Brain just makes every decision searchable "
+        "fleet-wide. Supersede-never-erase applies: redepositing the same `path` never overwrites, it "
+        "creates the next `version` in that path's history (the ack lists `{path, version, id}` per "
+        "item) -- `GET /v1/search?scope=decisions` (or `scope=all` for doc-kind mirrors too) always "
+        "surfaces only the latest version per path.\n\n"
+        "**Updating the project registry**: a deposit's envelope may carry an optional "
+        '`"project_update": {"description"?: "<string>", "status"?: "active"|"paused"|"done"}`, applied '
+        "atomically with the rest of the deposit to the deposit's own `project`. Unknown keys or an "
+        "invalid `status` reject the whole deposit. The owner can also update a project directly and "
+        "deliberately via `PATCH /v1/projects/{name}` (owner token) with the same `{description?, "
+        "status?}` shape, independent of any deposit. Read a project's full registry facts (including "
+        "current `description`/`status`, which machines have deposited on it, latest handoff, and "
+        "counts) via `GET /v1/projects/{name}`; its handoff chain via `GET /v1/projects/{name}/handoffs`.\n\n"
         "**Recovery from a rejected deposit**: every rejection is a `4xx` with body "
         '`{"error": {"code", "detail", ...}}`; validation failures add a `failing_events`/`failing_items` '
         "list naming exactly what to fix. Fix the listed field(s) and resend the *same* `deposit_id` -- "
@@ -233,8 +256,11 @@ def _render_markdown(data: dict) -> str:
     lines.append("## 2. Project context")
     lines.append("")
     lines.append(f"- **name**: {proj['name']}")
-    lines.append(f"- **status**: {proj['status']}")
-    lines.append(f"- **description**: {proj['description'] or '_(none)_'}")
+    lines.append(
+        f"- **status**: {proj['status']} _(writable -- via this deposit's `project_update`, or the "
+        "owner's `PATCH /v1/projects/{name}`)_"
+    )
+    lines.append(f"- **description**: {proj['description'] or '_(none)_'} _(writable, same as `status`)_")
     if proj["is_new"]:
         lines.append("")
         lines.append("_New project -- auto-stubbed on this bootstrap fetch. No history exists for it yet._")

@@ -69,6 +69,24 @@ async def _deposit_entry(client, headers, **entry_overrides) -> str:
     return resp.json()["knowledge"][0]["id"]
 
 
+def _document(**overrides) -> dict:
+    item = {
+        "path": "docs/adr/0003-choose-db.md",
+        "kind": "adr",
+        "title": "Choose the database",
+        "content": "We chose Postgres for its full-text search support.",
+    }
+    item.update(overrides)
+    return item
+
+
+async def _deposit_document(client, headers, **overrides) -> dict:
+    body = _deposit_body(project="brain", documents=[_document(**overrides)])
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+    assert resp.status_code == 200, resp.json()
+    return resp.json()["documents"][0]
+
+
 async def test_search_finds_library_entry_by_title_and_body_terms(client, db_session):
     headers = await _machine_headers(db_session)
     entry_id = await _deposit_entry(
@@ -194,3 +212,91 @@ async def test_search_accepts_machine_and_owner_tokens_rejects_no_auth(client, d
     no_auth_resp = await client.get("/v1/search", params={"q": "Tokenscope"})
     assert no_auth_resp.status_code == 401
     assert no_auth_resp.json()["error"]["code"] == "missing_token"
+
+
+# --- decisions scope: mirrored ADRs, latest version per path only (contracts-v1.md §5, §7) ---
+
+
+async def test_decisions_scope_returns_latest_adr_version_only(client, db_session):
+    headers = await _machine_headers(db_session)
+    await _deposit_document(
+        client, headers, path="docs/adr/0099-quazorbit.md", title="Quazorbit v1", content="original decision text"
+    )
+    v2 = await _deposit_document(
+        client, headers, path="docs/adr/0099-quazorbit.md", title="Quazorbit v2", content="revised decision text"
+    )
+
+    resp = await client.get("/v1/search", params={"q": "Quazorbit", "scope": "decisions"}, headers=headers)
+    assert resp.status_code == 200
+    results = resp.json()["results"]
+
+    ids = {r["id"] for r in results}
+    assert v2["id"] in ids
+    # the superseded (older) path version is absent from search entirely
+    assert len(results) == 1
+
+    hit = results[0]
+    assert hit["type"] == "decision"
+    assert hit["snippet"] == "Quazorbit v2"  # snippet is the title
+    assert hit["path"] == "docs/adr/0099-quazorbit.md"
+    assert hit["version"] == 2
+    assert hit["project"] == "brain"
+
+
+async def test_decisions_scope_excludes_doc_kind_mirrors(client, db_session):
+    headers = await _machine_headers(db_session)
+    await _deposit_document(
+        client, headers, path="docs/README.md", kind="doc", title="Zylofoo Doc", content="doc body text"
+    )
+
+    resp = await client.get("/v1/search", params={"q": "Zylofoo", "scope": "decisions"}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["results"] == []
+
+
+# --- default scope completeness: library + decisions + handoffs, no events ---
+
+
+async def test_default_scope_includes_decisions_excludes_events(client, db_session):
+    headers = await _machine_headers(db_session)
+    await _deposit_document(
+        client, headers, path="docs/adr/0077-wibblefract.md", title="Wibblefract Decision", content="decision body"
+    )
+    body = _deposit_body(
+        project="brain",
+        events=[_event(seq=1, kind="note", summary="Wibblefract mentioned in passing during a journal note")],
+    )
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+    assert resp.status_code == 200
+
+    default_resp = await client.get("/v1/search", params={"q": "Wibblefract"}, headers=headers)
+    assert default_resp.status_code == 200
+    results = default_resp.json()["results"]
+    types = {r["type"] for r in results}
+    assert "decision" in types
+    assert "event" not in types
+
+
+async def test_all_scope_includes_doc_kind_and_events(client, db_session):
+    headers = await _machine_headers(db_session)
+    await _deposit_document(
+        client, headers, path="docs/README.md", kind="doc", title="Skreevaltix README", content="doc content"
+    )
+    body = _deposit_body(
+        project="brain",
+        events=[_event(seq=1, kind="note", summary="Skreevaltix appeared in the journal too")],
+    )
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+    assert resp.status_code == 200
+
+    all_resp = await client.get("/v1/search", params={"q": "Skreevaltix", "scope": "all"}, headers=headers)
+    assert all_resp.status_code == 200
+    types = {r["type"] for r in all_resp.json()["results"]}
+    assert "document" in types
+    assert "event" in types
+
+    # but doc-kind mirrors are absent from the default scope
+    default_resp = await client.get("/v1/search", params={"q": "Skreevaltix"}, headers=headers)
+    default_types = {r["type"] for r in default_resp.json()["results"]}
+    assert "document" not in default_types
+    assert "event" not in default_types

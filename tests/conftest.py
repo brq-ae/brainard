@@ -22,6 +22,7 @@ from app.models import (
     Handoff,
     KnowledgeEntry,
     Machine,
+    MirroredDocument,
     OwnerToken,
     Project,
 )
@@ -61,14 +62,15 @@ async def _prepare_database():
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_tables():
     """Every test starts from an empty database. Deletion order respects
-    foreign keys: flags before the entries they reference, entries/journal/
-    handoff rows before their deposit, deposits before machines/projects,
-    doctrine_versions/bootstrap_fetches before the machines/projects they
-    reference.
+    foreign keys: flags before the entries they reference, entries/mirrored
+    documents/journal/handoff rows before their deposit, deposits before
+    machines/projects, doctrine_versions/bootstrap_fetches before the
+    machines/projects they reference.
     """
     async with AsyncSessionLocal() as session:
         await session.execute(Flag.__table__.delete())
         await session.execute(KnowledgeEntry.__table__.delete())
+        await session.execute(MirroredDocument.__table__.delete())
         await session.execute(Event.__table__.delete())
         await session.execute(Handoff.__table__.delete())
         await session.execute(Deposit.__table__.delete())

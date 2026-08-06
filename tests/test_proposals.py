@@ -275,6 +275,59 @@ async def test_proposal_cannot_supersede_library_entry_rejected_atomically(clien
     assert (await db_session.scalars(select(Flag).where(Flag.entry_id == library_id))).all() == []
 
 
+async def test_non_proposal_cannot_supersede_proposal_rejected_atomically(client, db_session):
+    """The carried-over phase 4 delta-review fix: supersession must not
+    cross the proposal boundary in *either* direction. The proposal->library
+    direction is covered above (test_proposal_cannot_supersede_library_...);
+    this is the mirror -- an ordinary, non-proposal knowledge[] item must
+    never name a proposal in its own `supersedes[]`.
+    """
+    headers = await _machine_headers(db_session)
+    proposal_id = await _deposit_proposal(client, headers, title="A pending proposal, still under review")
+
+    bad_deposit_id = str(ULID())
+    body = _deposit_body(
+        deposit_id=bad_deposit_id,
+        knowledge=[_lesson_knowledge(title="An ordinary entry trying to close the proposal", supersedes=[proposal_id])],
+    )
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "library_cannot_supersede_proposal"
+    assert proposal_id in error["detail"]
+    assert "proposals are closed via the owner's approve/reject, not by supersession" in error["detail"]
+    assert error["failing_items"] == [
+        {
+            "index": 0,
+            "supersedes": [proposal_id],
+            "recovery": "proposals are closed via the owner's approve/reject, not by supersession",
+        }
+    ]
+
+    from sqlalchemy import select
+
+    from app.models import Deposit, Flag, KnowledgeEntry
+
+    # whole deposit rejected atomically
+    assert await db_session.get(Deposit, bad_deposit_id) is None
+    assert (
+        await db_session.scalars(select(KnowledgeEntry).where(KnowledgeEntry.deposit_id == bad_deposit_id))
+    ).all() == []
+
+    # the proposal itself is untouched: still active, undecided, and still
+    # listed in GET /v1/proposals
+    proposal = await db_session.get(KnowledgeEntry, proposal_id)
+    assert proposal.status == "active"
+    assert proposal.proposal_decision is None
+    assert (await db_session.scalars(select(Flag).where(Flag.related_entry_id == proposal_id))).all() == []
+
+    owner_headers = await _owner_headers(db_session)
+    list_resp = await client.get("/v1/proposals", headers=owner_headers)
+    assert list_resp.status_code == 200
+    assert proposal_id in {p["id"] for p in list_resp.json()}
+
+
 async def test_proposal_can_supersede_another_proposal(client, db_session):
     headers = await _machine_headers(db_session)
     old_proposal_id = await _deposit_proposal(client, headers, title="Old proposal draft")

@@ -18,12 +18,14 @@ from ulid import ULID
 from app.auth import Principal, require_machine
 from app.db import get_db
 from app.errors import ApiError
-from app.models import Deposit, Event, Flag, Handoff, KnowledgeEntry, Project
+from app.models import Deposit, Event, Flag, Handoff, KnowledgeEntry, MirroredDocument, Project
+from app.projects import apply_project_update, validate_project_update
 from app.schemas import (
     DepositCounts,
     DepositProjectInfo,
     DepositRequest,
     DepositResponse,
+    DocumentAckItem,
     EventIn,
     KnowledgeAckItem,
 )
@@ -136,6 +138,7 @@ _RECOVERY_INVALID_KNOWLEDGE_ITEM = "fix the listed field(s), resend"
 _RECOVERY_BAD_SUPERSEDES = "fix or drop the supersedes reference, resend"
 _RECOVERY_RETIRE_TARGET = "fix or drop the retire action, resend"
 _RECOVERY_PROPOSAL_SUPERSEDES = "file the proposal without supersedes, or supersede only other proposals"
+_RECOVERY_LIBRARY_SUPERSEDES_PROPOSAL = "proposals are closed via the owner's approve/reject, not by supersession"
 
 
 def _is_retire_item(item: Any) -> bool:
@@ -280,10 +283,16 @@ async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str,
 
     bad_supersedes: list[dict[str, Any]] = []
     bad_retires: list[dict[str, Any]] = []
-    # Proposals must stay inert against the live library (contracts-v1.md
-    # §4): a proposal item may supersede another proposal (updating one's own
-    # proposal -- both inert), but never a real, non-proposal library entry.
+    # Proposals must stay inert against the live library, in *both*
+    # directions (contracts-v1.md §4): a proposal item may supersede another
+    # proposal (updating one's own proposal -- both inert), but never a real,
+    # non-proposal library entry (`bad_proposal_supersedes`). The carried-over
+    # phase 4 delta review also requires the mirror rejection: an ordinary,
+    # non-proposal item may never name a proposal in its own `supersedes[]`
+    # either (`bad_library_supersedes_proposal`) -- proposals are closed by
+    # the owner's approve/reject, never by another session's supersession.
     bad_proposal_supersedes: list[dict[str, Any]] = []
+    bad_library_supersedes_proposal: list[dict[str, Any]] = []
 
     for i, item in enumerate(items):
         if _is_retire_item(item):
@@ -318,6 +327,16 @@ async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str,
                     bad_proposal_supersedes.append(
                         {"index": i, "supersedes": non_proposal_targets, "recovery": _RECOVERY_PROPOSAL_SUPERSEDES}
                     )
+            else:
+                proposal_targets = [s for s in supersedes if s in existing and existing[s].is_doctrine_proposal]
+                if proposal_targets:
+                    bad_library_supersedes_proposal.append(
+                        {
+                            "index": i,
+                            "supersedes": proposal_targets,
+                            "recovery": _RECOVERY_LIBRARY_SUPERSEDES_PROPOSAL,
+                        }
+                    )
 
     if bad_supersedes:
         raise ApiError(
@@ -336,6 +355,16 @@ async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str,
             f"id(s) {all_ids} in `supersedes`; proposals must stay inert against the live library. "
             f"Recovery: {_RECOVERY_PROPOSAL_SUPERSEDES}.",
             extra={"failing_items": bad_proposal_supersedes},
+        )
+    if bad_library_supersedes_proposal:
+        all_ids = sorted({s for item in bad_library_supersedes_proposal for s in item["supersedes"]})
+        raise ApiError(
+            422,
+            "library_cannot_supersede_proposal",
+            f"{len(bad_library_supersedes_proposal)} non-proposal knowledge[] item(s) name doctrine-proposal "
+            f"id(s) {all_ids} in `supersedes`; supersession never crosses the proposal boundary in either "
+            f"direction. Recovery: {_RECOVERY_LIBRARY_SUPERSEDES_PROPOSAL}.",
+            extra={"failing_items": bad_library_supersedes_proposal},
         )
     if bad_retires:
         raise ApiError(
@@ -546,6 +575,126 @@ async def _apply_knowledge(
     return ack
 
 
+# --- documents[] -- mirrored ADRs/docs (contracts-v1.md §5) ---
+
+VALID_DOCUMENT_KINDS = frozenset({"adr", "doc"})
+MAX_DOCUMENT_CONTENT_BYTES = 1024 * 1024  # 1 MB content cap, same as knowledge[] body
+
+_RECOVERY_INVALID_DOCUMENT_ITEM = "fix the listed field(s), resend"
+
+
+def _validate_documents_shape(items: list[Any]) -> None:
+    """Whole-deposit, self-explaining structural validation for documents[]
+    items -- no database-dependent checks are needed (unlike knowledge[]'s
+    supersedes/retire references): every mirrored document is a fresh,
+    self-contained version, never a reference to another one.
+    """
+    failing: list[dict[str, Any]] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            failing.append(
+                {"index": i, "reason": "item is not an object", "recovery": _RECOVERY_INVALID_DOCUMENT_ITEM}
+            )
+            continue
+
+        path = item.get("path")
+        kind = item.get("kind")
+        title = item.get("title")
+        content = item.get("content")
+
+        if not isinstance(path, str) or not path.strip():
+            failing.append(
+                {"index": i, "reason": "`path` must be a non-empty repo-relative string", "recovery": _RECOVERY_INVALID_DOCUMENT_ITEM}
+            )
+        if kind not in VALID_DOCUMENT_KINDS:
+            failing.append(
+                {
+                    "index": i,
+                    "reason": f"`kind` must be one of {sorted(VALID_DOCUMENT_KINDS)}, got {kind!r}",
+                    "recovery": _RECOVERY_INVALID_DOCUMENT_ITEM,
+                }
+            )
+        if not isinstance(title, str) or not title.strip():
+            failing.append(
+                {"index": i, "reason": "`title` must be non-empty", "recovery": _RECOVERY_INVALID_DOCUMENT_ITEM}
+            )
+        if not isinstance(content, str) or not content.strip():
+            failing.append(
+                {"index": i, "reason": "`content` must be non-empty", "recovery": _RECOVERY_INVALID_DOCUMENT_ITEM}
+            )
+        elif len(content.encode("utf-8")) > MAX_DOCUMENT_CONTENT_BYTES:
+            failing.append(
+                {
+                    "index": i,
+                    "reason": f"`content` exceeds the {MAX_DOCUMENT_CONTENT_BYTES} byte cap",
+                    "recovery": _RECOVERY_INVALID_DOCUMENT_ITEM,
+                }
+            )
+        # Unknown keys are rejected too -- strict validation, matching the
+        # contract's "no direct write endpoints, checkpoints only" posture:
+        # a typo'd field should never silently no-op.
+        unknown_keys = sorted(set(item) - {"path", "kind", "title", "content"})
+        if unknown_keys:
+            failing.append(
+                {
+                    "index": i,
+                    "reason": f"unknown field(s) {unknown_keys}; only path/kind/title/content are recognized",
+                    "recovery": _RECOVERY_INVALID_DOCUMENT_ITEM,
+                }
+            )
+
+    if failing:
+        raise ApiError(
+            422,
+            "invalid_document_entry",
+            f"{len(failing)} documents[] item(s) failed validation; the whole deposit was rejected. "
+            "See `failing_items` for the scripted recovery.",
+            extra={"failing_items": failing},
+        )
+
+
+async def _apply_documents(
+    db: AsyncSession, items: list[dict[str, Any]], deposit: Deposit, principal: Principal
+) -> list[DocumentAckItem]:
+    """Applies the documents[] compartment in list order, within the same
+    uncommitted transaction as the rest of the deposit. `version` is a
+    per-(project, path) sequence starting at 1: supersede-never-erase means a
+    redeposit of the same path is never an overwrite, it's the next version.
+    Flushing after each insert makes same-deposit duplicate paths resolve
+    deterministically and sequentially -- the max() query below sees the
+    prior item's flushed-but-uncommitted row within this same transaction.
+    """
+    ack: list[DocumentAckItem] = []
+
+    for item in items:
+        path = item["path"]
+        max_version = await db.scalar(
+            select(func.max(MirroredDocument.version)).where(
+                MirroredDocument.project == deposit.project, MirroredDocument.path == path
+            )
+        )
+        version = (max_version or 0) + 1
+
+        doc = MirroredDocument(
+            id=str(ULID()),
+            project=deposit.project,
+            path=path,
+            kind=item["kind"],
+            title=item["title"],
+            content=item["content"],
+            version=version,
+            deposit_id=deposit.deposit_id,
+            machine_id=principal.machine.id,
+            created_at=deposit.received_at,
+        )
+        db.add(doc)
+        await db.flush()  # so the next same-path item in this deposit sees this version
+
+        ack.append(DocumentAckItem(path=doc.path, version=doc.version, id=doc.id))
+
+    return ack
+
+
 async def _events_count(db: AsyncSession, deposit_id: str) -> int:
     return await db.scalar(select(func.count()).select_from(Event).where(Event.deposit_id == deposit_id))
 
@@ -559,13 +708,17 @@ async def _build_ack(db: AsyncSession, deposit: Deposit, *, replayed: bool) -> D
     events_count = await _events_count(db, deposit.deposit_id)
     handoff_stored = await _handoff_stored(db, deposit.deposit_id)
     knowledge_ack = [KnowledgeAckItem(**item) for item in (deposit.knowledge_ack or [])]
+    documents_ack = [DocumentAckItem(**item) for item in (deposit.documents_ack or [])]
     return DepositResponse(
         deposit_id=deposit.deposit_id,
         received_at=deposit.received_at,
         replayed=replayed,
-        counts=DepositCounts(events=events_count, handoff=handoff_stored, knowledge=len(knowledge_ack)),
+        counts=DepositCounts(
+            events=events_count, handoff=handoff_stored, knowledge=len(knowledge_ack), documents=len(documents_ack)
+        ),
         project=DepositProjectInfo(name=deposit.project, stub_created=deposit.stub_created),
         knowledge=knowledge_ack,
+        documents=documents_ack,
     )
 
 
@@ -588,6 +741,13 @@ async def _insert_deposit(db: AsyncSession, body: DepositRequest, principal: Pri
         # insert below could otherwise be attempted before the stub row
         # exists. Still one transaction -- commit happens once, at the end.
         await db.flush()
+
+    # Optional project registry write (contracts-v1.md §5), applied to the
+    # same row -- new stub or pre-existing -- atomically with the rest of
+    # this deposit. Already validated (shape + values) before `_insert_deposit`
+    # was called.
+    if body.project_update is not None:
+        apply_project_update(project, body.project_update)
 
     deposit = Deposit(
         deposit_id=body.deposit_id,
@@ -641,8 +801,26 @@ async def _insert_deposit(db: AsyncSession, body: DepositRequest, principal: Pri
     # docstring for why idempotent replay can't re-derive this from DB state.
     deposit.knowledge_ack = [item.model_dump() for item in knowledge_ack]
 
+    documents_ack = await _apply_documents(db, body.documents, deposit, principal)
+    deposit.documents_ack = [item.model_dump() for item in documents_ack]
+
     await db.commit()
     return deposit
+
+
+# Two distinct races surface as IntegrityError on the insert attempt below,
+# disambiguated by whether *this* deposit_id exists afterward:
+#   1. A concurrent retry of the *same* deposit_id committed first -- the
+#      pre-existing idempotent-replay path (unchanged): return its ack.
+#   2. A concurrent, *different* deposit collided on something else -- e.g.
+#      two deposits computing the same "next version" for the same mirrored
+#      document (project, path) via ix_mirrored_documents_project_path_version
+#      (see app/models.py's MirroredDocument and app/documents.py). This
+#      deposit_id was never written, so replay doesn't apply: bounded
+#      in-server retry instead, recomputing version numbers fresh each time.
+MAX_INSERT_ATTEMPTS = 3
+
+_RECOVERY_DEPOSIT_CONFLICT = "resend the same deposit_id unchanged; it will be accepted"
 
 
 @router.post("", response_model=DepositResponse, status_code=200)
@@ -663,19 +841,45 @@ async def create_deposit(
 
     _validate_knowledge_shape(body.knowledge)
     await _validate_knowledge_references(db, body.knowledge)
+    _validate_documents_shape(body.documents)
     _validate_events(body.events)
     _validate_handoff_or_waiver(body)
+    if body.project_update is not None:
+        validate_project_update(body.project_update)
 
-    try:
-        deposit = await _insert_deposit(db, body, principal)
-    except IntegrityError:
-        # Lost a race against a concurrent identical retry that committed
-        # first. Same outcome as a normal replay: nothing new stored, return
-        # the (now-existing) original acknowledgment.
-        await db.rollback()
-        existing = await db.get(Deposit, body.deposit_id)
-        if existing is not None:
-            return await _build_ack(db, existing, replayed=True)
-        raise
+    for attempt in range(1, MAX_INSERT_ATTEMPTS + 1):
+        try:
+            deposit = await _insert_deposit(db, body, principal)
+        except IntegrityError:
+            await db.rollback()
+            existing = await db.get(Deposit, body.deposit_id)
+            if existing is not None:
+                # Race #1 above: lost to a concurrent identical retry that
+                # committed first. Same outcome as a normal replay.
+                return await _build_ack(db, existing, replayed=True)
+            if attempt < MAX_INSERT_ATTEMPTS:
+                # Race #2 above: retry the whole insert, version numbers
+                # recomputed fresh against the post-rollback state.
+                # `rollback()` expires every object tracked by this session,
+                # including `principal.machine` (loaded earlier, on this
+                # same session, by the `require_machine` dependency) --
+                # refresh it explicitly so the retried `_insert_deposit`
+                # doesn't trigger an implicit lazy load, which AsyncSession
+                # doesn't support outside an already-awaited context.
+                await db.refresh(principal.machine)
+                continue
+            # Pathological contention: every attempt collided. Fail loudly
+            # but through the contract's envelope, never a raw 500 -- every
+            # rejection is self-explaining with a scripted recovery
+            # (Principles: "never lose knowledge at deposit time").
+            raise ApiError(
+                503,
+                "deposit_conflict_retry",
+                "A concurrent write collided with this deposit repeatedly and in-server retries did not "
+                f"resolve it; nothing was stored. Recovery: {_RECOVERY_DEPOSIT_CONFLICT}.",
+            ) from None
+        else:
+            return await _build_ack(db, deposit, replayed=False)
 
-    return await _build_ack(db, deposit, replayed=False)
+    # Unreachable: the loop above always returns or raises.
+    raise AssertionError("unreachable")

@@ -7,6 +7,8 @@ knowledge_entries/handoffs/events (see docs/spec/contracts-v1.md §3, §6, §7).
 Phase 4: doctrine_versions, bootstrap_fetches, doctrine-proposal columns on
 knowledge_entries, and `projects.description` (see docs/spec/contracts-v1.md
 §4, §6).
+Phase 5: mirrored_documents (ADR/doc mirror), `deposits.documents_ack`
+(see docs/spec/contracts-v1.md §5, §7).
 """
 
 from datetime import datetime
@@ -36,6 +38,11 @@ _HANDOFF_SEARCH_VECTOR_SQL = (
 _KNOWLEDGE_ENTRY_SEARCH_VECTOR_SQL = (
     "setweight(to_tsvector('english', coalesce(title, '')), 'A') || "
     "setweight(to_tsvector('english', coalesce(body, '')), 'B')"
+)
+
+_MIRRORED_DOCUMENT_SEARCH_VECTOR_SQL = (
+    "setweight(to_tsvector('english', coalesce(title, '')), 'A') || "
+    "setweight(to_tsvector('english', coalesce(content, '')), 'B')"
 )
 
 
@@ -109,6 +116,12 @@ class Deposit(Base):
     # deposit_id, so the ack detail cannot be re-derived from DB state alone
     # on idempotent replay -- it must be captured at acceptance time.
     knowledge_ack: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    # Per-item documents[] acknowledgment detail (path/version/id), stored
+    # verbatim for the same idempotent-replay reason as `knowledge_ack` above
+    # -- a redeposit of the same path is versioned relative to whatever
+    # existed at acceptance time, which can't be re-derived from current DB
+    # state alone once later deposits have added still-newer versions.
+    documents_ack: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
 
 
 class Event(Base):
@@ -279,6 +292,59 @@ class DoctrineVersion(Base):
             unique=True,
             postgresql_where=text("kind = 'overlay'"),
         ),
+    )
+
+
+# --- Phase 5: projects & mirrored documents (contracts-v1.md §5, §7) ---
+
+
+class MirroredDocument(Base):
+    """A mirrored copy of a project's own ADR or doc (contracts-v1.md §5):
+    "the project's own git repo stays canonical ... the Brain stores it
+    searchable under the project." Supersede-never-erase applies here too --
+    a redeposit of the same `path` never overwrites, it creates the *next*
+    `version` in a per-(project, path) sequence starting at 1. Latest-version
+    lookups (search scope=decisions, project doc counts) join back against
+    the max version per (project, path); see app/documents.py.
+    """
+
+    __tablename__ = "mirrored_documents"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    project: Mapped[str] = mapped_column(String(255), ForeignKey("projects.name"), nullable=False, index=True)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)  # 'adr' | 'doc'
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    deposit_id: Mapped[str] = mapped_column(String(26), ForeignKey("deposits.deposit_id"), nullable=False, index=True)
+    machine_id: Mapped[str] = mapped_column(String(26), ForeignKey("machines.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    search_vector: Mapped[str | None] = mapped_column(
+        TSVECTOR, Computed(_MIRRORED_DOCUMENT_SEARCH_VECTOR_SQL, persisted=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_mirrored_documents_project_path", "project", "path"),
+        # Guards against two concurrent deposits computing the same "next
+        # version" for the same (project, path) -- a genuine race the
+        # application-level max()-then-insert logic in
+        # app/routers/deposits.py cannot fully rule out on its own (same
+        # limitation as DoctrineVersion.version; see that model's docstring).
+        # A collision here raises IntegrityError, which app/routers/
+        # deposits.py's create_deposit handles with a bounded in-server
+        # retry (version numbers recomputed fresh each attempt); if every
+        # attempt still collides, the client gets a proper enveloped 503
+        # (`deposit_conflict_retry`) rather than a raw 500 -- never an
+        # unexplained failure, per the contract's self-explaining principle.
+        Index(
+            "ix_mirrored_documents_project_path_version",
+            "project",
+            "path",
+            "version",
+            unique=True,
+        ),
+        Index("ix_mirrored_documents_search_vector", "search_vector", postgresql_using="gin"),
     )
 
 

@@ -117,6 +117,44 @@ async def test_bootstrap_json_contains_all_five_sections(client, db_session):
     assert isinstance(data["lessons_digest"], list)
 
 
+# --- phase 5: operating instructions stay true to the real API (contracts-v1.md §6) ---
+
+
+async def test_bootstrap_instructions_mention_documents_compartment(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "documents[]" in text
+    assert '"path"' in text
+    assert '"kind"' in text
+    assert "adr" in text and "doc" in text
+    assert "version" in text
+
+
+async def test_bootstrap_instructions_mention_project_update(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "project_update" in text
+    assert "PATCH /v1/projects/{name}" in text
+    assert "GET /v1/projects/{name}" in text
+
+
+async def test_bootstrap_instructions_mention_completed_search_scopes(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "decisions" in text
+    assert "library + decisions + handoffs" in text or "decisions + handoffs" in text
+
+
+async def test_bootstrap_project_context_mentions_writable_fields(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain"}, headers=headers)
+    text = resp.text
+    assert "writable" in text.lower()
+
+
 async def test_bootstrap_markdown_contains_all_five_section_headings(client, db_session):
     headers, _ = await _machine_headers(db_session)
     resp = await client.get("/v1/bootstrap", params={"project": "brain"}, headers=headers)
