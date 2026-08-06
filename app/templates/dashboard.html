@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Dashboard</h1></div>
+<p class="subtitle">Fleet at a glance.</p>
+
+<div class="grid cols-3">
+  <div class="panel">
+    <div class="stat-label">Machines</div>
+    <div class="stat">{{ machine_count }}</div>
+    <div class="meta">{{ active_machine_count }} active</div>
+  </div>
+  <div class="panel">
+    <div class="stat-label">Pending proposals</div>
+    <div class="stat">{{ pending_proposal_count }}</div>
+    <div class="meta"><a href="/ui/admin/proposals">review in admin →</a></div>
+  </div>
+  <div class="panel">
+    <div class="stat-label">Projects shown</div>
+    <div class="stat">{{ project_rows|length }}</div>
+    <div class="meta"><a href="/ui/projects">view all →</a></div>
+  </div>
+</div>
+
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>Machine last-seen</h2>
+    {% if machine_highlights %}
+    <ul class="list">
+      {% for m in machine_highlights %}
+      <li class="row">
+        <span class="row-main"><a href="/ui/admin/machines">{{ m.name }}</a></span>
+        <span class="badge {{ m.status }}">{{ m.status }}</span>
+        <span class="meta">{{ m.last_seen|human_ts if m.last_seen else "never seen" }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No machines registered yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>Projects</h2>
+    {% if project_rows %}
+    <ul class="list">
+      {% for p, latest_deposit_at in project_rows %}
+      <li class="row">
+        <span class="row-main"><a href="/ui/projects/{{ p.name }}">{{ p.name }}</a></span>
+        <span class="badge {{ p.status }}">{{ p.status }}</span>
+        <span class="meta">{{ latest_deposit_at|human_ts if latest_deposit_at else "no activity" }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No projects yet.</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Recent deposits</h2>
+  {% if deposits %}
+  <ul class="list">
+    {% for d, machine_name, events_count, has_handoff in deposits %}
+    <li class="row">
+      <span class="row-main">
+        <a href="/ui/projects/{{ d.project }}">{{ d.project }}</a>
+        <span class="meta">
+          <span class="sep">·</span>{{ machine_name }}
+          <span class="sep">·</span>{{ d.reason }}
+        </span>
+      </span>
+      <span class="meta">
+        {{ events_count }} event{{ "s" if events_count != 1 else "" }}
+        <span class="sep">·</span>{{ (d.knowledge_ack or [])|length }} knowledge
+        <span class="sep">·</span>{{ (d.documents_ack or [])|length }} docs
+        {% if has_handoff %}<span class="sep">·</span>handoff{% endif %}
+      </span>
+      <span class="meta">{{ d.received_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No deposits yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Doctrine — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Doctrine</h1></div>
+<p class="subtitle">Global rulebook + per-project overlays. Writes happen via the API (owner token) -- this page is read-only.</p>
+
+{% if not global_row %}
+<p class="empty">No global doctrine has been posted yet.</p>
+{% else %}
+<div class="panel">
+  <h2>Global doctrine — v{{ global_row.version }}</h2>
+  <h3>Non-negotiable (immutable everywhere)</h3>
+  {% if non_negotiable %}
+  <ul class="list">
+    {% for r in non_negotiable %}
+    <li><strong>{{ r.id }}</strong> — {{ r.text }}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">None defined.</p>
+  {% endif %}
+
+  <h3>Default (project overlays may override)</h3>
+  {% if default_rules %}
+  <ul class="list">
+    {% for r in default_rules %}
+    <li><strong>{{ r.id }}</strong> — {{ r.text }}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">None defined.</p>
+  {% endif %}
+
+  <h3>Full text</h3>
+  <div class="entry-body">{{ global_row.content | md }}</div>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>Project overlays</h2>
+  {% if overlays %}
+  {% for o in overlays %}
+  <div class="panel" style="background: var(--bg-panel-alt);">
+    <h3><a href="/ui/projects/{{ o.project }}">{{ o.project }}</a> — v{{ o.version }}</h3>
+    {% if o.overrides %}
+    <p class="meta">Overrides:</p>
+    <ul class="list">
+      {% for ov in o.overrides %}
+      <li>
+        <strong>{{ ov.id }}</strong> — {{ ov.text }}
+        {% if ov.stale_reason %}<div class="badge inactive">{{ ov.stale_reason }}</div>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% if o.additions %}
+    <p class="meta">Additions:</p>
+    <ul class="list">
+      {% for a in o.additions %}
+      <li><strong>{{ a.id }}</strong> — {{ a.text }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="empty">No project overlays yet.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>Version history</h2>
+  {% if history %}
+  <ul class="list">
+    {% for h in history %}
+    <li class="row">
+      <span class="row-main">
+        {% if h.kind == "global" %}
+        global v{{ h.version }}
+        {% else %}
+        overlay <a href="/ui/projects/{{ h.project }}">{{ h.project }}</a> v{{ h.version }}
+        {% endif %}
+      </span>
+      <span class="meta">{{ h.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No doctrine history yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

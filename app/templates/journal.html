@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Journal — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Journal</h1></div>
+<p class="subtitle">Raw activity events -- "the security footage", not the books. See Search for recall.</p>
+
+<form class="filters" method="get" action="/ui/journal">
+  <div class="field">
+    <label for="project">Project</label>
+    <select id="project" name="project">
+      <option value="" {{ "selected" if not f_project }}>all</option>
+      {% for p in project_names %}
+      <option value="{{ p }}" {{ "selected" if f_project == p }}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="kind">Kind</label>
+    <select id="kind" name="kind">
+      <option value="" {{ "selected" if not f_kind }}>all</option>
+      {% for k in kinds %}
+      <option value="{{ k }}" {{ "selected" if f_kind == k }}>{{ k }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button type="submit" class="btn primary">Filter</button>
+</form>
+
+{% if events %}
+<ul class="list">
+  {% for e in events %}
+  <li class="row">
+    <span class="row-main">
+      {{ e.summary }}
+      <div class="meta">
+        <a href="/ui/projects/{{ e.project }}">{{ e.project }}</a>
+        {% for t in e.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+      </div>
+    </span>
+    <span class="badge">{{ e.kind }}</span>
+    <span class="meta">{{ e.ts|human_ts }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No events match these filters.</p>
+{% endif %}
+
+<div class="pagination">
+  {% if next_cursor %}
+  <a class="btn" href="/ui/journal?project={{ f_project }}&kind={{ f_kind }}&cursor={{ next_cursor }}">Next page →</a>
+  {% endif %}
+</div>
+{% endblock %}

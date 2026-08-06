@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log in — The Brain</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <h1>The Brain</h1>
+  <div class="panel">
+    {% if error %}
+    <div class="notice error">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="/ui/login">
+      <div class="field">
+        <label for="token">Owner token</label>
+        <input type="password" id="token" name="token" autocomplete="current-password" autofocus required>
+      </div>
+      <button type="submit" class="btn primary" style="width:100%">Log in</button>
+    </form>
+  </div>
+  <p class="meta" style="text-align:center; margin-top:14px;">
+    Paste the owner token shown once at first boot (see server logs / <code>docker compose logs api</code>).
+    Machine tokens are not accepted here.
+  </p>
+</div>
+</body>
+</html>

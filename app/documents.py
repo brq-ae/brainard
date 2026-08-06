@@ -19,6 +19,7 @@ attempt still collides, a proper enveloped 503 (`deposit_conflict_retry`)
 """
 
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
 from app.models import MirroredDocument
@@ -68,3 +69,44 @@ def latest_mirrored_document_ids() -> Select:
         & (MirroredDocument.path == latest.c.path)
         & (MirroredDocument.version == latest.c.max_version),
     )
+
+
+# --- UI-only reads: per-project mirrored document list + per-path version
+# history (app/routers/ui_projects.py). No such listing exists in the
+# session-facing API surface (contracts-v1.md §7 names only search and the
+# project detail's counts), so there's nothing to refactor out of here --
+# same rationale as app/journal.py.
+
+
+async def list_documents_for_project(db: AsyncSession, project: str) -> list[MirroredDocument]:
+    """The latest version of every mirrored path under `project`, grouped by
+    kind then path.
+    """
+    stmt = latest_mirrored_documents().where(MirroredDocument.project == project).order_by(
+        MirroredDocument.kind, MirroredDocument.path
+    )
+    return list((await db.scalars(stmt)).all())
+
+
+async def document_versions(db: AsyncSession, project: str, path: str) -> list[MirroredDocument]:
+    """Full version history for one (project, path), newest first --
+    supersede-never-erase means every prior version is still there."""
+    stmt = (
+        select(MirroredDocument)
+        .where(MirroredDocument.project == project, MirroredDocument.path == path)
+        .order_by(MirroredDocument.version.desc())
+    )
+    return list((await db.scalars(stmt)).all())
+
+
+async def get_document_version(
+    db: AsyncSession, project: str, path: str, version: int | None = None
+) -> MirroredDocument | None:
+    """A specific version of a mirrored document, or the latest if
+    `version` is omitted."""
+    stmt = select(MirroredDocument).where(MirroredDocument.project == project, MirroredDocument.path == path)
+    if version is None:
+        stmt = stmt.order_by(MirroredDocument.version.desc())
+    else:
+        stmt = stmt.where(MirroredDocument.version == version)
+    return await db.scalar(stmt.limit(1))

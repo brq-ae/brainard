@@ -21,6 +21,8 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set (see .env.example)}
+      UI_SESSION_SECRET: ${UI_SESSION_SECRET:-}
+      UI_COOKIE_SECURE: ${UI_COOKIE_SECURE:-false}
     ports:
       - "${API_PORT:-8300}:8000"
     depends_on:

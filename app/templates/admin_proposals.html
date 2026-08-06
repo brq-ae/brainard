@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Admin — Proposals — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Admin — Doctrine proposals</h1></div>
+<p class="subtitle">Approving/rejecting records the decision only -- promoting into doctrine is a separate write via the API.</p>
+
+<div class="panel">
+  <h2>Pending ({{ pending|length }})</h2>
+  {% if pending %}
+  {% for p in pending %}
+  <div class="panel" style="background: var(--bg-panel-alt);">
+    <div class="page-title"><h3>{{ p.title }}</h3></div>
+    <p class="meta">
+      {{ p.namespace }} <span class="sep">·</span> {{ p.project or "universal" }}
+      <span class="sep">·</span> filed {{ p.created_at|human_ts }} by <code>{{ p.tool }}</code>/<code>{{ p.session }}</code>
+    </p>
+    <div class="entry-body">{{ p.body | md }}</div>
+    <form class="inline" method="post" action="/ui/admin/proposals/{{ p.id }}/approve">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn primary">Approve</button>
+    </form>
+    <form class="inline" method="post" action="/ui/admin/proposals/{{ p.id }}/reject">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn danger">Reject</button>
+    </form>
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="empty">No pending proposals.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>Decided ({{ decided|length }})</h2>
+  {% if decided %}
+  <ul class="list">
+    {% for p in decided %}
+    <li class="row">
+      <span class="row-main">
+        {{ p.title }}
+        <div class="meta">{{ p.namespace }} <span class="sep">·</span> {{ p.project or "universal" }}</div>
+      </span>
+      <span class="badge {{ p.proposal_decision }}">{{ p.proposal_decision }}</span>
+      <span class="meta">{{ p.proposal_decided_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No decisions recorded yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

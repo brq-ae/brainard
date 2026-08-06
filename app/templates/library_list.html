@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Library — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Library</h1></div>
+<p class="subtitle">Lessons, howtos, and reference entries.</p>
+
+<form class="filters" method="get" action="/ui/library">
+  <div class="field">
+    <label for="namespace">Namespace</label>
+    <select id="namespace" name="namespace">
+      <option value="" {{ "selected" if not f_namespace }}>all</option>
+      {% for ns in namespaces %}
+      <option value="{{ ns }}" {{ "selected" if f_namespace == ns }}>{{ ns }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="status">Status</label>
+    <select id="status" name="status">
+      {% for s in statuses %}
+      <option value="{{ s }}" {{ "selected" if f_status == s }}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="project">Project</label>
+    <select id="project" name="project">
+      <option value="" {{ "selected" if not f_project }}>all (incl. universal)</option>
+      {% for p in project_names %}
+      <option value="{{ p }}" {{ "selected" if f_project == p }}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button type="submit" class="btn primary">Filter</button>
+</form>
+
+{% if entries %}
+<ul class="list">
+  {% for e in entries %}
+  <li class="row">
+    <span class="row-main">
+      <a href="/ui/library/{{ e.id }}">{{ e.title }}</a>
+      <div class="meta">
+        {{ e.namespace }}
+        <span class="sep">·</span>{{ e.project or "universal" }}
+        {% for t in e.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+      </div>
+    </span>
+    <span class="badge {{ e.status }}">{{ e.status }}</span>
+    <span class="meta">{{ e.created_at|human_ts }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No entries match these filters.</p>
+{% endif %}
+
+<div class="pagination">
+  {% if next_cursor %}
+  <a class="btn" href="/ui/library?namespace={{ f_namespace }}&status={{ f_status }}&project={{ f_project }}&cursor={{ next_cursor }}">Next page →</a>
+  {% endif %}
+</div>
+{% endblock %}

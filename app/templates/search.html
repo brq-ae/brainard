@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Search — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Search</h1></div>
+<p class="subtitle">Full-text search across library, decisions, handoffs, and (opt-in) the journal.</p>
+
+<form class="filters" method="get" action="/ui/search">
+  <div class="field" style="flex:2; min-width:280px;">
+    <label for="q">Query</label>
+    <input type="text" id="q" name="q" value="{{ q }}" required autofocus>
+  </div>
+  <div class="field">
+    <label for="scope">Scope</label>
+    <select id="scope" name="scope">
+      {% for s in scopes %}
+      <option value="{{ s }}" {{ "selected" if scope == s }}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="include_history"><input type="checkbox" id="include_history" name="include_history" value="true" {{ "checked" if include_history }}> include history</label>
+  </div>
+  <button type="submit" class="btn primary">Search</button>
+</form>
+
+{% if searched %}
+  {% if results %}
+  <ul class="list">
+    {% for r in results %}
+    <li class="row">
+      <span class="row-main">
+        {% if r.type == "library" %}
+          <a href="/ui/library/{{ r.id }}">{{ r.snippet }}</a>
+        {% elif r.type in ("decision", "document") %}
+          <a href="/ui/projects/{{ r.project }}/documents/{{ r.path }}">{{ r.snippet }}</a>
+          <span class="meta">{{ r.path }} v{{ r.version }}</span>
+        {% elif r.type == "handoff" %}
+          <a href="/ui/projects/{{ r.project }}">{{ r.snippet }}</a>
+        {% elif r.type == "event" %}
+          <a href="/ui/journal?project={{ r.project }}">{{ r.snippet }}</a>
+        {% else %}
+          {{ r.snippet }}
+        {% endif %}
+        <div class="meta">
+          <span class="badge">{{ r.type }}</span>
+          {% if r.project %}<span class="sep">·</span>{{ r.project }}{% endif %}
+        </div>
+      </span>
+      <span class="meta">rank {{ "%.3f"|format(r.rank) }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No results for "{{ q }}" in scope "{{ scope }}".</p>
+  {% endif %}
+
+  <div class="pagination">
+    {% if next_cursor %}
+    <a class="btn" href="/ui/search?q={{ q }}&scope={{ scope }}&include_history={{ include_history }}&cursor={{ next_cursor }}">Next page →</a>
+    {% endif %}
+  </div>
+{% endif %}
+{% endblock %}

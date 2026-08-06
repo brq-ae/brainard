@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}{{ entry.title }} — The Brain{% endblock %}
+{% block content %}
+<div class="breadcrumb"><a href="/ui/library">← Library</a></div>
+<div class="page-title">
+  <h1>{{ entry.title }}</h1>
+  <span class="badge {{ entry.status }}">{{ entry.status }}</span>
+  {% if entry.is_doctrine_proposal %}<span class="badge">doctrine proposal</span>{% endif %}
+</div>
+<p class="meta">
+  {{ entry.namespace }}
+  <span class="sep">·</span>{{ entry.project or "universal" }}
+  <span class="sep">·</span>created {{ entry.created_at|human_ts }}
+  <span class="sep">·</span>tool <code>{{ entry.tool }}</code>
+  <span class="sep">·</span>session <code>{{ entry.session }}</code>
+</p>
+{% for t in entry.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+
+{% if entry.status == "retired" and entry.retire_reason %}
+<div class="notice warn"><strong>Retired:</strong> {{ entry.retire_reason }}</div>
+{% endif %}
+
+{% if duplicate_hints %}
+<div class="notice warn">
+  <strong>Possible duplicates:</strong>
+  <ul class="list">
+    {% for f in duplicate_hints %}
+    <li><a href="/ui/library/{{ f.related_entry_id }}">{{ (f.detail or {}).get("title", f.related_entry_id) }}</a>
+      <span class="meta">rank {{ "%.3f"|format((f.detail or {}).get("rank", 0)) }}</span></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% if parents or children %}
+<div class="panel">
+  <h2>Supersession chain</h2>
+  {% if parents %}
+  <p class="meta">Supersedes:</p>
+  <ul class="list">
+    {% for p in parents %}
+    <li><a href="/ui/library/{{ p.id }}">{{ p.title }}</a> <span class="badge {{ p.status }}">{{ p.status }}</span></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if children %}
+  <p class="meta">Superseded by:</p>
+  <ul class="list">
+    {% for c in children %}
+    <li><a href="/ui/library/{{ c.id }}">{{ c.title }}</a> <span class="badge {{ c.status }}">{{ c.status }}</span></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="panel entry-body">
+  {{ entry.body | md }}
+</div>
+{% endblock %}

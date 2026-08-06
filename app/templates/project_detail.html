@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} — The Brain{% endblock %}
+{% block content %}
+<div class="breadcrumb"><a href="/ui/projects">← Projects</a></div>
+<div class="page-title">
+  <h1>{{ project.name }}</h1>
+  <span class="badge {{ project.status }}">{{ project.status }}</span>
+</div>
+{% if project.description %}<p class="subtitle">{{ project.description }}</p>{% endif %}
+<p class="meta">
+  registered {{ project.created_at|human_ts }}
+  {% if overlay_version %}<span class="sep">·</span>doctrine overlay v{{ overlay_version }} (see <a href="/ui/doctrine">doctrine</a>){% endif %}
+</p>
+
+<div class="grid cols-3">
+  <div class="panel">
+    <div class="stat-label">Active library entries</div>
+    <div class="stat">{{ counts.active_library_entries }}</div>
+  </div>
+  <div class="panel">
+    <div class="stat-label">Mirrored documents</div>
+    <div class="stat">{{ counts.mirrored_documents.adr }} ADR / {{ counts.mirrored_documents.doc }} doc</div>
+  </div>
+  <div class="panel">
+    <div class="stat-label">Total deposits</div>
+    <div class="stat">{{ counts.total_deposits }}</div>
+  </div>
+</div>
+
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>Machines</h2>
+    {% if machines %}
+    <ul class="list">
+      {% for m in machines %}
+      <li class="row"><span class="row-main">{{ m.name }}</span><span class="meta">last deposit {{ m.last_deposit_at|human_ts }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No machines have deposited on this project yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>Latest handoff</h2>
+    {% if latest_handoff %}
+    <p class="meta">{{ latest_handoff.received_at|human_ts }}</p>
+    <p><strong>Stands:</strong> {{ latest_handoff.stands }}</p>
+    <p><strong>In flight:</strong> {{ latest_handoff.in_flight }}</p>
+    <p><strong>Blocked:</strong> {{ latest_handoff.blocked or "nothing" }}</p>
+    <p><strong>Next steps:</strong> {{ latest_handoff.next_steps }}</p>
+    {% if latest_handoff.notes %}<p><strong>Notes:</strong> {{ latest_handoff.notes }}</p>{% endif %}
+    {% else %}
+    <p class="empty">No handoff on record yet.</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Mirrored documents</h2>
+  {% if documents %}
+  <ul class="list">
+    {% for d in documents %}
+    <li class="row">
+      <span class="row-main">
+        <a href="/ui/projects/{{ project.name }}/documents/{{ d.path }}">{{ d.title }}</a>
+        <div class="meta">{{ d.path }} <span class="sep">·</span> {{ d.kind }}</div>
+      </span>
+      <span class="meta">v{{ d.version }} <span class="sep">·</span> {{ d.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No mirrored ADRs or docs yet.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>Handoff chain</h2>
+  {% if handoffs %}
+  <ul class="list">
+    {% for h in handoffs %}
+    <li>
+      <div class="meta">{{ h.received_at|human_ts }}</div>
+      <p><strong>Stands:</strong> {{ h.stands }}</p>
+      <p><strong>In flight:</strong> {{ h.in_flight }}</p>
+      <p><strong>Blocked:</strong> {{ h.blocked or "nothing" }}</p>
+      <p><strong>Next steps:</strong> {{ h.next_steps }}</p>
+      {% if h.notes %}<p><strong>Notes:</strong> {{ h.notes }}</p>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No handoffs on record yet.</p>
+  {% endif %}
+  <div class="pagination">
+    {% if next_handoff_cursor %}
+    <a class="btn" href="/ui/projects/{{ project.name }}?handoff_cursor={{ next_handoff_cursor }}">Older handoffs →</a>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

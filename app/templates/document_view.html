@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}{{ doc.title }} — The Brain{% endblock %}
+{% block content %}
+<div class="breadcrumb"><a href="/ui/projects/{{ project_name }}">← {{ project_name }}</a></div>
+<div class="page-title">
+  <h1>{{ doc.title }}</h1>
+  <span class="badge">{{ doc.kind }}</span>
+</div>
+<p class="meta">{{ path }} <span class="sep">·</span> version {{ doc.version }} <span class="sep">·</span> {{ doc.created_at|human_ts }}</p>
+
+{% if versions|length > 1 %}
+<div class="panel">
+  <h2>Version history</h2>
+  <ul class="list">
+    {% for v in versions %}
+    <li class="row">
+      <span class="row-main">
+        {% if v.version == doc.version %}
+        <strong>v{{ v.version }}</strong> (viewing)
+        {% else %}
+        <a href="/ui/projects/{{ project_name }}/documents/{{ path }}?version={{ v.version }}">v{{ v.version }}</a>
+        {% endif %}
+      </span>
+      <span class="meta">{{ v.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<div class="panel entry-body">
+  {{ doc.content | md }}
+</div>
+{% endblock %}

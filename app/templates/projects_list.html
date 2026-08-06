@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Projects — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Projects</h1></div>
+<p class="subtitle">Newest activity first.</p>
+
+{% if project_rows %}
+<ul class="list">
+  {% for p, latest_deposit_at in project_rows %}
+  <li class="row">
+    <span class="row-main">
+      <a href="/ui/projects/{{ p.name }}">{{ p.name }}</a>
+      {% if p.description %}<div class="meta">{{ p.description }}</div>{% endif %}
+    </span>
+    <span class="badge {{ p.status }}">{{ p.status }}</span>
+    <span class="meta">{{ latest_deposit_at|human_ts if latest_deposit_at else "no activity" }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No projects yet.</p>
+{% endif %}
+
+<div class="pagination">
+  {% if next_cursor %}
+  <a class="btn" href="/ui/projects?cursor={{ next_cursor }}">Next page →</a>
+  {% endif %}
+</div>
+{% endblock %}

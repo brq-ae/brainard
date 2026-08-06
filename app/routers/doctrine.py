@@ -6,13 +6,12 @@ where full trust does not apply -- no AI may alter the rulebook.
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from app.auth import Principal, require_owner
 from app.db import get_db
-from app.doctrine import current_global, next_version
+from app.doctrine import current_global, current_overlays_all, next_version
 from app.errors import ApiError
 from app.models import DoctrineVersion, Project
 from app.schemas import (
@@ -214,25 +213,9 @@ async def get_doctrine(
         else DoctrineGlobalResponse(version=global_row.version, content=global_row.content, rules=global_row.rules, created_at=global_row.created_at)
     )
 
-    # Current (latest-by-version) overlay per project: group by project, take
-    # the max version, then re-select the full rows at that (project, version).
-    latest = (
-        select(DoctrineVersion.project, func.max(DoctrineVersion.version).label("max_version"))
-        .where(DoctrineVersion.kind == "overlay")
-        .group_by(DoctrineVersion.project)
-        .subquery()
-    )
-    overlay_rows = (
-        await db.scalars(
-            select(DoctrineVersion)
-            .join(
-                latest,
-                (DoctrineVersion.project == latest.c.project) & (DoctrineVersion.version == latest.c.max_version),
-            )
-            .where(DoctrineVersion.kind == "overlay")
-            .order_by(DoctrineVersion.project)
-        )
-    ).all()
+    # Current (latest-by-version) overlay per project -- shared query, see
+    # app/doctrine.py's `current_overlays_all`.
+    overlay_rows = await current_overlays_all(db)
 
     overlays = [
         DoctrineOverlayResponse(

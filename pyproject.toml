@@ -11,6 +11,18 @@ dependencies = [
     "alembic>=1.14,<2.0",
     "pydantic-settings>=2.6,<3.0",
     "python-ulid>=4.0,<5.0",
+    # Phase 6 UI: server-rendered Jinja2 templates (no JS framework, no CDN
+    # assets -- LAN-deployable and fully self-contained).
+    "jinja2>=3.1,<4.0",
+    # Parses admin form POSTs (machine mint, proposal decisions, login).
+    "python-multipart>=0.0.12,<1.0",
+    # Signs the owner UI session cookie (see app/ui_auth.py).
+    "itsdangerous>=2.2,<3.0",
+    # Renders library/document/proposal markdown bodies server-side for the
+    # UI. Paired with bleach below -- entries are AI-written content and
+    # treated as untrusted for the browser context (see app/markdown_render.py).
+    "markdown>=3.7,<4.0",
+    "bleach>=6.1,<7.0",
 ]
 
 [project.optional-dependencies]

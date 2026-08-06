@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Admin — Machines — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Admin — Machines</h1></div>
+<p class="subtitle">Mint and revoke per-machine bearer tokens.</p>
+
+{% if newly_minted %}
+<div class="notice ok">
+  <strong>Machine "{{ newly_minted.name }}" created.</strong> Copy this token now -- it is shown exactly once and cannot be retrieved again.
+  <div class="token-reveal" id="new-token">{{ newly_minted.token }}</div>
+  <button type="button" class="btn" data-copy-target="new-token">Copy token</button>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>Add a machine</h2>
+  <form method="post" action="/ui/admin/machines">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="name">Name</label>
+      <input type="text" id="name" name="name" placeholder="e.g. NUC — Proxmox container 111" required>
+    </div>
+    <button type="submit" class="btn primary">Mint token</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Registered machines</h2>
+  {% if machines %}
+  <ul class="list">
+    {% for m in machines %}
+    <li class="row">
+      <span class="row-main">
+        {{ m.name }}
+        <div class="meta">created {{ m.created_at|human_ts }} <span class="sep">·</span> last seen {{ m.last_seen|human_ts if m.last_seen else "never" }}</div>
+      </span>
+      <span class="badge {{ m.status }}">{{ m.status }}</span>
+      {% if m.status == "active" %}
+      <form class="inline" method="post" action="/ui/admin/machines/{{ m.id }}/revoke" data-confirm="Revoke machine &quot;{{ m.name }}&quot;? This cannot be undone.">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn danger">Revoke</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No machines registered yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

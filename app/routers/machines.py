@@ -1,16 +1,20 @@
-"""Machine registry: mint, list, revoke. Owner token required for all three."""
+"""Machine registry: mint, list, revoke. Owner token required for all three.
 
-from ulid import ULID
+The actual mint/list/revoke logic lives in app/machines.py, shared with the
+UI admin area (app/routers/ui_admin.py) so the two surfaces never drift.
+"""
+
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import Principal, require_owner
 from app.db import get_db
 from app.errors import ApiError
+from app.machines import list_machines as _list_machines
+from app.machines import mint_machine
+from app.machines import revoke_machine as revoke_machine_impl
 from app.models import Machine
 from app.schemas import MachineCreateRequest, MachineCreateResponse, MachineListItem, MachineRevokeResponse
-from app.security import generate_machine_token, hash_token
 
 router = APIRouter(prefix="/v1/machines", tags=["machines"])
 
@@ -21,15 +25,7 @@ async def create_machine(
     _owner: Principal = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ) -> MachineCreateResponse:
-    token = generate_machine_token()
-    machine = Machine(
-        id=str(ULID()),
-        name=body.name,
-        token_hash=hash_token(token),
-        status="active",
-    )
-    db.add(machine)
-    await db.commit()
+    machine, token = await mint_machine(db, body.name)
     return MachineCreateResponse(id=machine.id, name=machine.name, token=token)
 
 
@@ -38,8 +34,7 @@ async def list_machines(
     _owner: Principal = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ) -> list[Machine]:
-    result = await db.scalars(select(Machine).order_by(Machine.created_at))
-    return list(result)
+    return await _list_machines(db)
 
 
 @router.post("/{machine_id}/revoke", response_model=MachineRevokeResponse)
@@ -48,10 +43,7 @@ async def revoke_machine(
     _owner: Principal = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ) -> MachineRevokeResponse:
-    machine = await db.get(Machine, machine_id)
+    machine = await revoke_machine_impl(db, machine_id)
     if machine is None:
         raise ApiError(404, "machine_not_found", f"No machine with id '{machine_id}'.")
-
-    machine.status = "revoked"  # idempotent: revoking an already-revoked machine is a no-op
-    await db.commit()
     return MachineRevokeResponse(id=machine.id, status=machine.status)
