@@ -57,6 +57,10 @@ async def _duplicate_hints(db: AsyncSession, entry: KnowledgeEntry) -> list[Libr
 
 @router.get("/{entry_id}", response_model=LibraryEntryResponse)
 async def get_library_entry(
+    # Intentionally unfiltered by `is_doctrine_proposal`: by-id readability of
+    # a proposal entry is deliberate (the filer needs to re-read their own
+    # proposal), unlike its exclusion from search/digest/discovery paths --
+    # ids reach machines only via their own deposit acks or GET /v1/proposals.
     entry_id: str,
     _principal: Principal = Depends(require_machine_or_owner),
     db: AsyncSession = Depends(get_db),

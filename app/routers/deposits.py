@@ -135,6 +135,7 @@ BODY_KEYWORD_CAP = 12  # top-N most frequent body lexemes folded into the OR que
 _RECOVERY_INVALID_KNOWLEDGE_ITEM = "fix the listed field(s), resend"
 _RECOVERY_BAD_SUPERSEDES = "fix or drop the supersedes reference, resend"
 _RECOVERY_RETIRE_TARGET = "fix or drop the retire action, resend"
+_RECOVERY_PROPOSAL_SUPERSEDES = "file the proposal without supersedes, or supersede only other proposals"
 
 
 def _is_retire_item(item: Any) -> bool:
@@ -173,6 +174,17 @@ def _validate_knowledge_shape(items: list[Any]) -> None:
                     {
                         "index": i,
                         "reason": "`reason` must be non-empty when retiring an entry",
+                        "recovery": _RECOVERY_INVALID_KNOWLEDGE_ITEM,
+                    }
+                )
+            # A retire action mutates an existing library entry in place --
+            # `doctrine_proposal` (which only ever applies to a newly-created
+            # entry) is a nonsensical combination with it.
+            if item.get("doctrine_proposal"):
+                failing.append(
+                    {
+                        "index": i,
+                        "reason": "`doctrine_proposal` cannot be combined with a `retire` action",
                         "recovery": _RECOVERY_INVALID_KNOWLEDGE_ITEM,
                     }
                 )
@@ -225,6 +237,19 @@ def _validate_knowledge_shape(items: list[Any]) -> None:
                     "recovery": _RECOVERY_INVALID_KNOWLEDGE_ITEM,
                 }
             )
+        # Doctrine proposal flag (contracts-v1.md §4): an ordinary knowledge[]
+        # item, opted into proposal treatment (excluded from the bootstrap
+        # digest and default search scope; visible via scope=proposals and
+        # GET /v1/proposals) by this one boolean.
+        doctrine_proposal = item.get("doctrine_proposal", False)
+        if not isinstance(doctrine_proposal, bool):
+            failing.append(
+                {
+                    "index": i,
+                    "reason": "`doctrine_proposal` must be a boolean",
+                    "recovery": _RECOVERY_INVALID_KNOWLEDGE_ITEM,
+                }
+            )
 
     if failing:
         raise ApiError(
@@ -255,6 +280,10 @@ async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str,
 
     bad_supersedes: list[dict[str, Any]] = []
     bad_retires: list[dict[str, Any]] = []
+    # Proposals must stay inert against the live library (contracts-v1.md
+    # §4): a proposal item may supersede another proposal (updating one's own
+    # proposal -- both inert), but never a real, non-proposal library entry.
+    bad_proposal_supersedes: list[dict[str, Any]] = []
 
     for i, item in enumerate(items):
         if _is_retire_item(item):
@@ -279,9 +308,16 @@ async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str,
                     }
                 )
         else:
-            missing = [s for s in item.get("supersedes", []) if s not in existing]
+            supersedes = item.get("supersedes", [])
+            missing = [s for s in supersedes if s not in existing]
             if missing:
                 bad_supersedes.append({"index": i, "missing": missing, "recovery": _RECOVERY_BAD_SUPERSEDES})
+            if item.get("doctrine_proposal", False):
+                non_proposal_targets = [s for s in supersedes if s in existing and not existing[s].is_doctrine_proposal]
+                if non_proposal_targets:
+                    bad_proposal_supersedes.append(
+                        {"index": i, "supersedes": non_proposal_targets, "recovery": _RECOVERY_PROPOSAL_SUPERSEDES}
+                    )
 
     if bad_supersedes:
         raise ApiError(
@@ -290,6 +326,16 @@ async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str,
             f"{len(bad_supersedes)} knowledge[] item(s) reference a `supersedes` id that does not exist; "
             "the whole deposit was rejected. See `failing_items` for the scripted recovery.",
             extra={"failing_items": bad_supersedes},
+        )
+    if bad_proposal_supersedes:
+        all_ids = sorted({s for item in bad_proposal_supersedes for s in item["supersedes"]})
+        raise ApiError(
+            422,
+            "proposal_cannot_supersede_library",
+            f"{len(bad_proposal_supersedes)} doctrine-proposal item(s) name non-proposal library entry "
+            f"id(s) {all_ids} in `supersedes`; proposals must stay inert against the live library. "
+            f"Recovery: {_RECOVERY_PROPOSAL_SUPERSEDES}.",
+            extra={"failing_items": bad_proposal_supersedes},
         )
     if bad_retires:
         raise ApiError(
@@ -352,6 +398,13 @@ _DUPLICATE_HINTS_SQL = text(
       AND ke.namespace = :namespace
       AND ke.status = 'active'
       AND ke.id != :entry_id
+      -- Doctrine proposals are excluded from the candidate pool entirely
+      -- (contracts-v1.md §4: proposals stay inert against the live
+      -- library) -- a proposal never surfaces as a "possible duplicate" of
+      -- an ordinary entry. The other direction (a proposal not receiving
+      -- hints) is enforced by the caller skipping this query for proposal
+      -- entries -- see `_apply_knowledge`.
+      AND ke.is_doctrine_proposal = false
       AND ke.search_vector @@ q.query
       AND ts_rank(ke.search_vector, q.query) > :min_rank
     ORDER BY rank DESC
@@ -423,6 +476,7 @@ async def _apply_knowledge(
             session=deposit.session,
             deposit_id=deposit.deposit_id,
             created_at=deposit.received_at,
+            is_doctrine_proposal=bool(item.get("doctrine_proposal", False)),
         )
         db.add(entry)
         await db.flush()  # id must exist before the fork/duplicate queries below reference it
@@ -470,17 +524,22 @@ async def _apply_knowledge(
             if parent.status == "active":
                 parent.status = "superseded"
 
-        for other_id, other_title, rank in await _duplicate_hints(db, entry):
-            db.add(
-                Flag(
-                    id=str(ULID()),
-                    type="duplicate",
-                    entry_id=entry.id,
-                    related_entry_id=other_id,
-                    detail={"rank": rank, "title": other_title},
-                    created_at=deposit.received_at,
+        # Proposals stay inert against the live library in both directions
+        # (contracts-v1.md §4): the SQL above already excludes proposal rows
+        # from the candidate pool, and a proposal entry itself never gets
+        # hints pointing at library entries -- skip the check entirely.
+        if not entry.is_doctrine_proposal:
+            for other_id, other_title, rank in await _duplicate_hints(db, entry):
+                db.add(
+                    Flag(
+                        id=str(ULID()),
+                        type="duplicate",
+                        entry_id=entry.id,
+                        related_entry_id=other_id,
+                        detail={"rank": rank, "title": other_title},
+                        created_at=deposit.received_at,
+                    )
                 )
-            )
 
         ack.append(KnowledgeAckItem(index=i, action="created", id=entry.id, title=entry.title))
 

@@ -44,7 +44,7 @@ def _decode_cursor(cursor: str) -> tuple[float, str]:
 @router.get("", response_model=SearchResponse)
 async def search(
     q: str = Query(..., min_length=1),
-    scope: Literal["default", "journal", "all"] = "default",
+    scope: Literal["default", "journal", "all", "proposals"] = "default",
     include_history: bool = False,
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
@@ -64,6 +64,12 @@ async def search(
         # Readers see `active` content by default; history on request
         # (contracts-v1.md Principles).
         lib_stmt = lib_stmt.where(KnowledgeEntry.status == "active")
+    # Doctrine proposals (§4) are inert library entries: never served by
+    # default/journal/all, only surfaced via the explicit 'proposals' scope.
+    if scope == "proposals":
+        lib_stmt = lib_stmt.where(KnowledgeEntry.is_doctrine_proposal.is_(True))
+    else:
+        lib_stmt = lib_stmt.where(KnowledgeEntry.is_doctrine_proposal.is_(False))
 
     handoff_stmt = select(
         literal("handoff").label("type"),
@@ -84,10 +90,15 @@ async def search(
     # Search default scope: library + handoffs (contracts-v1.md §7). Mirrored
     # decisions join the default scope in phase 5 (not implemented yet);
     # 'journal' opts the journal (events) in; 'all' is everything -- for now
-    # identical to 'journal' since decisions don't exist yet.
-    statements = [lib_stmt, handoff_stmt]
-    if scope in ("journal", "all"):
-        statements.append(event_stmt)
+    # identical to 'journal' since decisions don't exist yet. 'proposals' is
+    # its own lane: only doctrine-proposal library entries, never mixed with
+    # handoffs/events.
+    if scope == "proposals":
+        statements = [lib_stmt]
+    else:
+        statements = [lib_stmt, handoff_stmt]
+        if scope in ("journal", "all"):
+            statements.append(event_stmt)
 
     subq = union_all(*statements).subquery("search_results")
     outer = select(subq.c.type, subq.c.id, subq.c.snippet, subq.c.project, subq.c.rank)

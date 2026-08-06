@@ -183,3 +183,99 @@ class SearchResultItem(BaseModel):
 class SearchResponse(BaseModel):
     results: list[SearchResultItem]
     next_cursor: str | None
+
+
+# --- Doctrine (contracts-v1.md §4, §7) ---
+
+
+class DoctrineRuleIn(BaseModel):
+    """One global rule. `tier` is kept as a plain str (not a pydantic
+    Literal) so an invalid tier can produce the contract's self-explaining,
+    named rejection in the route handler instead of a generic 422 -- same
+    reasoning as `EventIn.kind` in the deposits schemas above.
+    """
+
+    id: str = Field(min_length=1)
+    tier: str
+    text: str = Field(min_length=1)
+
+
+class DoctrineGlobalRequest(BaseModel):
+    content: str = Field(min_length=1)
+    rules: list[DoctrineRuleIn] = Field(default_factory=list)
+
+
+class DoctrineOverrideIn(BaseModel):
+    id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class DoctrineAdditionIn(BaseModel):
+    id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class DoctrineOverlayRequest(BaseModel):
+    content: str = Field(min_length=1)
+    overrides: list[DoctrineOverrideIn] = Field(default_factory=list)
+    additions: list[DoctrineAdditionIn] = Field(default_factory=list)
+
+
+class DoctrineRuleOut(BaseModel):
+    id: str
+    tier: str
+    text: str
+
+
+class DoctrineGlobalResponse(BaseModel):
+    version: int
+    content: str
+    rules: list[DoctrineRuleOut]
+    created_at: datetime
+
+
+class DoctrineOverlayRuleRefOut(BaseModel):
+    id: str
+    text: str
+
+
+class DoctrineOverlayResponse(BaseModel):
+    project: str
+    version: int
+    content: str
+    overrides: list[DoctrineOverlayRuleRefOut]
+    additions: list[DoctrineOverlayRuleRefOut]
+    created_at: datetime
+
+
+class DoctrineGetResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    # Aliased to "global" in the wire format -- `global` is a Python keyword,
+    # so the attribute is named `doctrine_global` and serialized by alias
+    # (FastAPI's default: response_model_by_alias=True).
+    doctrine_global: DoctrineGlobalResponse | None = Field(default=None, alias="global")
+    overlays: list[DoctrineOverlayResponse] = Field(default_factory=list)
+
+
+# --- Doctrine proposals (contracts-v1.md §4) ---
+
+
+class ProposalListItem(BaseModel):
+    id: str
+    title: str
+    namespace: str
+    project: str | None
+    tags: list[str]
+    body: str
+    status: str
+    proposal_decision: str | None
+    proposal_decided_at: datetime | None
+    created_at: datetime
+    source: LibrarySource
+
+
+class ProposalDecisionResponse(BaseModel):
+    id: str
+    decision: str
+    decided_at: datetime

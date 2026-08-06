@@ -12,7 +12,19 @@ from httpx import ASGITransport, AsyncClient
 
 from app.db import AsyncSessionLocal, engine
 from app.main import app
-from app.models import Base, Deposit, Event, Flag, Handoff, KnowledgeEntry, Machine, OwnerToken, Project
+from app.models import (
+    Base,
+    BootstrapFetch,
+    Deposit,
+    DoctrineVersion,
+    Event,
+    Flag,
+    Handoff,
+    KnowledgeEntry,
+    Machine,
+    OwnerToken,
+    Project,
+)
 
 
 def _asyncpg_dsn(database_url: str, dbname: str) -> str:
@@ -50,7 +62,9 @@ async def _prepare_database():
 async def _clean_tables():
     """Every test starts from an empty database. Deletion order respects
     foreign keys: flags before the entries they reference, entries/journal/
-    handoff rows before their deposit, deposits before machines/projects.
+    handoff rows before their deposit, deposits before machines/projects,
+    doctrine_versions/bootstrap_fetches before the machines/projects they
+    reference.
     """
     async with AsyncSessionLocal() as session:
         await session.execute(Flag.__table__.delete())
@@ -58,6 +72,8 @@ async def _clean_tables():
         await session.execute(Event.__table__.delete())
         await session.execute(Handoff.__table__.delete())
         await session.execute(Deposit.__table__.delete())
+        await session.execute(BootstrapFetch.__table__.delete())
+        await session.execute(DoctrineVersion.__table__.delete())
         await session.execute(Project.__table__.delete())
         await session.execute(Machine.__table__.delete())
         await session.execute(OwnerToken.__table__.delete())

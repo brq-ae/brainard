@@ -4,11 +4,14 @@ Phase 1: owner_token, machines.
 Phase 2: deposits, events, handoffs, projects (see docs/spec/contracts-v1.md §2).
 Phase 3: knowledge_entries, flags, and FTS `search_vector` columns on
 knowledge_entries/handoffs/events (see docs/spec/contracts-v1.md §3, §6, §7).
+Phase 4: doctrine_versions, bootstrap_fetches, doctrine-proposal columns on
+knowledge_entries, and `projects.description` (see docs/spec/contracts-v1.md
+§4, §6).
 """
 
 from datetime import datetime
 
-from sqlalchemy import ARRAY, Boolean, Computed, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import ARRAY, Boolean, Computed, DateTime, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -71,6 +74,10 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(255), primary_key=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Registry fact served by bootstrap's "project context" section
+    # (contracts-v1.md §5, §6). Absent for auto-stubbed projects until an
+    # owner/session sets one -- no write endpoint exists yet (phase 5).
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Deposit(Base):
@@ -193,6 +200,16 @@ class KnowledgeEntry(Base):
     session: Mapped[str] = mapped_column(String(255), nullable=False)
     deposit_id: Mapped[str] = mapped_column(String(26), ForeignKey("deposits.deposit_id"), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Doctrine proposal flag (contracts-v1.md §4): a proposal is stored as an
+    # ordinary library entry -- same table, same supersession/dedup rules --
+    # but is excluded from the bootstrap lessons digest and from default
+    # search scope (see app/routers/search.py, app/routers/bootstrap.py).
+    is_doctrine_proposal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 'approved' | 'rejected', set once by POST /v1/proposals/{id}/approve|reject.
+    # Recording the decision never mutates doctrine itself -- promotion is the
+    # owner's separate, deliberate POST to the doctrine endpoints.
+    proposal_decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    proposal_decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     search_vector: Mapped[str | None] = mapped_column(
         TSVECTOR, Computed(_KNOWLEDGE_ENTRY_SEARCH_VECTOR_SQL, persisted=True), nullable=True
     )
@@ -216,4 +233,65 @@ class Flag(Base):
     )
     # 'fork': {"parent_id": ...}. 'duplicate': {"rank": ..., "title": ...}.
     detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# --- Phase 4: doctrine & bootstrap (contracts-v1.md §4, §6) ---
+
+
+class DoctrineVersion(Base):
+    """One immutable doctrine version -- either the global rulebook (`kind`
+    'global', `project` null) or one project's overlay (`kind` 'overlay',
+    `project` set). Owner-only writes; every write is a new version, never an
+    edit -- supersede-never-erase applies to doctrine too (§4: "Versioned:
+    every doctrine change bumps a version").
+    """
+
+    __tablename__ = "doctrine_versions"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)  # 'global' | 'overlay'
+    project: Mapped[str | None] = mapped_column(String(255), ForeignKey("projects.name"), nullable=True, index=True)
+    # Per-(kind, project) sequence starting at 1. Computed and enforced in the
+    # route handler (app/doctrine.py's `next_version`), not a DB constraint --
+    # Postgres unique indexes treat every NULL `project` as distinct from every
+    # other NULL, so a plain UNIQUE(kind, project, version) would never catch a
+    # collision among 'global' rows (which are always project=NULL).
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # global: [{"id": "G1", "tier": "non_negotiable"|"default", "text": ...}, ...]
+    # overlay: {"overrides": [{"id", "text"}, ...], "additions": [{"id", "text"}, ...]}
+    rules: Mapped[dict | list] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_doctrine_versions_global_version",
+            "kind",
+            "version",
+            unique=True,
+            postgresql_where=text("project IS NULL"),
+        ),
+        Index(
+            "ix_doctrine_versions_overlay_version",
+            "project",
+            "version",
+            unique=True,
+            postgresql_where=text("kind = 'overlay'"),
+        ),
+    )
+
+
+class BootstrapFetch(Base):
+    """Server-side log of every GET /v1/bootstrap call (§6: "Every fetch is
+    logged server-side (machine, project, doctrine version, timestamp)").
+    """
+
+    __tablename__ = "bootstrap_fetches"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    machine_id: Mapped[str] = mapped_column(String(26), ForeignKey("machines.id"), nullable=False, index=True)
+    project: Mapped[str] = mapped_column(String(255), ForeignKey("projects.name"), nullable=False, index=True)
+    doctrine_global_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    doctrine_overlay_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

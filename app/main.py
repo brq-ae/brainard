@@ -5,9 +5,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.bootstrap import bootstrap_owner_token
 from app.errors import ApiError, api_error_handler
-from app.routers import deposits, health, library, machines, search
+from app.routers import bootstrap, deposits, doctrine, health, library, machines, proposals, search
+from app.startup import bootstrap_owner_token
 
 
 @asynccontextmanager
@@ -25,3 +25,6 @@ app.include_router(machines.router)
 app.include_router(deposits.router)
 app.include_router(library.router)
 app.include_router(search.router)
+app.include_router(doctrine.router)
+app.include_router(proposals.router)
+app.include_router(bootstrap.router)

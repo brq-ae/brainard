@@ -1,5 +1,9 @@
 """First-boot owner token provisioning.
 
+(Renamed from app/bootstrap.py in phase 4 to free that name for the real
+bootstrap feature -- GET /v1/bootstrap, contracts-v1.md §6 -- which is
+unrelated to this first-boot concern.)
+
 On first startup (no owner_token row exists), generate the owner token,
 persist only its hash, and print the plaintext exactly once -- it can never
 be retrieved again.
