@@ -12,7 +12,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.db import AsyncSessionLocal, engine
 from app.main import app
-from app.models import Base, Machine, OwnerToken
+from app.models import Base, Deposit, Event, Handoff, Machine, OwnerToken, Project
 
 
 def _asyncpg_dsn(database_url: str, dbname: str) -> str:
@@ -48,8 +48,15 @@ async def _prepare_database():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_tables():
-    """Every test starts from an empty owner_token/machines state."""
+    """Every test starts from an empty database. Deletion order respects
+    foreign keys: journal/handoff rows before their deposit, deposits before
+    machines/projects.
+    """
     async with AsyncSessionLocal() as session:
+        await session.execute(Event.__table__.delete())
+        await session.execute(Handoff.__table__.delete())
+        await session.execute(Deposit.__table__.delete())
+        await session.execute(Project.__table__.delete())
         await session.execute(Machine.__table__.delete())
         await session.execute(OwnerToken.__table__.delete())
         await session.commit()

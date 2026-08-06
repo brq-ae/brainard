@@ -8,15 +8,21 @@ from fastapi.responses import JSONResponse
 
 
 class ApiError(Exception):
-    def __init__(self, status_code: int, code: str, detail: str) -> None:
+    def __init__(self, status_code: int, code: str, detail: str, extra: dict | None = None) -> None:
         self.status_code = status_code
         self.code = code
         self.detail = detail
+        # Structured detail beyond the human-readable `detail` string -- e.g. a
+        # per-item breakdown of which deposit events failed and how to recover.
+        # Merged alongside `code`/`detail` in the response, never overriding them
+        # -- `extra` is spread first below so `code`/`detail` are applied last
+        # and always win on key collision.
+        self.extra = extra or {}
         super().__init__(detail)
 
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"code": exc.code, "detail": exc.detail}},
+        content={"error": {**exc.extra, "code": exc.code, "detail": exc.detail}},
     )

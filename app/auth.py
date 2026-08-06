@@ -36,6 +36,9 @@ async def authenticate(token: str, db: AsyncSession) -> Principal:
     if machine is not None:
         if machine.status == "revoked":
             raise ApiError(401, "token_revoked", "This machine token has been revoked.")
+        # Side effect is intentional: `last_seen` is defined as "updated on any
+        # authenticated call" (contracts-v1.md §1), so every request through
+        # this dependency -- not just deposits -- keeps it fresh.
         machine.last_seen = datetime.now(UTC)
         await db.commit()
         return Principal(kind="machine", machine=machine)
