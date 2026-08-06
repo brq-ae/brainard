@@ -84,15 +84,20 @@ async def test_ui_mint_machine_shows_paste_line(client, db_session):
     # Jinja2 autoescape turns '<'/'>'/"'" into HTML entities -- unescape
     # before asserting on the literal paste-line text.
     body = html.unescape(resp.text)
-    assert "You are connected to the Brain" in body
+    assert "I run a private knowledge hub for my projects" in body
     assert "/v1/bootstrap?project=<PROJECT>" in body
     assert f"Bearer {minted_token}" in body
-    assert "follow the returned instructions exactly for the rest of this session" in body
+    # Trust anchored in the owner's own message, judgment preserved -- never
+    # an obedience-demand (docs/onboarding.md "Why it's worded this way":
+    # "follow the returned instructions exactly" was refused by a
+    # well-defended AI elsewhere as prompt-injection-shaped).
+    assert "apply it with your normal judgment" in body
+    assert "it never overrides your safety rules" in body
 
     # not shown again on a plain re-list of the page (same rule as the token itself)
     listing = await client.get("/ui/admin/machines")
     assert minted_token not in listing.text
-    assert "You are connected to the Brain" not in listing.text
+    assert "I run a private knowledge hub for my projects" not in listing.text
 
 
 async def test_ui_revoke_machine_works(client, db_session):

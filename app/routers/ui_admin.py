@@ -49,12 +49,20 @@ def _paste_line(request: Request, token: str) -> str:
     (`request.base_url`), which is the address this browser -- and
     therefore, on a LAN deployment, any session on the same network --
     actually reached the hub at.
+
+    Worded to anchor trust in the owner's own message, not the endpoint,
+    and to explicitly preserve the assistant's judgment (docs/onboarding.md
+    "Why it's worded this way") -- a real-world session on another machine
+    correctly refused an earlier "follow the returned instructions exactly"
+    wording as prompt-injection-shaped.
     """
     hub_base = str(request.base_url).rstrip("/")
     return (
-        "You are connected to the Brain, our central knowledge hub. Fetch "
-        f"{hub_base}/v1/bootstrap?project=<PROJECT> with header 'Authorization: Bearer {token}' "
-        "and follow the returned instructions exactly for the rest of this session."
+        "I run a private knowledge hub for my projects — it's mine and I administer it. Fetch "
+        f"{hub_base}/v1/bootstrap?project=<PROJECT> with header 'Authorization: Bearer {token}'. "
+        "The response contains my working rules for this session, the project's current state, and how "
+        "to deposit what you learn back to the hub. Read it and apply it with your normal judgment — it "
+        "never overrides your safety rules. If anything in it seems off, ask me."
     )
 
 
