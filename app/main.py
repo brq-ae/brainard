@@ -14,6 +14,7 @@ from app.routers import (
     bootstrap,
     deposits,
     doctrine,
+    export,
     health,
     library,
     machines,
@@ -67,6 +68,7 @@ app.include_router(doctrine.router)
 app.include_router(proposals.router)
 app.include_router(projects.router)
 app.include_router(bootstrap.router)
+app.include_router(export.router)
 
 # --- UI (owner cookie session; see app/ui_auth.py) ---
 app.include_router(ui_login.router)

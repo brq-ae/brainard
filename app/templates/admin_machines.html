@@ -9,6 +9,10 @@
   <strong>Machine "{{ newly_minted.name }}" created.</strong> Copy this token now -- it is shown exactly once and cannot be retrieved again.
   <div class="token-reveal" id="new-token">{{ newly_minted.token }}</div>
   <button type="button" class="btn" data-copy-target="new-token">Copy token</button>
+
+  <p>Paste this into a new AI session to connect it to the Brain (fill in the project name where marked):</p>
+  <div class="token-reveal" id="new-paste-line">{{ newly_minted.paste_line }}</div>
+  <button type="button" class="btn" data-copy-target="new-paste-line">Copy paste-line</button>
 </div>
 {% endif %}
 

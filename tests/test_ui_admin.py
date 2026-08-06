@@ -5,6 +5,7 @@ tests/test_machines.py and tests/test_proposals.py for the API-side
 equivalents.
 """
 
+import html
 import re
 
 from ulid import ULID
@@ -62,6 +63,36 @@ async def test_ui_mint_machine_shows_token_once(client, db_session):
     listing = await client.get("/ui/admin/machines")
     assert minted_token not in listing.text
     assert "ui-minted-machine" in listing.text
+
+
+async def test_ui_mint_machine_shows_paste_line(client, db_session):
+    """Phase 7 addition (docs/onboarding.md): the show-once mint page also
+    displays a ready-to-copy paste-line with the hub URL and the fresh
+    token already filled in.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post("/ui/admin/machines", data={"name": "paste-line-machine", "csrf_token": csrf})
+    assert resp.status_code == 201
+
+    token_match = re.search(r"brn_[A-Za-z0-9_-]+", resp.text)
+    assert token_match, "minted token not found in response"
+    minted_token = token_match.group(0)
+
+    # Jinja2 autoescape turns '<'/'>'/"'" into HTML entities -- unescape
+    # before asserting on the literal paste-line text.
+    body = html.unescape(resp.text)
+    assert "You are connected to the Brain" in body
+    assert "/v1/bootstrap?project=<PROJECT>" in body
+    assert f"Bearer {minted_token}" in body
+    assert "follow the returned instructions exactly for the rest of this session" in body
+
+    # not shown again on a plain re-list of the page (same rule as the token itself)
+    listing = await client.get("/ui/admin/machines")
+    assert minted_token not in listing.text
+    assert "You are connected to the Brain" not in listing.text
 
 
 async def test_ui_revoke_machine_works(client, db_session):

@@ -23,6 +23,9 @@ htmlcov/
 # Docker
 docker-compose.override.yml
 
+# Backups (scripts/backup.sh local dump/bundle staging area)
+backups/
+
 # Editors / OS
 .DS_Store
 .idea/

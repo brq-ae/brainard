@@ -41,6 +41,23 @@ async def admin_machines(
     )
 
 
+def _paste_line(request: Request, token: str) -> str:
+    """The onboarding paste-line (docs/onboarding.md), pre-filled with the
+    real hub URL and the freshly minted token -- `project` is left as a
+    literal fill-in since a machine isn't bound to a single project at mint
+    time. Hub URL is derived from the request the mint happened over
+    (`request.base_url`), which is the address this browser -- and
+    therefore, on a LAN deployment, any session on the same network --
+    actually reached the hub at.
+    """
+    hub_base = str(request.base_url).rstrip("/")
+    return (
+        "You are connected to the Brain, our central knowledge hub. Fetch "
+        f"{hub_base}/v1/bootstrap?project=<PROJECT> with header 'Authorization: Bearer {token}' "
+        "and follow the returned instructions exactly for the rest of this session."
+    )
+
+
 @router.post("/machines")
 async def admin_machines_create(
     request: Request,
@@ -62,7 +79,12 @@ async def admin_machines_create(
         {
             "csrf_token": session["csrf"],
             "machines": machines,
-            "newly_minted": {"id": machine.id, "name": machine.name, "token": token},
+            "newly_minted": {
+                "id": machine.id,
+                "name": machine.name,
+                "token": token,
+                "paste_line": _paste_line(request, token),
+            },
         },
         status_code=201,
     )
