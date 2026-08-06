@@ -103,3 +103,15 @@ Unknown project → auto-stub + global doctrine + orientation. Every fetch is lo
 **Ops:** `GET /healthz` (unauthenticated).
 
 **Search default scope:** library + mirrored decisions + handoffs. The journal is opt-in per query — recall searches the books, not the security footage.
+
+## Amendments — ratified 2026-08-06
+
+Implementation-driven gap-fills, each consistent with the Principles, ratified by the owner:
+
+1. **Retire actions travel inside deposits.** A `knowledge[]` item may be a retire action `{retire: "<entry_id>", reason: "<non-empty>"}` instead of a new entry. Valid only against `active` entries; self-explaining rejections otherwise. No standalone retire endpoint exists — all session writes are checkpoint-borne.
+2. **Deposit acknowledgments return server-generated identity.** The deposit response includes per-item acknowledgments (`knowledge`: entry ids and actions; `documents`: path/version/id) and counts. Required so sessions can later supersede/retire what they created. Acks are stored verbatim and replayed identically for idempotent retries.
+3. **Proposals are readable by exact id.** `GET /v1/library/{id}` serves doctrine-proposal entries to any valid token. Proposals remain excluded from bootstrap, digests, duplicate hints, and all search scopes except the explicit `proposals` scope. Rationale: ids are unguessable ULIDs that reach machines only via their own deposit acks; the filer must be able to re-read its pending proposal.
+4. **`GET /v1/projects` (list) exists.** Read-only, machine-or-owner token, cursor-paginated by latest activity. The original §7 omission was an oversight; the UI requires enumeration.
+5. **Project registry updates travel inside deposits.** The deposit envelope accepts optional `project_update: {description?, status?}`, applied atomically to the deposit's project. The owner additionally holds direct `PATCH /v1/projects/{name}`.
+
+Supersession boundary (clarification from phases 4-5): supersession never crosses the proposal boundary in either direction — proposals may supersede only proposals; library entries may supersede only library entries. Proposals are closed exclusively by owner approve/reject.
