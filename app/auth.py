@@ -77,3 +77,15 @@ async def require_machine(
     if principal.kind != "machine":
         raise ApiError(403, "machine_token_required", "This endpoint requires a machine token.")
     return principal
+
+
+async def require_machine_or_owner(
+    token: str = Depends(get_bearer_token),
+    db: AsyncSession = Depends(get_db),
+) -> Principal:
+    """Session-facing reads (library, search -- contracts-v1.md §7) accept
+    either credential kind. `authenticate` already restricts to the two
+    recognized kinds and rejects anything else (missing/garbage/revoked), so
+    no extra kind check is needed here.
+    """
+    return await authenticate(token, db)

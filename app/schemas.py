@@ -86,20 +86,35 @@ class DepositRequest(BaseModel):
     events: list[EventIn] = Field(default_factory=list)
     handoff: HandoffIn | None = None
     no_handoff: str | None = Field(default=None, min_length=1)
-    # Library entries -- not implemented until phase 3. Accepted here only so
-    # a non-empty submission can be rejected with a self-explaining error
-    # rather than silently dropped or bounced by generic schema validation.
+    # Library entries (contracts-v1.md §3): either a new entry
+    # {title, namespace, body, tags?, project?, supersedes?} or a retire
+    # action {retire: "<id>", reason: "<non-empty>"}. Kept as untyped dicts
+    # (not a pydantic discriminated union) so the route handler can produce
+    # the contract's self-explaining, per-item rejection instead of a
+    # generic 422 validation error -- same reasoning as `EventIn.kind` above.
     knowledge: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DepositCounts(BaseModel):
     events: int
     handoff: bool
+    knowledge: int
 
 
 class DepositProjectInfo(BaseModel):
     name: str
     stub_created: bool
+
+
+class KnowledgeAckItem(BaseModel):
+    """Per-item knowledge[] acknowledgment detail. `id` is server-generated
+    for `created` entries and echoes the target for `retired` actions.
+    """
+
+    index: int
+    action: Literal["created", "retired"]
+    id: str
+    title: str
 
 
 class DepositResponse(BaseModel):
@@ -108,3 +123,63 @@ class DepositResponse(BaseModel):
     replayed: bool = False
     counts: DepositCounts
     project: DepositProjectInfo
+    knowledge: list[KnowledgeAckItem] = Field(default_factory=list)
+
+
+# --- Library (contracts-v1.md §3, §7) ---
+
+
+class LibraryEntryRef(BaseModel):
+    """A minimal reference to another library entry, used in the
+    supersession chain (parents/children).
+    """
+
+    id: str
+    title: str
+    status: str
+
+
+class LibraryDuplicateHint(BaseModel):
+    entry_id: str
+    title: str
+    rank: float
+
+
+class LibrarySource(BaseModel):
+    machine_id: str
+    tool: str
+    session: str
+
+
+class LibraryEntryResponse(BaseModel):
+    id: str
+    title: str
+    namespace: str
+    project: str | None
+    tags: list[str]
+    status: str
+    retire_reason: str | None
+    supersedes: list[str]
+    body: str
+    source: LibrarySource
+    created_at: datetime
+    deposit_id: str
+    parents: list[LibraryEntryRef]
+    children: list[LibraryEntryRef]
+    duplicate_hints: list[LibraryDuplicateHint]
+
+
+# --- Search (contracts-v1.md §6 note, §7) ---
+
+
+class SearchResultItem(BaseModel):
+    type: Literal["library", "handoff", "event"]
+    id: str
+    snippet: str
+    project: str | None
+    rank: float
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResultItem]
+    next_cursor: str | None
