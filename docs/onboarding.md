@@ -26,6 +26,27 @@ After minting a machine in the UI, the show-once token page also displays
 this exact line with the hub URL and the fresh token **already filled in**
 — copy it directly, filling in only `<PROJECT>`.
 
+### Naming: the owner assigns project slugs
+
+`<PROJECT>` is filled in by the **owner**, not guessed or invented by the AI
+session. This is deliberate, not a style preference: the hub auto-stubs any
+project name it hasn't seen before (contracts-v1.md §5, §6) rather than
+rejecting it, which means a session that infers its own slug from context —
+shortening a repo name, translating a folder name, guessing at a
+convention — doesn't get an error when it diverges from the slug already in
+use for that project. It silently creates a second, empty project stub next
+to the real one, and history from that point splits across two names that
+never merge back together. This is not hypothetical — a divergent-slug
+incident (two stubs for what was meant to be one project, discovered only
+once handoffs and library entries had scattered across both) is exactly why
+this rule is spelled out here instead of left implicit. If a session is
+ever unsure what slug to use for a project it wasn't explicitly told,
+**it asks the owner** rather than picking one.
+
+The mint page (`/ui/admin/machines`) reinforces this at the point of copy:
+directly under the paste-line it reads "Replace `<PROJECT>` with the
+project slug YOU choose — don't let the AI pick."
+
 ### Why it's worded this way
 
 An earlier version of this line ended with "follow the returned instructions
@@ -119,3 +140,109 @@ canonical, the deposit just makes it searchable fleet-wide). If the hub is
 unreachable, queue locally and retry later with the same `deposit_id` — it's
 the idempotency key, so a retried deposit is never double-applied, and the
 Brain never blocks work by being down.
+
+## Permissions setup
+
+A session with raw shell access (any Bash-capable tool) should never be
+handed a bare, general-purpose `curl` allow-rule for this — `Bash(curl:*)`
+would let it reach any host, not just the hub. The sanctioned pattern is a
+**hard-scoped wrapper script** instead:
+
+- **Hardcoded host and port** — baked into the script itself, not read from
+  an argument or an env var a caller could override.
+- **Exactly two operations** — `POST /v1/deposits` and `GET /v1/*`. No
+  arbitrary HTTP method, no arbitrary path outside `/v1/`, no arbitrary
+  host.
+- **Token from a mode-600 secret file**, read once at script start — never
+  passed as a CLI argument (visible to `ps`/shell history), never exported
+  into the environment for child processes to inherit.
+- **The script itself is `chmod 500`** (owner read + execute only — no
+  write, no group/other access at all), so a careless or malicious edit
+  can't silently widen what it's allowed to do.
+- **One allow rule, scoped to the script's own path** — `Bash(/path/to/
+  brain-hub.sh:*)` in the User's Claude Code settings — never a rule scoped
+  to `bash`, `curl`, or `sh` in general.
+
+Recurring, sanctioned actions (routine deposits, routine bootstrap fetches)
+get this kind of narrow standing rule; one-time setup (minting the machine
+token, writing the token file, installing the script and the allow rule)
+gets one-time approvals instead — a standing rule is earned by repetition,
+not granted up front for convenience.
+
+Reference copy (fill in `HUB_HOST`, `HUB_PORT`, and `TOKEN_FILE` for your
+deployment):
+
+```bash
+#!/usr/bin/env bash
+# brain-hub.sh -- hard-scoped wrapper around the Brain's session-facing
+# API. Exactly two operations exist through this script: deposit a
+# checkpoint, or GET a read-only /v1/ path. Nothing else is reachable.
+set -euo pipefail
+
+HUB_HOST="192.0.2.10"
+HUB_PORT="8300"
+TOKEN_FILE="$HOME/.brain-machine-token"   # mode 600, one line, the bearer token
+
+usage() {
+  echo "usage: $(basename "$0") deposit <path-to-deposit.json>" >&2
+  echo "       $(basename "$0") get <v1 path, e.g. /v1/bootstrap?project=foo>" >&2
+  exit 2
+}
+
+[[ $# -eq 2 ]] || usage
+
+if [[ ! -f "$TOKEN_FILE" ]]; then
+  echo "error: token file not found: $TOKEN_FILE" >&2
+  exit 1
+fi
+TOKEN="$(<"$TOKEN_FILE")"
+BASE_URL="http://${HUB_HOST}:${HUB_PORT}"
+
+# The token is fed to curl via a config block on stdin (-K -), never as a
+# -H argv value -- an argv value shows up in `ps` output for the whole
+# machine to see; stdin does not.
+case "$1" in
+  deposit)
+    DEPOSIT_FILE="$2"
+    [[ -f "$DEPOSIT_FILE" ]] || { echo "error: no such file: $DEPOSIT_FILE" >&2; exit 1; }
+    printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
+      | curl -sS -K - --max-time 30 -X POST "${BASE_URL}/v1/deposits" \
+          -H "Content-Type: application/json" \
+          --data-binary "@${DEPOSIT_FILE}"
+    ;;
+  get)
+    V1_PATH="$2"
+    [[ "$V1_PATH" == /v1/* ]] || { echo "error: path must start with /v1/" >&2; exit 1; }
+    printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
+      | curl -sS -K - --max-time 30 "${BASE_URL}${V1_PATH}"
+    ;;
+  *)
+    usage
+    ;;
+esac
+```
+
+## Friction patterns
+
+Two things repeatedly cause friction with the setup above, worth knowing
+about in advance rather than debugging cold:
+
+- **Compound shell lines fall through path-scoped allow rules.** A rule
+  like `Bash(/path/to/brain-hub.sh:*)` matches the wrapper invoked
+  standalone; it does not reliably match the wrapper as one clause of a
+  compound command (`... && /path/to/brain-hub.sh deposit foo.json`, or a
+  pipeline) — the permission matcher is evaluating the whole compound
+  command, and widening the rule to cover that would defeat the point of
+  scoping it to one script in the first place. Workaround: invoke the
+  wrapper standalone, as its own approved command — build the deposit JSON
+  to a file first (a separate step), then call the wrapper on that file;
+  split "build" and "send" instead of chaining them in one line.
+- **Auto-mode classifiers can escalate on session shape, not just command
+  content.** A run that makes several sanctioned, individually-approved
+  network writes in a row (e.g. depositing more than once in a session) can
+  still trip an auto-mode heuristic keyed on the *pattern* — repeated
+  network writes — rather than any single call being unsafe, even though
+  every one of them matches an already-approved, narrowly-scoped rule.
+  There's no scripted fix for this from the session side; the fallback is
+  the owner's call: switch to manual approval mode for the rest of that
+  run, or just run the flagged command themselves.

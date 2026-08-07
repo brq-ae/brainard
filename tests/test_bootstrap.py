@@ -148,6 +148,99 @@ async def test_bootstrap_instructions_mention_completed_search_scopes(client, db
     assert "library + decisions + handoffs" in text or "decisions + handoffs" in text
 
 
+# --- patch 2026-08-07: instructions enumerate the full deposit schema ---
+
+
+async def test_bootstrap_instructions_enumerate_envelope_fields(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    for field in (
+        "deposit_id",
+        "tool",
+        "session",
+        "project",
+        "reason",
+        "client_ts",
+        "doctrine_version",
+        "metrics",
+        "project_update",
+    ):
+        assert field in text, f"envelope field {field!r} missing from operating instructions"
+    assert "tokens_in" in text and "tokens_out" in text and "cost_estimate" in text and "duration" in text
+
+
+async def test_bootstrap_instructions_enumerate_events_required_fields(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    for field in ("seq", "ts", "kind", "summary", "payload", "tags", "256 KB"):
+        assert field in text
+
+
+async def test_bootstrap_instructions_state_project_cascade_rule_plainly(client, db_session):
+    """The new project cascade rule must be stated in plain, unambiguous
+    terms: omitting `project` inherits the deposit's project; sending
+    explicit null is universal.
+    """
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "omit" in text.lower() and "this deposit's project" in text.lower()
+    assert "null" in text.lower() and "universal" in text.lower()
+    # supersedes is explicitly called out as an array/list, not a scalar
+    assert "supersedes" in text and ("a list" in text.lower() or "an array" in text.lower())
+
+
+async def test_bootstrap_instructions_include_retire_action_shape(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert '"retire"' in text
+    assert '"reason"' in text
+
+
+async def test_bootstrap_instructions_mention_handoff_or_waiver_fields(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "no_handoff" in text
+    for field in ("stands", "in_flight", "blocked", "next_steps"):
+        assert field in text
+
+
+async def test_bootstrap_instructions_contain_a_minimal_valid_example_deposit(client, db_session):
+    """Contracts amendment (2026-08-07): the instructions must include one
+    minimal valid example deposit JSON, in a code block, that a client can
+    verify against -- not just prose describing the shape.
+    """
+    import json as _json
+
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "```json" in text
+
+    # Extract the fenced json block and confirm it's valid, minimal, and
+    # actually satisfies the real deposit validation (envelope-only + one
+    # event + one knowledge item with `project` omitted).
+    start = text.index("```json") + len("```json")
+    end = text.index("```", start)
+    example = _json.loads(text[start:end].strip())
+
+    assert set(example) >= {"deposit_id", "tool", "session", "project", "reason", "client_ts"}
+    assert example["reason"] == "daily"
+    assert "project" not in example["knowledge"][0]  # demonstrates the cascade rule: omitted -> inherits
+
+    from ulid import ULID as _ULID
+
+    example["deposit_id"] = str(_ULID())  # the example reuses a fixed illustrative id; make it fresh for posting
+    post_resp = await client.post("/v1/deposits", json=example, headers=headers)
+    assert post_resp.status_code == 200, post_resp.json()
+    entry = post_resp.json()["knowledge"][0]
+    assert entry["action"] == "created"
+
+
 async def test_bootstrap_project_context_mentions_writable_fields(client, db_session):
     headers, _ = await _machine_headers(db_session)
     resp = await client.get("/v1/bootstrap", params={"project": "brain"}, headers=headers)
@@ -370,6 +463,52 @@ async def test_bootstrap_version_stamp_formats(client, db_session):
 
 
 # --- size budget trimming ---
+
+
+async def test_bootstrap_typical_response_fits_well_under_budget(client, db_session):
+    """Patch 2026-08-07 grew the operating-instructions section (full schema
+    enumeration + example JSON). A realistic bootstrap -- global doctrine +
+    a project overlay + a handful of digest entries, nothing pathological --
+    must still land comfortably under the 32 KB budget with no trimming, so
+    the budget mechanics never have to trim ordinary rules to make room for
+    the bigger instructions text.
+    """
+    owner_headers = await _owner_headers(db_session)
+    await _post_global(client, owner_headers)
+    db_session.add(Project(name="typical-proj", status="active", created_at=datetime.now(UTC)))
+    await db_session.commit()
+    await _post_overlay(
+        client,
+        owner_headers,
+        "typical-proj",
+        content="# Project overlay\n\nA normal, modestly-sized project overlay document.",
+        additions=[{"id": "P1", "text": "Run the test profile before committing."}],
+    )
+
+    headers, _ = await _machine_headers(db_session)
+    for i in range(10):
+        body = _deposit_body(
+            project="typical-proj",
+            knowledge=[
+                {
+                    "title": f"Ordinary lesson {i}",
+                    "namespace": "lessons",
+                    "body": f"A normal, realistically-sized lesson body for entry {i}.",
+                }
+            ],
+        )
+        assert (await client.post("/v1/deposits", json=body, headers=headers)).status_code == 200
+
+    resp = await client.get("/v1/bootstrap", params={"project": "typical-proj", "format": "json"}, headers=headers)
+    data = resp.json()
+    assert len(data["lessons_digest"]) == 10  # nothing trimmed
+    assert data["doctrine"]["overlay_content"] is not None  # nothing trimmed
+
+    assert _markdown_bytes(data) <= SIZE_BUDGET_BYTES // 2  # comfortably under half the budget
+    assert _json_bytes(data) <= SIZE_BUDGET_BYTES // 2
+
+    md_resp = await client.get("/v1/bootstrap", params={"project": "typical-proj"}, headers=headers)
+    assert len(md_resp.content) <= SIZE_BUDGET_BYTES // 2
 
 
 async def test_bootstrap_trims_digest_before_overlay_content_before_rules(client, db_session):

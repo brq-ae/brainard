@@ -139,6 +139,10 @@ _RECOVERY_BAD_SUPERSEDES = "fix or drop the supersedes reference, resend"
 _RECOVERY_RETIRE_TARGET = "fix or drop the retire action, resend"
 _RECOVERY_PROPOSAL_SUPERSEDES = "file the proposal without supersedes, or supersede only other proposals"
 _RECOVERY_LIBRARY_SUPERSEDES_PROPOSAL = "proposals are closed via the owner's approve/reject, not by supersession"
+_RECOVERY_UNKNOWN_ENTRY_PROJECT = (
+    "use an existing project name, omit the key to file under this deposit's project, or send null for "
+    "universal knowledge"
+)
 
 
 def _is_retire_item(item: Any) -> bool:
@@ -228,10 +232,22 @@ def _validate_knowledge_shape(items: list[Any]) -> None:
             failing.append(
                 {"index": i, "reason": "`tags` must be a list of strings", "recovery": _RECOVERY_INVALID_KNOWLEDGE_ITEM}
             )
-        if project is not None and not isinstance(project, str):
+        if project is not None and (not isinstance(project, str) or not project.strip()):
             failing.append(
-                {"index": i, "reason": "`project` must be a string", "recovery": _RECOVERY_INVALID_KNOWLEDGE_ITEM}
+                {
+                    "index": i,
+                    "reason": "`project` must be a non-empty string or null",
+                    "recovery": _RECOVERY_INVALID_KNOWLEDGE_ITEM,
+                }
             )
+        # Shape-only here: `project is None` covers both an absent `project`
+        # key and an explicit `"project": null` -- this check only needs to
+        # reject a wrong *type*, not distinguish the two. The distinction
+        # (absent -> inherits the deposit's project; explicit null -> stays
+        # universal) is a key-presence check (`"project" in item`, not
+        # `item.get("project")`), and only matters once we know the item is
+        # a well-shaped dict -- see the project cascade rule applied in
+        # `_apply_knowledge` below.
         if not isinstance(supersedes, list) or not all(isinstance(s, str) for s in supersedes):
             failing.append(
                 {
@@ -264,10 +280,12 @@ def _validate_knowledge_shape(items: list[Any]) -> None:
         )
 
 
-async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str, Any]]) -> None:
+async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str, Any]], envelope_project: str) -> None:
     """Second pass: existence/status checks that require the database.
     `supersedes[]` references must exist; retire targets must exist and be
-    'active'. Every bad item is listed at once -- one resend fixes all of them.
+    'active'; an explicit entry-level `project` (naming a project other than
+    the deposit's own) must already be registered. Every bad item is listed
+    at once -- one resend fixes all of them.
     """
     referenced_ids: set[str] = set()
     for item in items:
@@ -280,6 +298,49 @@ async def _validate_knowledge_references(db: AsyncSession, items: list[dict[str,
     if referenced_ids:
         rows = (await db.scalars(select(KnowledgeEntry).where(KnowledgeEntry.id.in_(referenced_ids)))).all()
         existing = {row.id: row for row in rows}
+
+    # Entry-level `project` existence check (added 2026-08-07, fixing the
+    # FK-trap where an unknown explicit project name died as an
+    # IntegrityError deep in `_apply_knowledge`, mis-surfaced as a 503 with
+    # permanently-wrong "resend unchanged" advice -- resending unchanged
+    # would hit the exact same FK violation forever). Unlike the deposit's
+    # own envelope `project` (which auto-stubs -- contracts-v1.md §5/§6),
+    # an entry naming a *different* project must name one that already
+    # exists: naming a project is owner authority, and a knowledge item
+    # must never be able to silently mint one. The envelope's own project
+    # always counts as "existing" here even when it's brand-new to this
+    # deposit -- `_insert_deposit` guarantees that stub exists (or already
+    # existed) before `_apply_knowledge` ever runs.
+    bad_entry_projects: list[dict[str, Any]] = []
+    named_other_projects = {
+        item["project"]
+        for item in items
+        if not _is_retire_item(item)
+        and "project" in item
+        and item["project"] is not None
+        and item["project"] != envelope_project
+    }
+    if named_other_projects:
+        existing_project_names = set(
+            (await db.scalars(select(Project.name).where(Project.name.in_(named_other_projects)))).all()
+        )
+        for i, item in enumerate(items):
+            if _is_retire_item(item):
+                continue
+            name = item.get("project")
+            if "project" in item and name is not None and name != envelope_project and name not in existing_project_names:
+                bad_entry_projects.append({"index": i, "project": name, "recovery": _RECOVERY_UNKNOWN_ENTRY_PROJECT})
+
+    if bad_entry_projects:
+        offending = sorted({item["project"] for item in bad_entry_projects})
+        raise ApiError(
+            422,
+            "unknown_entry_project",
+            f"{len(bad_entry_projects)} knowledge[] item(s) name a `project` {offending} that is not a "
+            "registered project; the whole deposit was rejected. See `failing_items` for the scripted "
+            "recovery.",
+            extra={"failing_items": bad_entry_projects},
+        )
 
     bad_supersedes: list[dict[str, Any]] = []
     bad_retires: list[dict[str, Any]] = []
@@ -491,11 +552,23 @@ async def _apply_knowledge(
             ack.append(KnowledgeAckItem(index=i, action="retired", id=target.id, title=target.title))
             continue
 
+        # Project cascade rule (ratified 2026-08-07, contracts-v1.md §3
+        # "Absent = universal knowledge" amended): a knowledge[] item whose
+        # `project` KEY IS ABSENT inherits the deposit envelope's own
+        # `project` -- filed under this deposit's project by default, the
+        # common case for a session working on one project. An item with an
+        # EXPLICIT `"project": null` stays universal (stored as project
+        # NULL) -- an opt-in, not a fallback. An explicit other project name
+        # is honored as before. `"project" in item` (key presence), not
+        # `item.get("project")` (which can't tell absent from explicit
+        # None), is what makes this distinction real.
+        entry_project = item["project"] if "project" in item else deposit.project
+
         entry = KnowledgeEntry(
             id=str(ULID()),
             title=item["title"],
             namespace=item["namespace"],
-            project=item.get("project"),
+            project=entry_project,
             tags=item.get("tags", []),
             status="active",
             supersedes=item.get("supersedes", []),
@@ -558,7 +631,17 @@ async def _apply_knowledge(
         # from the candidate pool, and a proposal entry itself never gets
         # hints pointing at library entries -- skip the check entirely.
         if not entry.is_doctrine_proposal:
+            # Duplicate-hint suppression vs supersession: an entry that
+            # explicitly names a parent in its own `supersedes[]` is a
+            # deliberate, corrective replacement of that parent -- not an
+            # accidental near-duplicate of it. Flagging "possibly duplicates
+            # entry X" against the very entry X it was just filed to
+            # supersede would be noise the librarian doesn't need. Unrelated
+            # similar entries are still flagged normally.
+            superseded_ids = set(unique_parent_ids)
             for other_id, other_title, rank in await _duplicate_hints(db, entry):
+                if other_id in superseded_ids:
+                    continue
                 db.add(
                     Flag(
                         id=str(ULID()),
@@ -840,7 +923,7 @@ async def create_deposit(
         return await _build_ack(db, existing, replayed=True)
 
     _validate_knowledge_shape(body.knowledge)
-    await _validate_knowledge_references(db, body.knowledge)
+    await _validate_knowledge_references(db, body.knowledge, body.project)
     _validate_documents_shape(body.documents)
     _validate_events(body.events)
     _validate_handoff_or_waiver(body)

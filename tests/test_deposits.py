@@ -531,6 +531,227 @@ async def test_knowledge_entry_created_with_tags_and_project(client, db_session)
     assert entry.created_at is not None
 
 
+# --- project cascade: absent key inherits, explicit null stays universal (patch 2026-08-07) ---
+
+
+async def test_knowledge_project_key_absent_inherits_deposit_project(client, db_session):
+    """An entry whose `project` key is simply not present in the item
+    inherits the deposit envelope's own `project` -- the common case for a
+    session filing knowledge while working on one project.
+    """
+    headers = await _machine_headers(db_session)
+    body = _deposit_body(project="cascade-proj", knowledge=[_knowledge_new(title="Inherits envelope project")])
+    # No "project" key at all on the item -- not even project=None.
+    assert "project" not in body["knowledge"][0]
+
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+    assert resp.status_code == 200
+    entry_id = resp.json()["knowledge"][0]["id"]
+
+    entry = await db_session.get(KnowledgeEntry, entry_id)
+    assert entry.project == "cascade-proj"
+
+    # And it shows up in that project's bootstrap digest.
+    bootstrap_resp = await client.get(
+        "/v1/bootstrap", params={"project": "cascade-proj", "format": "json"}, headers=headers
+    )
+    titles = {item["title"] for item in bootstrap_resp.json()["lessons_digest"]}
+    assert "Inherits envelope project" in titles
+
+
+async def test_knowledge_project_explicit_null_stays_universal(client, db_session):
+    """An entry with an EXPLICIT `"project": null` stays universal (stored
+    as project NULL) -- opt-in, not the cascade default. It must not appear
+    in the deposit's own project's digest, but must still be searchable.
+    """
+    headers = await _machine_headers(db_session)
+    body = _deposit_body(
+        project="cascade-proj-2",
+        knowledge=[_knowledge_new(title="Explicitly universal knowledge", project=None)],
+    )
+    assert body["knowledge"][0]["project"] is None
+    assert "project" in body["knowledge"][0]
+
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+    assert resp.status_code == 200
+    entry_id = resp.json()["knowledge"][0]["id"]
+
+    entry = await db_session.get(KnowledgeEntry, entry_id)
+    assert entry.project is None
+
+    # Absent from that project's digest.
+    bootstrap_resp = await client.get(
+        "/v1/bootstrap", params={"project": "cascade-proj-2", "format": "json"}, headers=headers
+    )
+    titles = {item["title"] for item in bootstrap_resp.json()["lessons_digest"]}
+    assert "Explicitly universal knowledge" not in titles
+
+    # Still searchable.
+    search_resp = await client.get("/v1/search", params={"q": "Explicitly universal"}, headers=headers)
+    assert entry_id in {r["id"] for r in search_resp.json()["results"]}
+
+
+async def test_knowledge_project_explicit_other_name_honored(client, db_session):
+    """An explicit `project` naming some other project than the deposit
+    envelope's own is honored as-is (unchanged behavior)."""
+    headers = await _machine_headers(db_session)
+    # Unlike the envelope's own `project` (auto-stubbed by the deposit
+    # insert itself), an entry naming a *different* project must name one
+    # that already exists -- explicitly validated and rejected with a clean
+    # 422 `unknown_entry_project` otherwise (see
+    # test_knowledge_entry_project_unknown_rejects_cleanly_not_503 below);
+    # naming a project is owner authority, an entry never gets to mint one.
+    # Pre-create the target here so this test can exercise the "honored"
+    # path on its own, independent of that validation.
+    db_session.add(Project(name="a-totally-different-project", status="active", created_at=datetime.now(UTC)))
+    await db_session.commit()
+
+    body = _deposit_body(
+        project="cascade-proj-3",
+        knowledge=[_knowledge_new(title="Filed under a different project", project="a-totally-different-project")],
+    )
+
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+    assert resp.status_code == 200
+    entry_id = resp.json()["knowledge"][0]["id"]
+
+    entry = await db_session.get(KnowledgeEntry, entry_id)
+    assert entry.project == "a-totally-different-project"
+
+    # Not in the envelope project's digest.
+    own_digest = await client.get(
+        "/v1/bootstrap", params={"project": "cascade-proj-3", "format": "json"}, headers=headers
+    )
+    assert entry_id not in {i["id"] for i in own_digest.json()["lessons_digest"]}
+
+    # In the named project's digest.
+    other_digest = await client.get(
+        "/v1/bootstrap", params={"project": "a-totally-different-project", "format": "json"}, headers=headers
+    )
+    assert entry_id in {i["id"] for i in other_digest.json()["lessons_digest"]}
+
+
+async def test_knowledge_entry_project_unknown_rejects_cleanly_not_503(client, db_session):
+    """CRITICAL fix (2026-08-07): an entry-level `project` naming a project
+    that doesn't exist must be caught by validation, before any insert is
+    attempted -- a clean 422 `unknown_entry_project`, never the old
+    FK-violation-via-IntegrityError path that mis-surfaced as a 503
+    `deposit_conflict_retry` with permanently-wrong "resend unchanged"
+    advice (resending unchanged would hit the same FK violation forever).
+    Also atomic: nothing from the deposit is stored, not even the
+    project stub for the envelope's own (novel) project.
+    """
+    headers = await _machine_headers(db_session)
+    body = _deposit_body(
+        project="never-created-envelope-proj",
+        knowledge=[_knowledge_new(title="Orphaned project reference", project="this-project-does-not-exist")],
+    )
+
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "unknown_entry_project"
+    assert error["failing_items"][0]["index"] == 0
+    assert error["failing_items"][0]["project"] == "this-project-does-not-exist"
+
+    # Atomic: nothing stored at all, including the envelope's own project
+    # stub -- validation runs before any insert in `_insert_deposit`.
+    assert await db_session.get(Deposit, body["deposit_id"]) is None
+    assert await db_session.get(Project, "never-created-envelope-proj") is None
+    assert (
+        await db_session.scalars(select(KnowledgeEntry).where(KnowledgeEntry.deposit_id == body["deposit_id"]))
+    ).all() == []
+
+
+async def test_knowledge_entry_project_empty_string_rejects_as_shape_error(client, db_session):
+    """An explicit `"project": ""` is a shape violation (non-empty string or
+    null required), not an existence lookup -- caught by
+    `_validate_knowledge_shape`, before the database-backed existence check
+    even runs.
+    """
+    headers = await _machine_headers(db_session)
+    body = _deposit_body(
+        project="brain",
+        knowledge=[_knowledge_new(title="Empty string project", project="")],
+    )
+
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "invalid_knowledge_entry"
+    assert error["failing_items"][0]["index"] == 0
+    assert "project" in error["failing_items"][0]["reason"]
+    assert await db_session.get(Deposit, body["deposit_id"]) is None
+
+
+async def test_knowledge_entry_project_equal_to_brand_new_envelope_project_accepted(client, db_session):
+    """An explicit entry-level `project` equal to the deposit envelope's own
+    `project` is always accepted, even when that project name is brand new
+    to this same deposit (about to be auto-stubbed) -- the envelope's own
+    project counts as existing for this check regardless of DB state at
+    validation time, since `_insert_deposit` guarantees the stub exists (or
+    already existed) before `knowledge[]` is applied.
+    """
+    headers = await _machine_headers(db_session)
+    assert await db_session.get(Project, "brand-new-matching-project") is None
+
+    body = _deposit_body(
+        project="brand-new-matching-project",
+        knowledge=[
+            _knowledge_new(title="Explicit but matches envelope", project="brand-new-matching-project")
+        ],
+    )
+
+    resp = await client.post("/v1/deposits", json=body, headers=headers)
+
+    assert resp.status_code == 200
+    entry_id = resp.json()["knowledge"][0]["id"]
+    entry = await db_session.get(KnowledgeEntry, entry_id)
+    assert entry.project == "brand-new-matching-project"
+    assert (await db_session.get(Project, "brand-new-matching-project")) is not None
+
+
+async def test_replay_of_stored_deposit_does_not_rederive_project_cascade(client, db_session):
+    """Idempotent replay returns the ack stored at original acceptance time
+    verbatim -- it must never re-run knowledge[] application (and therefore
+    never re-derive the project cascade) on a retried body, even one shaped
+    differently from the original.
+    """
+    headers = await _machine_headers(db_session)
+    deposit_id = str(ULID())
+    original = _deposit_body(
+        deposit_id=deposit_id,
+        project="cascade-proj-4",
+        knowledge=[_knowledge_new(title="Original cascade item")],
+    )
+    resp1 = await client.post("/v1/deposits", json=original, headers=headers)
+    assert resp1.status_code == 200
+    original_ack = resp1.json()
+
+    # Retried body: same deposit_id, but a materially different knowledge[]
+    # item (explicit null this time) -- must be ignored in favor of replay.
+    retry = _deposit_body(
+        deposit_id=deposit_id,
+        project="cascade-proj-4",
+        knowledge=[_knowledge_new(title="Different item entirely", project=None)],
+    )
+    resp2 = await client.post("/v1/deposits", json=retry, headers=headers)
+    assert resp2.status_code == 200
+    retried_ack = resp2.json()
+
+    assert retried_ack["replayed"] is True
+    assert retried_ack["knowledge"] == original_ack["knowledge"]
+
+    # Only the one entry from the original deposit exists.
+    entries = (
+        await db_session.scalars(select(KnowledgeEntry).where(KnowledgeEntry.deposit_id == deposit_id))
+    ).all()
+    assert len(entries) == 1
+    assert entries[0].title == "Original cascade item"
+
+
 async def test_knowledge_strict_namespace_validation_rejected(client, db_session):
     headers = await _machine_headers(db_session)
     body = _deposit_body(project="brain", knowledge=[_knowledge_new(namespace="not-a-real-shelf")])
@@ -803,6 +1024,59 @@ async def test_duplicate_flag_created_for_near_identical_entry_same_namespace(cl
     # never blocks acceptance
     entry = await db_session.get(KnowledgeEntry, dup_id)
     assert entry.status == "active"
+
+
+async def test_duplicate_hint_suppressed_against_own_supersedes_target(client, db_session):
+    """A corrective entry that explicitly supersedes a near-identical parent
+    must NOT get a duplicate flag pointing at that same parent -- naming it
+    in `supersedes[]` is a deliberate replacement, not an accidental
+    near-duplicate. It must still be flagged against an unrelated but
+    genuinely similar entry.
+    """
+    headers = await _machine_headers(db_session)
+    parent_id = await _deposit_one_entry(
+        client,
+        headers,
+        "brain",
+        title="Docker Compose Healthcheck Times Out On Cold Start",
+        namespace="lessons",
+        body="The healthcheck interval was too aggressive for a cold container start.",
+    )
+    # A second, unrelated-but-similar entry that should still surface as a hint.
+    unrelated_similar_id = await _deposit_one_entry(
+        client,
+        headers,
+        "brain",
+        title="Docker Compose Healthcheck Times Out On Cold Start Redux",
+        namespace="lessons",
+        body="Another write-up covering the same cold-start healthcheck timing problem.",
+    )
+
+    corrective_body = _deposit_body(
+        project="brain",
+        knowledge=[
+            _knowledge_new(
+                title="Docker Compose Healthcheck Times Out On Cold Start",
+                namespace="lessons",
+                body="A slightly different write-up of the same healthcheck timing lesson.",
+                supersedes=[parent_id],
+            )
+        ],
+    )
+    resp = await client.post("/v1/deposits", json=corrective_body, headers=headers)
+    assert resp.status_code == 200
+    corrective_id = resp.json()["knowledge"][0]["id"]
+
+    flags = (
+        await db_session.scalars(select(Flag).where(Flag.type == "duplicate", Flag.entry_id == corrective_id))
+    ).all()
+    related_ids = {f.related_entry_id for f in flags}
+    assert parent_id not in related_ids  # suppressed: named in this item's own supersedes[]
+    assert unrelated_similar_id in related_ids  # still flagged: genuinely similar, not superseded
+
+    # The parent is still cleanly superseded (supersession itself unaffected).
+    parent = await db_session.get(KnowledgeEntry, parent_id)
+    assert parent.status == "superseded"
 
 
 async def test_duplicate_flag_created_for_identical_body_under_different_title(client, db_session):

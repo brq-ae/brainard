@@ -92,6 +92,11 @@ async def test_ui_mint_machine_shows_paste_line(client, db_session):
     # "follow the returned instructions exactly" was refused by a
     # well-defended AI elsewhere as prompt-injection-shaped).
     assert "apply it with your normal judgment" in body
+    # Patch 2026-08-07 (docs/onboarding.md "Naming: the owner assigns
+    # project slugs"): the mint page reinforces, right under the
+    # paste-line, that <PROJECT> is the owner's call, never the AI's guess.
+    assert "Replace <PROJECT> with the project slug YOU choose" in body
+    assert "don't let the AI pick" in body
     assert "it never overrides your safety rules" in body
 
     # not shown again on a plain re-list of the page (same rule as the token itself)

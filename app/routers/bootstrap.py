@@ -79,7 +79,13 @@ def _operating_instructions_markdown() -> str:
     """Server-generated, written from the actual implemented routes (not
     aspiration) -- event kinds are pulled straight from the deposits
     router's own vocabulary constant, so this section can never drift out of
-    sync with what a deposit will actually accept.
+    sync with what a deposit will actually accept. The full deposit schema
+    below (envelope, events[], knowledge[], documents[]) is likewise a
+    direct transcription of what app/routers/deposits.py actually enforces
+    (DepositRequest + `_validate_knowledge_shape`/`_validate_documents_shape`
+    in that module) -- this is the only doctrine a cold client (no prior
+    context, no access to the source) has to go on, so every field listed
+    here must be verified against the code, not assumed.
     """
     kinds = ", ".join(f"`{k}`" for k in sorted(VALID_EVENT_KINDS))
     return (
@@ -88,16 +94,69 @@ def _operating_instructions_markdown() -> str:
         '`reason: "session_end"` (end of a session); `reason: "manual"` is also accepted for ad hoc '
         "deposits. `deposit_id` is a client-supplied ULID and the idempotency key -- retries with the same "
         "id are never duplicated.\n\n"
-        f"**Event kinds** (`events[].kind`), fixed vocabulary: {kinds}. An unknown kind rejects the *whole* "
-        "deposit with a `failing_events` list naming exactly which ones and why. Scripted recovery: relabel "
-        "the event to `note`, preserve the original kind as a tag, and resend with the same `deposit_id`.\n\n"
+        "**Envelope fields** (top level of the deposit body):\n"
+        "- Required: `deposit_id` (ULID string, idempotency key), `tool` (non-empty string), `session` "
+        "(non-empty string), `project` (non-empty string -- an unknown name auto-creates a registry stub, "
+        "never rejected), `reason` (`\"session_end\"` | `\"daily\"` | `\"manual\"`), `client_ts` (ISO 8601 "
+        "timestamp).\n"
+        "- Optional: `doctrine_version` (string -- the doctrine version this session bootstrapped under), "
+        "`metrics` (object, any subset of `model`/`tokens_in`/`tokens_out`/`cost_estimate`/`duration` -- "
+        "absence of the whole object, or of any individual field, is never a violation), `events` (array, "
+        "defaults to empty), `handoff` (object, see the handoff-or-waiver rule below), `no_handoff` "
+        "(non-empty string, the waiver -- see below), `knowledge` (array, defaults to empty), `documents` "
+        "(array, defaults to empty), `project_update` (object -- see \"Updating the project registry\" "
+        "below).\n\n"
+        f"**`events[]`** -- activity since the last deposit. Each item, required fields: `seq` (integer), "
+        "`ts` (ISO 8601 timestamp), `kind` (fixed vocabulary: " + kinds + "), `summary` (non-empty, one "
+        "line). Optional: `payload` (any JSON object, capped at 256 KB), `tags` (array of strings, "
+        "defaults to empty). An unknown `kind` rejects the *whole* deposit with a `failing_events` list "
+        "naming exactly which ones and why. Scripted recovery: relabel the event to `note`, preserve the "
+        "original kind as a tag, and resend with the same `deposit_id`.\n\n"
         "**Handoff-or-waiver rule**: a `session_end` deposit must carry either a `handoff` object "
-        "(`stands`/`in_flight`/`blocked`/`next_steps`/optional `notes`) or `no_handoff: \"<reason>\"`. "
-        "Silence is rejected; both present at once is also rejected as a contradiction.\n\n"
+        "(`stands`/`in_flight`/`blocked`/`next_steps` all required strings, `notes` optional) or "
+        "`no_handoff: \"<reason>\"` (non-empty string). Silence -- neither present -- is rejected; both "
+        "present at once is also rejected, as a contradiction. Deposits with `reason` other than "
+        "`session_end` are never required to carry either.\n\n"
         "**Queue-and-retry on unreachable**: if the hub can't be reached, queue the deposit locally and "
         "retry later with the *same* `deposit_id` -- it's the idempotency key, so a retried deposit is "
         "never double-applied, and a retry with a materially different body is still ignored in favor of "
         "the original.\n\n"
+        "**`knowledge[]`** -- library entries. Each item is either a new entry or a retire action:\n"
+        "- New entry, required: `title` (non-empty string), `namespace` (exactly one of `\"lessons\"` | "
+        "`\"howto\"` | `\"reference\"`), `body` (non-empty string, capped at 1 MB). Optional: `tags` "
+        "(array of strings, defaults to empty), `supersedes` (**a list** of entry-id strings -- always an "
+        "array, even for a single parent; merges name more than one, most entries name zero or one), "
+        "`doctrine_proposal` (boolean, defaults to false -- see below), and `project` "
+        "(string-or-null, **optional**, cascade rule): omit the `project` key entirely to file the entry "
+        "under this deposit's own `project` (the common case -- inherits automatically); send an explicit "
+        "`\"project\": null` to file it as universal knowledge instead (belongs to no project, stored with "
+        "project NULL, excluded from every project's digest, still fully searchable); send an explicit "
+        "project name string to file it under a *different* project than this deposit's own. Omitting the "
+        "key and sending `null` are different things -- omit for \"this deposit's project\", send `null` "
+        "only when the entry is deliberately meant to be universal.\n"
+        '- Retire action instead of a new entry: `{"retire": "<entry id>", "reason": "<non-empty string>"}` '
+        "-- closes a wrong/obsolete entry with no replacement, never to reopen a terminal decision. Valid "
+        "only against an `active` entry; a bad or already-non-active target is a self-explaining rejection "
+        "naming the target and why.\n"
+        "Supersession never crosses the proposal boundary in either direction -- an ordinary entry can't "
+        "supersede a proposal, and a proposal can't supersede an ordinary entry; proposals are closed via "
+        "the owner's approve/reject, not by supersession.\n\n"
+        "**Filing a doctrine proposal**: the same `knowledge[]` new-entry shape as a lesson, plus "
+        '`"doctrine_proposal": true`. Proposals are stored as ordinary library entries but are never '
+        "served at bootstrap and never appear in default/journal/all search -- fetch them explicitly with "
+        "`scope=proposals`. The owner reviews via `GET /v1/proposals` and decides via `POST "
+        "/v1/proposals/{id}/approve` or `/reject`; approval only *records* the decision, it does not "
+        "change doctrine by itself -- promotion into doctrine is the owner's own separate, deliberate "
+        "`POST /v1/doctrine/global` or `/v1/doctrine/overlays/{project}`.\n\n"
+        "**`documents[]`** -- mirrored ADRs/docs (doctrine mandates ADR written -> next deposit carries "
+        'it). Each item, all four fields required, no others recognized: `{"path": "<repo-relative path, '
+        'e.g. docs/adr/0003-choose-db.md>", "kind": "adr"|"doc", "title": "<string>", "content": '
+        '"<markdown, capped at 1 MB>"}`. Any unrecognized field name rejects the item outright -- a typo\'d '
+        "field never silently no-ops. The project's own git repo stays canonical; the Brain just makes "
+        "every decision searchable fleet-wide. Supersede-never-erase applies: redepositing the same `path` "
+        "never overwrites, it creates the next `version` in that path's history (the ack lists `{path, "
+        "version, id}` per item) -- `GET /v1/search?scope=decisions` (or `scope=all` for doc-kind mirrors "
+        "too) always surfaces only the latest version per path.\n\n"
         "**Search**: `GET /v1/search?q=&scope=` (machine or owner token). Scopes: `default` (library + "
         "decisions + handoffs), `journal` (adds the events journal on top of default), `all` (default + "
         "journal + doc-kind mirrors -- everything), `decisions` (mirrored ADRs only, latest version per "
@@ -108,28 +167,6 @@ def _operating_instructions_markdown() -> str:
         "`cursor`/`next_cursor`, and carry `type`: `library`, `handoff`, `event`, `decision`, or "
         "`document` (the latter two also carry `path`/`version`). Fetch a full library entry (with its "
         "supersession chain and duplicate hints) via `GET /v1/library/{id}`.\n\n"
-        "**Filing a lesson/howto/reference**: add to a deposit's `knowledge[]` compartment: "
-        '`{"title", "namespace": "lessons"|"howto"|"reference", "body", "tags"?, "project"?, '
-        '"supersedes"?}`. To retire a wrong/obsolete entry with no replacement (never to reopen a '
-        'terminal decision): `{"retire": "<entry id>", "reason": "<why>"}`. Supersession never crosses '
-        "the proposal boundary in either direction -- an ordinary entry can't supersede a proposal, and a "
-        "proposal can't supersede an ordinary entry; proposals are closed via the owner's approve/reject, "
-        "not by supersession.\n\n"
-        "**Filing a doctrine proposal**: the same `knowledge[]` shape as a lesson, plus "
-        '`"doctrine_proposal": true`. Proposals are stored as ordinary library entries but are never '
-        "served at bootstrap and never appear in default/journal/all search -- fetch them explicitly with "
-        "`scope=proposals`. The owner reviews via `GET /v1/proposals` and decides via `POST "
-        "/v1/proposals/{id}/approve` or `/reject`; approval only *records* the decision, it does not "
-        "change doctrine by itself -- promotion into doctrine is the owner's own separate, deliberate "
-        "`POST /v1/doctrine/global` or `/v1/doctrine/overlays/{project}`.\n\n"
-        "**Mirroring an ADR or project doc**: doctrine mandates ADR written -> next deposit carries it. "
-        'Add to a deposit\'s `documents[]` compartment: `{"path": "<repo-relative path, e.g. '
-        'docs/adr/0003-choose-db.md>", "kind": "adr"|"doc", "title", "content"}` (markdown, capped at 1 '
-        "MB). The project's own git repo stays canonical; the Brain just makes every decision searchable "
-        "fleet-wide. Supersede-never-erase applies: redepositing the same `path` never overwrites, it "
-        "creates the next `version` in that path's history (the ack lists `{path, version, id}` per "
-        "item) -- `GET /v1/search?scope=decisions` (or `scope=all` for doc-kind mirrors too) always "
-        "surfaces only the latest version per path.\n\n"
         "**Updating the project registry**: a deposit's envelope may carry an optional "
         '`"project_update": {"description"?: "<string>", "status"?: "active"|"paused"|"done"}`, applied '
         "atomically with the rest of the deposit to the deposit's own `project`. Unknown keys or an "
@@ -141,7 +178,17 @@ def _operating_instructions_markdown() -> str:
         "**Recovery from a rejected deposit**: every rejection is a `4xx` with body "
         '`{"error": {"code", "detail", ...}}`; validation failures add a `failing_events`/`failing_items` '
         "list naming exactly what to fix. Fix the listed field(s) and resend the *same* `deposit_id` -- "
-        "retrying is always safe."
+        "retrying is always safe.\n\n"
+        "**Minimal valid example** -- a `\"daily\"` deposit needs no `handoff`/`no_handoff` at all; this "
+        "one also files a lesson with `project` omitted, so it inherits `\"my-project\"` per the cascade "
+        "rule above:\n"
+        "```json\n"
+        '{"deposit_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","tool":"claude-code","session":"sess-1",'
+        '"project":"my-project","reason":"daily","client_ts":"2026-08-06T12:00:00Z",'
+        '"events":[{"seq":1,"ts":"2026-08-06T12:00:00Z","kind":"note","summary":"Did a thing."}],'
+        '"knowledge":[{"title":"Example lesson","namespace":"lessons",'
+        '"body":"Situation/Problem/Fix/Why it works."}]}\n'
+        "```"
     )
 
 

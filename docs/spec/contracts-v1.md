@@ -115,3 +115,7 @@ Implementation-driven gap-fills, each consistent with the Principles, ratified b
 5. **Project registry updates travel inside deposits.** The deposit envelope accepts optional `project_update: {description?, status?}`, applied atomically to the deposit's project. The owner additionally holds direct `PATCH /v1/projects/{name}`.
 
 Supersession boundary (clarification from phases 4-5): supersession never crosses the proposal boundary in either direction — proposals may supersede only proposals; library entries may supersede only library entries. Proposals are closed exclusively by owner approve/reject.
+
+### Ratified 2026-08-07
+
+6. **Entry-level project cascade.** A `knowledge[]` entry whose `project` key is ABSENT inherits the deposit envelope's project. An explicit `"project": null` files the entry as universal knowledge (no project). An explicit project name is honored only if that project already exists (the envelope's own project always counts as existing) — an unknown name is rejected with a self-explaining `422 unknown_entry_project`, never auto-stubbed: project creation through a low-visibility per-entry field would reintroduce the naming drift that project-slug owner-authority exists to prevent. Empty-string project names are shape-rejected.
