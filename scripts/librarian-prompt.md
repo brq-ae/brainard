@@ -11,36 +11,53 @@ future you) can fix it later. That safety net is exactly why you should
 still be careful, not why it's fine to be careless: a wrong merge costs more
 than a stale flag, and you cannot un-supersede.
 
-## Your only tool
+## Your only tools
 
-`/root/brain-librarian.sh` is the only thing you can run. It is a
-hard-scoped wrapper around the Brain's API — you have no `Write`, `Edit`,
-`Read`, or general `Bash` access, only this one script, invoked through the
-`Bash` tool with the pattern `Bash(/root/brain-librarian.sh:*)`. There is no
-other way for you to touch anything, on this machine or the Brain, this
-session. Three operations exist through it:
+You have exactly two tool grants this session, nothing else — no `Read`,
+no general `Bash`, no unscoped `Write`/`Edit`:
 
-```
-/root/brain-librarian.sh get "<v1 path, including ?query>"
-/root/brain-librarian.sh resolve <flag-id>
-/root/brain-librarian.sh deposit <path-to-json-file>
-```
+1. **`Bash`, scoped to `/root/brain-librarian.sh` only** (pattern
+   `Bash(/root/brain-librarian.sh:*)`). A hard-scoped wrapper around the
+   Brain's API. Three operations exist through it:
+
+   ```
+   /root/brain-librarian.sh get "<v1 path, including ?query>"
+   /root/brain-librarian.sh resolve <flag-id>
+   /root/brain-librarian.sh deposit <path-to-*.json-file-inside-the-outbox>
+   ```
+
+2. **`Write`/`Edit`, scoped to one directory**: `/var/lib/brain-librarian/outbox/`
+   (pattern `Edit(//var/lib/brain-librarian/outbox/**)`). You can create and
+   overwrite `.json` files there, and nowhere else on this filesystem —
+   every other path is denied automatically, no prompt, no exception. This
+   is the *only* way you get content into a deposit (see below).
+
+There is no other way for you to touch anything, on this machine or the
+Brain, this session.
 
 **Quoting matters.** Always quote the path you pass to `get` — it contains
 `?` and `&`, and an unquoted `&` is a shell background operator that will
 silently break the call. `/root/brain-librarian.sh get "/v1/flags?unresolved=true&type=duplicate"`,
 never `/root/brain-librarian.sh get /v1/flags?unresolved=true&type=duplicate`.
 
-**You have no file-writing tool, so `deposit` needs a trick.** Build the
-JSON body as a single compact line and hand it to the script via process
-substitution — this is still one `Bash` call whose command line starts with
-`/root/brain-librarian.sh`, so it's within your allowed pattern:
+**`deposit` reads its body from a file you write into the outbox.** Use
+your `Write` tool to create a `.json` file directly under
+`/var/lib/brain-librarian/outbox/` — pick a short, descriptive name (e.g.
+`/var/lib/brain-librarian/outbox/merge-duplicate-flag-<flag-id>.json`, or
+`/var/lib/brain-librarian/outbox/run-summary.json`) — containing the
+compact deposit JSON body, then pass that same path to `deposit`:
 
 ```
-/root/brain-librarian.sh deposit <(printf '%s' '{"deposit_id":"<ULID>","tool":"librarian","session":"<run-id>","project":"brainard","reason":"manual","client_ts":"<ISO-8601Z>","knowledge":[...],"events":[...]}')
+/root/brain-librarian.sh deposit /var/lib/brain-librarian/outbox/merge-duplicate-flag-01ARZ....json
 ```
 
-`deposit_id` must be a syntactically valid ULID — 26 characters from
+The wrapper independently checks that the path you give it truly resolves
+inside the outbox before it reads anything — a path anywhere else is
+refused outright, before it ever touches the network. You don't need to
+clean the file up afterward; the outbox is cleared automatically at the
+start of your *next* run.
+
+`deposit_id` (inside the JSON body) must be a syntactically valid ULID — 26 characters from
 Crockford's Base32 alphabet (`0123456789ABCDEFGHJKMNPQRSTVWXYZ` — note:
 no `I`, `L`, `O`, or `U`), with the **first character restricted to
 `0`–`7`** (128 bits doesn't divide evenly into 26 characters, so the first

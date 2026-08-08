@@ -3,11 +3,30 @@
 # agent (ADR-0004: "fully autonomous"; docs/spec/contracts-v1.md, the
 # librarian's inbox: fork/duplicate flags, lesson.candidate harvest).
 #
-# Runs headless Claude Code once, non-interactively, with its *only* tool
-# hard-scoped to /root/brain-librarian.sh (itself hard-scoped to GET /v1/*,
-# POST /v1/deposits, and POST /v1/flags/*/resolve -- see that script and
-# scripts/librarian-prompt.md, the agent's working prompt). Everything the
-# librarian can ever do to the Brain is bounded by those two files.
+# Runs headless Claude Code once, non-interactively, with exactly two tool
+# grants: Bash, hard-scoped to /root/brain-librarian.sh (itself hard-scoped
+# to GET /v1/*, POST /v1/deposits, and POST /v1/flags/*/resolve), and
+# Edit -- which, per Claude Code's own permission model, is the rule name
+# that actually governs the Write tool too (a literal `Write(path)` rule is
+# accepted but silently never consulted; only `Edit(path)` rules are, and
+# they cover every file-mutating tool including Write -- verified against
+# `claude --help` and the installed CLI's own startup-warning text at
+# implementation time) -- scoped to the outbox directory only. See that
+# script and scripts/librarian-prompt.md, the agent's working prompt.
+# Everything the librarian can ever do to the Brain is bounded by those
+# two grants plus the two files they point at.
+#
+# Why Write/Edit is granted at all: headless Claude Code's Bash tool has a
+# static command scanner that rejects `<(...)` process-substitution syntax
+# outright, before any permission check even runs -- so a deposit body can
+# no longer be built inline and handed to brain-librarian.sh via a pipe (the
+# original design). The outbox is the fix: the librarian writes its deposit
+# JSON to a file under OUTBOX_DIR (Write access scoped to nowhere else),
+# then passes that file's path to `brain-librarian.sh deposit`, which
+# itself independently verifies (via `realpath`, symlink-proof) that the
+# path truly resolves inside the outbox before ever reading it -- so even
+# if the CLI-level path scoping were ever misconfigured, the wrapper script
+# still refuses to read/upload anything outside that one directory.
 #
 # Run on the Docker host (not inside a container): it shells out to
 # `claude`, and brain-librarian.sh talks to the API over localhost:8300 --
@@ -26,11 +45,29 @@ KEEP=30
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="$LOG_DIR/librarian-${TIMESTAMP}.log"
 
+# Must match OUTBOX_DIR in /root/brain-librarian.sh and the --allowedTools
+# Edit(...) scope below -- all three have to agree on one path.
+OUTBOX_DIR="/var/lib/brain-librarian/outbox"
+
 mkdir -p -m 700 "$LOG_DIR"
+mkdir -p -m 700 "$OUTBOX_DIR"
 
 run_status=0
 (
   echo "[librarian] run started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Clear the outbox from the *previous* run at the start of this one --
+  # not at the end, deliberately: this run's files stay in place after it
+  # finishes, available for debugging, right up until the next run starts
+  # and clears them in turn. Plus a belt-and-suspenders age-based prune
+  # (should never actually fire under normal nightly cron, but guards
+  # against the outbox growing unbounded if the cron line is ever disabled
+  # for a stretch and then re-enabled, or the clear step above is ever
+  # bypassed).
+  echo "[librarian] clearing outbox left over from the previous run: $OUTBOX_DIR"
+  rm -f "$OUTBOX_DIR"/*.json 2>/dev/null || true
+  echo "[librarian] pruning any outbox file older than 7 days"
+  find "$OUTBOX_DIR" -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
 
   if ! command -v claude >/dev/null 2>&1; then
     echo "[librarian] error: 'claude' CLI not found on PATH -- cron runs with a minimal PATH that may not" \
@@ -50,13 +87,17 @@ run_status=0
     exit 1
   fi
 
-  echo "[librarian] invoking claude (model: sonnet, tools: Bash(/root/brain-librarian.sh:*) only)"
+  echo "[librarian] invoking claude (model: sonnet, tools: Bash(/root/brain-librarian.sh:*) + Edit(//${OUTBOX_DIR#/}/**) only)"
 
   # -p/--print: non-interactive, exits after one response -- no TTY needed,
-  # safe under cron. --allowedTools pre-authorizes exactly one tool pattern;
-  # anything the agent tries outside it is denied automatically (print mode
-  # can't prompt interactively), so this is the entire enforcement boundary
-  # -- no --dangerously-skip-permissions is used or needed.
+  # safe under cron. --allowedTools pre-authorizes exactly these two tool
+  # patterns; anything the agent tries outside them is denied automatically
+  # (print mode can't prompt interactively), so this is the entire
+  # enforcement boundary -- no --dangerously-skip-permissions is used or
+  # needed. The `Edit(...)` rule (not `Write(...)` -- see the file header
+  # comment for why) is the one that actually governs Write-tool calls too,
+  # and the leading `//` forces the pattern to be read as an absolute
+  # filesystem path rather than one relative to some settings-file root.
   #
   # Deviation from the original brief's proposed `--max-turns 40`: the
   # installed CLI (verified via `claude --help`, checked at implementation
@@ -66,7 +107,7 @@ run_status=0
   # the full flag verification.
   claude -p "$(cat "$PROMPT_FILE")" \
     --model sonnet \
-    --allowedTools "Bash(/root/brain-librarian.sh:*)" \
+    --allowedTools "Bash(/root/brain-librarian.sh:*) Edit(//${OUTBOX_DIR#/}/**)" \
     --max-budget-usd 5 \
     --output-format text
 

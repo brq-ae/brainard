@@ -220,20 +220,39 @@ is nothing prior for them to supersede.
 **What runs, and what bounds it:**
 
 - `/root/brain-librarian.sh` — a hard-scoped wrapper (same pattern as
-  `/root/brain-hub.sh`), the librarian's **only** tool. It permits exactly
-  three operations: `GET /v1/*` (read anything), `POST /v1/deposits`
-  (checkpoint knowledge/events, same as any session), and
-  `POST /v1/flags/{id}/resolve` (close out a worked flag). Nothing else is
-  reachable through it. Reads its bearer token from
+  `/root/brain-hub.sh`), one of the librarian's exactly two tools. It
+  permits exactly three operations: `GET /v1/*` (read anything),
+  `POST /v1/deposits` (checkpoint knowledge/events, same as any session),
+  and `POST /v1/flags/{id}/resolve` (close out a worked flag). Nothing else
+  is reachable through it. Reads its bearer token from
   `/root/.brain-librarian-token` (mode 600) — fails loudly if that file is
-  missing rather than silently no-op'ing.
+  missing rather than silently no-op'ing. A deposit body is either a
+  process-substitution pipe (unreachable from headless Claude Code — its
+  Bash static scanner rejects `<(...)` syntax before any permission check
+  runs — but still accepted for interactive/manual use) or a `.json` file
+  that must `realpath`-resolve (symlink-proof) strictly inside
+  `/var/lib/brain-librarian/outbox/` — see the next bullet for how the
+  librarian gets a file there at all.
+- `/var/lib/brain-librarian/outbox/` (mode 700, root — created out-of-band,
+  not by any committed script; see "Prerequisites" below) — the librarian's
+  *only* writable location, anywhere. `scripts/librarian-run.sh` clears it
+  at the start of each run (previous run's files are left in place in the
+  meantime, for debugging) and prunes anything older than 7 days as a
+  backstop.
 - `scripts/librarian-run.sh` (committed, `chmod 755`) — the cron
-  entrypoint. Invokes headless Claude Code (`claude -p`) with its tool
-  access locked to `Bash(/root/brain-librarian.sh:*)` only — no `Write`,
-  `Edit`, or general `Bash`, so the wrapper script above is the entire
-  enforcement boundary on what the librarian can do. Logs each run to a
-  timestamped file under `/var/log/brain-librarian/` (created if missing),
-  pruned to the last 30 runs.
+  entrypoint. Invokes headless Claude Code (`claude -p`) with tool access
+  locked to exactly two grants: `Bash(/root/brain-librarian.sh:*)`, and
+  `Edit(//var/lib/brain-librarian/outbox/**)` — the librarian composes its
+  deposit JSON as a file there with its `Write` tool, then hands that path
+  to the wrapper above. (`Edit(...)`, not `Write(...)`: Claude Code's
+  permission engine only consults `Edit(path)` rules for file-mutating
+  tools — a literal `Write(path)` rule is accepted but silently never
+  checked, per the installed CLI's own startup-warning text, verified at
+  implementation time.) No general `Bash`, `Read`, or unscoped `Write`, so
+  those two scoped grants are the entire enforcement boundary on what the
+  librarian can do. Logs each run to a timestamped file under
+  `/var/log/brain-librarian/` (created if missing), pruned to the last 30
+  runs.
 - `scripts/librarian-prompt.md` (committed) — the librarian's working
   prompt: identity, the four-step loop (work the flag queue, harvest
   `lesson.candidate` events, a light quality pass, close with a summary
@@ -242,13 +261,13 @@ is nothing prior for them to supersede.
   ambiguous duplicate/fork judgment calls as "distinct" rather than risk a
   bad merge.
 
-### Prerequisite: mint the librarian machine
+### Prerequisites
 
-Not done yet on this deployment — `/root/.brain-librarian-token` does not
-exist until this step happens. Owner token required, same ceremony as any
-other machine (see "Minting machines" above): name it something
-identifiable, e.g. `librarian`, save the printed token to
-`/root/.brain-librarian-token`, then:
+**Mint the librarian machine.** Not done yet on this deployment —
+`/root/.brain-librarian-token` does not exist until this step happens.
+Owner token required, same ceremony as any other machine (see "Minting
+machines" above): name it something identifiable, e.g. `librarian`, save
+the printed token to `/root/.brain-librarian-token`, then:
 
 ```
 chmod 600 /root/.brain-librarian-token
@@ -258,6 +277,12 @@ chmod 600 /root/.brain-librarian-token
 invoke `claude` at all if it's missing, so it's safe to install the cron
 line below before or after minting — a run before the token exists just
 logs the error and exits, no partial/garbled state.
+
+**The outbox directory** (`/var/lib/brain-librarian/outbox/`, mode 700,
+root) already exists on this host — created out-of-band, not by any
+committed script. `scripts/librarian-run.sh` also `mkdir -p -m 700`s it
+itself on every run regardless, so it's self-healing if it's ever missing
+(e.g. after a fresh host build) — nothing further to do here.
 
 ### Cron (host-side — never inside the container)
 
