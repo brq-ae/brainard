@@ -14,7 +14,9 @@ from app.routers import (
     bootstrap,
     deposits,
     doctrine,
+    events,
     export,
+    flags,
     health,
     library,
     machines,
@@ -63,6 +65,8 @@ app.include_router(health.router)
 app.include_router(machines.router)
 app.include_router(deposits.router)
 app.include_router(library.router)
+app.include_router(flags.router)
+app.include_router(events.router)
 app.include_router(search.router)
 app.include_router(doctrine.router)
 app.include_router(proposals.router)

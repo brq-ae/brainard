@@ -166,7 +166,9 @@ def _operating_instructions_markdown() -> str:
         "prior versions stay stored, supersede-never-erase, but drop out of search). Results paginate via "
         "`cursor`/`next_cursor`, and carry `type`: `library`, `handoff`, `event`, `decision`, or "
         "`document` (the latter two also carry `path`/`version`). Fetch a full library entry (with its "
-        "supersession chain and duplicate hints) via `GET /v1/library/{id}`.\n\n"
+        "supersession chain and duplicate hints) via `GET /v1/library/{id}`. Curation agents (e.g. the "
+        "librarian) also have `GET /v1/flags` (the fork/duplicate queue) and `GET /v1/events` (a filtered, "
+        "non-ranked journal read) -- not typically needed by ordinary sessions.\n\n"
         "**Updating the project registry**: a deposit's envelope may carry an optional "
         '`"project_update": {"description"?: "<string>", "status"?: "active"|"paused"|"done"}`, applied '
         "atomically with the rest of the deposit to the deposit's own `project`. Unknown keys or an "

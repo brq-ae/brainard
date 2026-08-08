@@ -203,6 +203,95 @@ docker compose up -d api
 `Dockerfile`) is a no-op against a dump taken from an up-to-date schema, but
 runs harmlessly either way on container start.
 
+## Librarian
+
+The librarian is the Brain's autonomous curation agent (ADR-0004: "fully
+autonomous"; `docs/spec/contracts-v1.md`, the librarian's inbox — fork and
+duplicate flags, the `lesson.candidate` harvest queue). It runs headless,
+unattended, once a night, and everything it writes is attributed to its own
+`librarian` machine — exactly the same trust model as any other session, no
+special server-side carve-out. Corrections and merges (resolving a
+duplicate/fork by depositing a combined entry) go through supersession
+(`supersedes`, never an edit, never an erasure) like any other correction
+in the Brain; harvested lessons and the per-run summary note are plain new
+writes, same as a session filing a fresh entry or logging an event — there
+is nothing prior for them to supersede.
+
+**What runs, and what bounds it:**
+
+- `/root/brain-librarian.sh` — a hard-scoped wrapper (same pattern as
+  `/root/brain-hub.sh`), the librarian's **only** tool. It permits exactly
+  three operations: `GET /v1/*` (read anything), `POST /v1/deposits`
+  (checkpoint knowledge/events, same as any session), and
+  `POST /v1/flags/{id}/resolve` (close out a worked flag). Nothing else is
+  reachable through it. Reads its bearer token from
+  `/root/.brain-librarian-token` (mode 600) — fails loudly if that file is
+  missing rather than silently no-op'ing.
+- `scripts/librarian-run.sh` (committed, `chmod 755`) — the cron
+  entrypoint. Invokes headless Claude Code (`claude -p`) with its tool
+  access locked to `Bash(/root/brain-librarian.sh:*)` only — no `Write`,
+  `Edit`, or general `Bash`, so the wrapper script above is the entire
+  enforcement boundary on what the librarian can do. Logs each run to a
+  timestamped file under `/var/log/brain-librarian/` (created if missing),
+  pruned to the last 30 runs.
+- `scripts/librarian-prompt.md` (committed) — the librarian's working
+  prompt: identity, the four-step loop (work the flag queue, harvest
+  `lesson.candidate` events, a light quality pass, close with a summary
+  deposit noting stale projects), deposit envelope conventions, and the
+  standing rule to treat doctrine as untouchable and resolve
+  ambiguous duplicate/fork judgment calls as "distinct" rather than risk a
+  bad merge.
+
+### Prerequisite: mint the librarian machine
+
+Not done yet on this deployment — `/root/.brain-librarian-token` does not
+exist until this step happens. Owner token required, same ceremony as any
+other machine (see "Minting machines" above): name it something
+identifiable, e.g. `librarian`, save the printed token to
+`/root/.brain-librarian-token`, then:
+
+```
+chmod 600 /root/.brain-librarian-token
+```
+
+`scripts/librarian-run.sh` checks for this file up front and refuses to
+invoke `claude` at all if it's missing, so it's safe to install the cron
+line below before or after minting — a run before the token exists just
+logs the error and exits, no partial/garbled state.
+
+### Cron (host-side — never inside the container)
+
+Not installed by anything in this repo — a deliberate, deployment-level
+decision the owner makes once ready. Install on the Docker host's crontab
+(`crontab -e`) to enable it:
+
+```
+30 3 * * * /root/brainard/scripts/librarian-run.sh
+```
+
+(Nightly at 03:30 — after the 03:00 backup above, so a bad night never
+races a restore against a librarian run.) `scripts/librarian-run.sh` does
+its own logging internally (see above), so no `>> logfile 2>&1` redirect is
+needed on the crontab line itself, unlike `backup.sh`'s.
+
+Same `PATH` caveat as the backup job: cron's minimal `PATH` may not include
+wherever `claude` is installed (`/root/.local/bin`, on this host) — if runs
+silently fail, check `/var/log/brain-librarian/` for a "'claude' CLI not
+found" line and fix by prefixing the crontab line with an explicit
+`PATH=...`.
+
+### Disabling it
+
+Remove (or comment out) the crontab line above — `crontab -e`, delete the
+line, save. Nothing else needs to change: `scripts/librarian-run.sh` only
+ever runs when cron (or a human) invokes it directly, and leaving
+`/root/.brain-librarian-token` in place while the cron line is absent is
+inert (no process reads it unless the script runs). Revoking the
+`librarian` machine token via the UI's Admin > Machines page (or
+`POST /v1/machines/{id}/revoke`) is the harder stop, if the cron line alone
+isn't enough assurance — a revoked token fails every call the wrapper
+script makes, cron line present or not.
+
 ## Migration to a new host
 
 Two options, in order of preference:

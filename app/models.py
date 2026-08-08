@@ -231,9 +231,17 @@ class KnowledgeEntry(Base):
 
 
 class Flag(Base):
-    """The librarian's future inbox (§3): fork and duplicate signals raised
-    while processing a deposit's knowledge[] compartment. Purely informative
-    -- never blocks acceptance of the deposit that raised them.
+    """The librarian's inbox (§3): fork and duplicate signals raised while
+    processing a deposit's knowledge[] compartment. Purely informative --
+    never blocks acceptance of the deposit that raised them.
+
+    Phase 8 (librarian support): `resolved_at`/`resolved_by` close a flag out
+    -- set together, server-side, by `POST /v1/flags/{id}/resolve`
+    (app/routers/flags.py). Both null means unresolved (the default listing
+    filter). Resolution is a terminal action attributed to the resolving
+    machine, same shape as every other "who/when" pair in this schema
+    (`KnowledgeEntry.machine_id`/`created_at`, etc.) -- never re-cleared,
+    consistent with supersede-never-erase: a flag is closed, not un-flagged.
     """
 
     __tablename__ = "flags"
@@ -247,6 +255,8 @@ class Flag(Base):
     # 'fork': {"parent_id": ...}. 'duplicate': {"rank": ..., "title": ...}.
     detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(26), ForeignKey("machines.id"), nullable=True, index=True)
 
 
 # --- Phase 4: doctrine & bootstrap (contracts-v1.md §4, §6) ---

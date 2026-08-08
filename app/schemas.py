@@ -377,3 +377,50 @@ class ProjectPatchResponse(BaseModel):
 class HandoffListResponse(BaseModel):
     results: list[ProjectHandoffOut]
     next_cursor: str | None
+
+
+# --- Flags (contracts-v1.md §3, ADR-0004 librarian inbox) ---
+
+
+class FlagListItem(BaseModel):
+    id: str
+    type: str
+    entry_id: str
+    related_entry_id: str | None
+    detail: dict[str, Any] | None
+    created_at: datetime
+    resolved_at: datetime | None
+    resolved_by: str | None
+
+
+class FlagListResponse(BaseModel):
+    results: list[FlagListItem]
+    next_cursor: str | None
+
+
+class FlagResolveResponse(BaseModel):
+    id: str
+    resolved_at: datetime
+    resolved_by: str
+    already_resolved: bool = False
+
+
+# --- Events (contracts-v1.md §2, §7; phase 8 librarian support) ---
+
+
+class EventListItem(BaseModel):
+    id: str
+    deposit_id: str
+    project: str
+    seq: int
+    ts: datetime
+    kind: str
+    summary: str
+    tags: list[str]
+    # Omitted (null) unless `include_payload=true` was requested.
+    payload: dict[str, Any] | None = None
+
+
+class EventListResponse(BaseModel):
+    results: list[EventListItem]
+    next_cursor: str | None

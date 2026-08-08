@@ -1,8 +1,10 @@
-"""Shared journal (events) read logic -- UI-only (contracts-v1.md §7 notes
-the journal is "opt-in per query" via GET /v1/search?scope=journal; no
-standalone events-listing endpoint exists in the session-facing API
-surface). Kept here, in one place, for the UI journal page
-(app/routers/ui_journal.py) -- same rationale as app/library.py's
+"""Shared journal (events) read logic. Originally UI-only (GET /v1/search
+?scope=journal is the full-text opt-in named by contracts-v1.md §7); phase 8
+(librarian support) adds a standalone `GET /v1/events` on top of the same
+`list_events` -- exact-match filtering (kind/project/since) for curation
+agents that need to walk the raw journal, not search it. Kept here, in one
+place, so the UI journal page (app/routers/ui_journal.py) and
+app/routers/events.py never drift -- same rationale as app/library.py's
 `list_entries`.
 """
 
@@ -35,6 +37,7 @@ async def list_events(
     *,
     project: str | None = None,
     kind: str | None = None,
+    since: datetime | None = None,
     cursor: str | None = None,
     limit: int = 20,
 ) -> tuple[list[Event], str | None]:
@@ -43,6 +46,8 @@ async def list_events(
         stmt = stmt.where(Event.project == project)
     if kind:
         stmt = stmt.where(Event.kind == kind)
+    if since is not None:
+        stmt = stmt.where(Event.ts >= since)
 
     if cursor is not None:
         cursor_ts, cursor_id = _decode_cursor(cursor)
