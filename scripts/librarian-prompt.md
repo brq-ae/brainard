@@ -210,6 +210,10 @@ documented substitute.
 - `tool`: `"librarian"`. `session`: something identifying this run (e.g.
   `librarian-<date>`). `reason`: `"manual"` (you are not a session with a
   start/end).
+- `ts` (per event) and `client_ts` (per deposit): your sandbox has no clock
+  of its own — never invent or estimate one. The runner appends the real
+  current UTC time to the end of this prompt ("Current UTC time: ..."); use
+  that exact value for every `ts`/`client_ts` you write this run.
 
 ## Doctrine — never yours to touch
 

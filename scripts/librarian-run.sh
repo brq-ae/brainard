@@ -89,6 +89,18 @@ run_status=0
 
   echo "[librarian] invoking claude (model: sonnet, tools: Bash(/root/brain-librarian.sh:*) + Edit(//${OUTBOX_DIR#/}/**) only)"
 
+  # The librarian's sandbox has no clock of its own -- without this, it has
+  # been observed inventing a stylized/wrong timestamp (e.g. "22:00:00Z")
+  # for event `ts` and deposit `client_ts` values instead of using the real
+  # current time. Appended as a plain trailing line on the prompt (not a
+  # separate flag -- there isn't one; `-p` takes a single prompt string),
+  # so it reads as part of the same instructions the prompt file already
+  # gives, right where deposit conventions are covered.
+  NOW_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  PROMPT_WITH_TIME="$(cat "$PROMPT_FILE")
+
+Current UTC time: ${NOW_UTC} -- use this for all ts and client_ts values."
+
   # -p/--print: non-interactive, exits after one response -- no TTY needed,
   # safe under cron. --allowedTools pre-authorizes exactly these two tool
   # patterns; anything the agent tries outside them is denied automatically
@@ -105,7 +117,7 @@ run_status=0
   # closest available runaway-loop guard (a hard dollar ceiling on this
   # run's API spend) and is used instead; see the implementation report for
   # the full flag verification.
-  claude -p "$(cat "$PROMPT_FILE")" \
+  claude -p "$PROMPT_WITH_TIME" \
     --model sonnet \
     --allowedTools "Bash(/root/brain-librarian.sh:*) Edit(//${OUTBOX_DIR#/}/**)" \
     --max-budget-usd 5 \
