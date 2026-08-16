@@ -23,6 +23,7 @@ from app.models import (
     KnowledgeEntry,
     Machine,
     MirroredDocument,
+    NotificationConfig,
     OwnerToken,
     Project,
 )
@@ -76,6 +77,7 @@ async def _clean_tables():
         await session.execute(Deposit.__table__.delete())
         await session.execute(BootstrapFetch.__table__.delete())
         await session.execute(DoctrineVersion.__table__.delete())
+        await session.execute(NotificationConfig.__table__.delete())
         await session.execute(Project.__table__.delete())
         await session.execute(Machine.__table__.delete())
         await session.execute(OwnerToken.__table__.delete())

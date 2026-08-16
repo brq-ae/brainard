@@ -379,6 +379,30 @@ class HandoffListResponse(BaseModel):
     next_cursor: str | None
 
 
+# --- Notification channel config (owner-managed ntfy channel) ---
+
+
+class NotificationConfigCreateRequest(BaseModel):
+    ntfy_url: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
+    note: str | None = None
+
+
+class NotificationConfigResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    version: int
+    ntfy_url: str
+    topic: str
+    note: str | None
+    created_at: datetime
+
+
+class NotificationConfigGetResponse(BaseModel):
+    current: NotificationConfigResponse | None
+    history: list[NotificationConfigResponse] = Field(default_factory=list)
+
+
 # --- Flags (contracts-v1.md §3, ADR-0004 librarian inbox) ---
 
 

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Notifications — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Notifications</h1></div>
+<p class="subtitle">The ntfy channel sessions use to notify you (rule G9, injected live into bootstrap's Notifications subsection). Immutable history -- every change is a new version.</p>
+
+{% if error %}
+<div class="notice danger">{{ error }}</div>
+{% endif %}
+
+<div class="panel">
+  <h2>Current channel</h2>
+  {% if current %}
+  <p><strong>ntfy URL</strong>: <span class="mono">{{ current.ntfy_url }}</span></p>
+  <p><strong>topic</strong>: <span class="mono">{{ current.topic }}</span></p>
+  {% if current.note %}<p><strong>note</strong>: {{ current.note }}</p>{% endif %}
+  <p class="meta">v{{ current.version }} <span class="sep">·</span> {{ current.created_at|human_ts }}</p>
+  {% else %}
+  <p class="empty">No notification channel configured yet.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>Update channel</h2>
+  <p class="subtitle">Posting here creates the next version -- the previous one stays in history, never overwritten.</p>
+  <form method="post" action="/ui/notifications">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="ntfy_url">ntfy URL</label>
+      <input type="text" id="ntfy_url" name="ntfy_url" class="mono" placeholder="https://ntfy.sh" required>
+    </div>
+    <div class="field">
+      <label for="topic">Topic</label>
+      <input type="text" id="topic" name="topic" class="mono" placeholder="e.g. a1b2c3..." required>
+    </div>
+    <div class="field">
+      <label for="note">Note (optional)</label>
+      <input type="text" id="note" name="note" placeholder="e.g. rotated after X">
+    </div>
+    <button type="submit" class="btn primary">Save new version</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>History</h2>
+  {% if history %}
+  <ul class="list">
+    {% for h in history %}
+    <li class="row">
+      <span class="row-main">
+        v{{ h.version }} — <span class="mono">{{ h.ntfy_url }}</span> / <span class="mono">{{ h.topic }}</span>
+        {% if h.note %}<div class="meta">{{ h.note }}</div>{% endif %}
+      </span>
+      <span class="meta">{{ h.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No history yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

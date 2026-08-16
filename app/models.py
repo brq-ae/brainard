@@ -9,6 +9,8 @@ knowledge_entries, and `projects.description` (see docs/spec/contracts-v1.md
 §4, §6).
 Phase 5: mirrored_documents (ADR/doc mirror), `deposits.documents_ack`
 (see docs/spec/contracts-v1.md §5, §7).
+Notification channel config: notification_configs (owner-managed ntfy
+channel injected into bootstrap's operating instructions).
 """
 
 from datetime import datetime
@@ -370,4 +372,37 @@ class BootstrapFetch(Base):
     project: Mapped[str] = mapped_column(String(255), ForeignKey("projects.name"), nullable=False, index=True)
     doctrine_global_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     doctrine_overlay_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# --- Notification channel config (owner-managed ntfy channel) ---
+
+
+class NotificationConfig(Base):
+    """One immutable version of the owner's ntfy notification channel
+    config. Supersede-never-erase applies (Principles): every change --
+    rotating the URL, changing the topic -- is a new version, never an edit.
+    The CURRENT (highest-version) row is what app/routers/bootstrap.py
+    interpolates into the "Notifications" subsection of the operating
+    instructions, so it always reflects the live config.
+    """
+
+    __tablename__ = "notification_configs"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    # Sequential from 1. Unlike DoctrineVersion, there is no (kind, project)
+    # dimension to partition by here -- one channel, one global sequence --
+    # so a plain table-wide unique index is the correct analog of doctrine's
+    # partial-unique global-version index; see DoctrineVersion.version's
+    # docstring for why *that* one needs a partial index (a shared table with
+    # a second, differently-scoped 'overlay' kind) and why this table
+    # doesn't share that concern. Computed in app/notifications.py's
+    # `next_version`, not a DB sequence -- same pattern as
+    # DoctrineVersion.version.
+    version: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    ntfy_url: Mapped[str] = mapped_column(Text, nullable=False)
+    topic: Mapped[str] = mapped_column(Text, nullable=False)
+    # Owner's free-form comment on this version, e.g. "rotated after X".
+    # Never shown to sessions via bootstrap -- owner-facing only.
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -24,7 +24,8 @@ from ulid import ULID
 from app.auth import Principal, require_machine
 from app.db import get_db
 from app.doctrine import current_global, current_overlay
-from app.models import BootstrapFetch, DoctrineVersion, Handoff, KnowledgeEntry, Project
+from app.models import BootstrapFetch, DoctrineVersion, Handoff, KnowledgeEntry, NotificationConfig, Project
+from app.notifications import current_config as current_notification_config
 from app.routers.deposits import VALID_EVENT_KINDS
 
 router = APIRouter(prefix="/v1/bootstrap", tags=["bootstrap"])
@@ -75,7 +76,89 @@ TEMPLATES: dict[str, str] = {
 }
 
 
-def _operating_instructions_markdown() -> str:
+# --- Notifications subsection (rule G9) -- per-event Title prefix / ntfy
+# Priority / ntfy Tags. Order matches the task spec's pipe-separated triples
+# exactly: input | done | error.
+_NOTIFICATION_EVENTS: list[dict[str, str]] = [
+    {"event": "input", "prefix": "Input needed", "priority": "high", "tags": "question,bell"},
+    {"event": "done", "prefix": "Done", "priority": "default", "tags": "checkered_flag,tada"},
+    {"event": "error", "prefix": "Error", "priority": "urgent", "tags": "warning,skull"},
+]
+
+
+def _notifications_markdown(config: NotificationConfig | None) -> str:
+    """The "Notifications" subsection of operating instructions (rule G9).
+    Server-generated so it always reflects the CURRENT channel -- callers
+    pass in whatever app.notifications.current_config(db) returns right now,
+    never a cached/stale value. Part of the never-trimmed operating
+    instructions text (see SIZE_BUDGET_BYTES / `_apply_size_budget` below --
+    only the lessons digest and overlay content are ever trimmed).
+    """
+    lines = [
+        "### Notifications",
+        "",
+        "Rule **G9** governs the owner-notification channel. Exactly two moments fire a notification -- "
+        "never for intermediate sub-steps within a larger assignment:",
+        "- **input** -- the session is blocked and needs the owner's decision or input to continue.",
+        "- **done** / **error** -- the owner's *whole assignment* has completed or failed, fired exactly "
+        "once at that point -- not per sub-step along the way.",
+        "",
+        "**Dedup rule**: if this environment already fires these events automatically via hooks, do not "
+        "also fire them manually -- one source per environment, never both, or the owner receives "
+        "duplicate notifications for the same moment.",
+        "",
+        "**Self-identification**: identify as the agent name the owner assigned for this session, if one "
+        "was given. Absent that, fall back to the machine name, then the project name. Never invent a "
+        'name, and never identify as "claude" -- that tells the owner nothing about which agent or '
+        "session actually needs them.",
+        "",
+        "**Nothing sensitive**: never put secrets, tokens, credentials, or other private data in a "
+        "notification body -- this channel carries none of the Brain's access controls.",
+        "",
+    ]
+
+    if config is None:
+        lines.append(
+            "**Current channel**: no notification channel configured yet -- the owner has not posted one "
+            "(`POST /v1/notifications-config`). There is nothing to notify to; proceed without this "
+            "channel until the owner sets one up."
+        )
+        return "\n".join(lines)
+
+    lines.append("**Current channel** (from the live config, version " + str(config.version) + "):")
+    lines.append("")
+    lines.append("Preferred, if the `notify-me` helper script exists on this machine:")
+    lines.append("```")
+    lines.append('notify-me <event> <agent-name> "<summary>"')
+    lines.append("```")
+    lines.append("where `<event>` is one of `input`, `done`, `error`.")
+    lines.append("")
+    lines.append("Raw fallback (use only if `notify-me` is not installed):")
+    lines.append("```")
+    lines.append(
+        'curl -sSf -H "Title: <Event prefix>: <agent-name> (<machine>)" -H "Priority: <high|default|urgent>" '
+        '-H "Tags: <question,bell|checkered_flag,tada|warning,skull>" -d "<summary>" '
+        f"{config.ntfy_url}/{config.topic}"
+    )
+    lines.append("```")
+    lines.append("with `<Event prefix>`/`<Priority>`/`<Tags>` chosen per event:")
+    lines.append("")
+    lines.append("| event | Title prefix | Priority | Tags |")
+    lines.append("|---|---|---|---|")
+    for e in _NOTIFICATION_EVENTS:
+        lines.append(f"| `{e['event']}` | {e['prefix']} | `{e['priority']}` | `{e['tags']}` |")
+    lines.append("")
+    lines.append(
+        f"**Pre-approved sync clause**: comparing these values (ntfy URL `{config.ntfy_url}`, topic "
+        f"`{config.topic}`) against this machine's local `/usr/local/bin/notify-me` script and updating "
+        "THOSE SPECIFIC VALUES there to match is pre-approved maintenance -- no separate confirmation "
+        "needed. Mention that you did so in your next handoff. This grant covers nothing else in that "
+        "file, and nothing in any other file."
+    )
+    return "\n".join(lines)
+
+
+def _operating_instructions_markdown(notification_config: NotificationConfig | None) -> str:
     """Server-generated, written from the actual implemented routes (not
     aspiration) -- event kinds are pulled straight from the deposits
     router's own vocabulary constant, so this section can never drift out of
@@ -190,8 +273,8 @@ def _operating_instructions_markdown() -> str:
         '"events":[{"seq":1,"ts":"2026-08-06T12:00:00Z","kind":"note","summary":"Did a thing."}],'
         '"knowledge":[{"title":"Example lesson","namespace":"lessons",'
         '"body":"Situation/Problem/Fix/Why it works."}]}\n'
-        "```"
-    )
+        "```\n\n"
+    ) + _notifications_markdown(notification_config)
 
 
 def _compile_doctrine(global_row: DoctrineVersion | None, overlay_row: DoctrineVersion | None) -> dict:
@@ -430,6 +513,7 @@ async def get_bootstrap(
 
     global_row = await current_global(db)
     overlay_row = await current_overlay(db, project)
+    notification_config = await current_notification_config(db)
 
     latest_handoff = await db.scalar(
         select(Handoff).where(Handoff.project == project).order_by(Handoff.received_at.desc()).limit(1)
@@ -469,7 +553,7 @@ async def get_bootstrap(
                 "received_at": latest_handoff.received_at.isoformat(),
             },
         },
-        "operating_instructions": _operating_instructions_markdown(),
+        "operating_instructions": _operating_instructions_markdown(notification_config),
         "templates": TEMPLATES,
         "lessons_digest": [
             {"id": e.id, "title": e.title, "snippet": _first_line_snippet(e.body)} for e in digest_rows

@@ -581,7 +581,7 @@ def _synthetic_bootstrap_data(digest_count: int) -> dict:
             "is_new": False,
             "handoff": None,
         },
-        "operating_instructions": _operating_instructions_markdown(),
+        "operating_instructions": _operating_instructions_markdown(None),
         "templates": TEMPLATES,
         "lessons_digest": [
             {"id": "a" * 26, "title": "t", "snippet": "s"} for _ in range(digest_count)
@@ -613,3 +613,89 @@ def test_size_budget_binds_json_even_when_markdown_is_under_budget():
     # The digest is what got trimmed to fit JSON -- overlay content was
     # already None (nothing to drop) and rules stay untouched.
     assert len(trimmed["lessons_digest"]) < 4000
+
+
+# --- Notifications subsection (rule G9) ---
+
+
+async def _post_notifications_config(client, owner_headers, **overrides) -> dict:
+    body = {"ntfy_url": "https://ntfy.example.org", "topic": "deadbeefcafe1234"}
+    body.update(overrides)
+    resp = await client.post("/v1/notifications-config", json=body, headers=owner_headers)
+    assert resp.status_code == 201, resp.json()
+    return resp.json()
+
+
+async def test_bootstrap_notifications_no_config_is_honest(client, db_session):
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "### Notifications" in text
+    assert "no notification channel configured yet" in text.lower()
+    assert "notify-me" not in text  # never fakes a channel that doesn't exist
+
+    md_resp = await client.get("/v1/bootstrap", params={"project": "brain"}, headers=headers)
+    assert "no notification channel configured yet" in md_resp.text.lower()
+
+
+async def test_bootstrap_notifications_with_config_interpolates_current_values(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    await _post_notifications_config(client, owner_headers, ntfy_url="https://ntfy.example.org", topic="deadbeefcafe1234")
+
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+
+    assert "### Notifications" in text
+    assert "rule **G9**" in text.lower() or "Rule **G9**" in text
+    # the two moments + never-sub-steps + dedup + self-identification + nothing-sensitive
+    assert "blocked and needs the owner" in text
+    assert "whole assignment" in text and "not per sub-step" in text
+    assert "must not also fire them manually" in text or "do not also fire them manually" in text
+    assert "never identify as" in text.lower() and '"claude"' in text
+    assert "never invent a name" in text.lower()
+    assert "nothing sensitive" in text.lower() or "never put secrets" in text.lower()
+
+    # current channel, actual values interpolated
+    assert 'notify-me <event> <agent-name> "<summary>"' in text
+    assert "https://ntfy.example.org/deadbeefcafe1234" in text
+    assert "Priority:" in text and "Tags:" in text
+
+    # pre-approved sync clause
+    assert "pre-approved maintenance" in text
+    assert "/usr/local/bin/notify-me" in text
+    assert "next handoff" in text
+    assert "covers nothing else" in text
+
+
+async def test_bootstrap_notifications_reflects_latest_version_not_first(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    await _post_notifications_config(client, owner_headers, ntfy_url="https://ntfy.old.example", topic="old-topic-123")
+    await _post_notifications_config(client, owner_headers, ntfy_url="https://ntfy.new.example", topic="newtopic456")
+
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+
+    assert "https://ntfy.new.example/newtopic456" in text
+    assert "ntfy.old.example" not in text
+    assert "old-topic-123" not in text
+
+
+async def test_bootstrap_notifications_section_never_trimmed(client, db_session):
+    """The Notifications subsection is part of operating instructions --
+    never-trimmable, same as the rest of section 3 (only the lessons digest
+    and overlay content are ever trimmed; see SIZE_BUDGET_BYTES mechanics)."""
+    owner_headers = await _owner_headers(db_session)
+    await _post_notifications_config(client, owner_headers)
+    await _post_global(client, owner_headers)
+    db_session.add(Project(name="oversized-notif-proj", status="active", created_at=datetime.now(UTC)))
+    await db_session.commit()
+    await _post_overlay(client, owner_headers, "oversized-notif-proj", content="OVERLAY-MARKER " + ("x" * 50000))
+
+    headers, _ = await _machine_headers(db_session)
+    resp = await client.get("/v1/bootstrap", params={"project": "oversized-notif-proj", "format": "json"}, headers=headers)
+    assert resp.status_code == 200
+    text = resp.json()["operating_instructions"]
+    assert "### Notifications" in text
+    assert "https://ntfy.example.org/deadbeefcafe1234" in text
