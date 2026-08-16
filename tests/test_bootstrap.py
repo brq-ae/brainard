@@ -661,6 +661,15 @@ async def test_bootstrap_notifications_with_config_interpolates_current_values(c
     assert "https://ntfy.example.org/deadbeefcafe1234" in text
     assert "Priority:" in text and "Tags:" in text
 
+    # per-event Title prefix/Priority/Tags table -- byte-identical to the
+    # real /usr/local/bin/notify-me script's output (2026-08-16 alignment
+    # fix: previously "Input needed"/"Done"/"Error", now aligned).
+    assert "| `input` | Action Required | `high` | `question,bell` |" in text
+    assert "| `done` | Task Finished | `default` | `checkered_flag,tada` |" in text
+    assert "| `error` | FAILURE | `urgent` | `warning,skull` |" in text
+    assert "Input needed" not in text
+    assert "| `done` | Done |" not in text
+
     # pre-approved sync clause
     assert "pre-approved maintenance" in text
     assert "/usr/local/bin/notify-me" in text

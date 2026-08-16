@@ -78,11 +78,14 @@ TEMPLATES: dict[str, str] = {
 
 # --- Notifications subsection (rule G9) -- per-event Title prefix / ntfy
 # Priority / ntfy Tags. Order matches the task spec's pipe-separated triples
-# exactly: input | done | error.
+# exactly: input | done | error. Title prefixes are byte-identical to the
+# real /usr/local/bin/notify-me script's output (2026-08-16 alignment fix)
+# so the raw-curl fallback documented here produces the exact same
+# notification a session would get by running the script itself.
 _NOTIFICATION_EVENTS: list[dict[str, str]] = [
-    {"event": "input", "prefix": "Input needed", "priority": "high", "tags": "question,bell"},
-    {"event": "done", "prefix": "Done", "priority": "default", "tags": "checkered_flag,tada"},
-    {"event": "error", "prefix": "Error", "priority": "urgent", "tags": "warning,skull"},
+    {"event": "input", "prefix": "Action Required", "priority": "high", "tags": "question,bell"},
+    {"event": "done", "prefix": "Task Finished", "priority": "default", "tags": "checkered_flag,tada"},
+    {"event": "error", "prefix": "FAILURE", "priority": "urgent", "tags": "warning,skull"},
 ]
 
 
