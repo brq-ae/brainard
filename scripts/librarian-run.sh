@@ -126,6 +126,16 @@ Current UTC time: ${NOW_UTC} -- use this for all ts and client_ts values."
   echo "[librarian] run finished $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ) >> "$LOG_FILE" 2>&1 || run_status=$?
 
+# Notify the owner of this assignment's outcome -- fired by the runner
+# itself (deterministic, based on run_status), not by the librarian agent,
+# which has no notify-me/hooks wiring of its own inside its sandboxed
+# --allowedTools grant.
+if [ "$run_status" -ne 0 ]; then
+    notify-me error "librarian" "Nightly run failed (exit $run_status) -- see /var/log/brain-librarian/"
+else
+    notify-me done "librarian" "Nightly curation run complete."
+fi
+
 echo "[librarian] pruning logs to the last ${KEEP} in ${LOG_DIR}"
 # shellcheck disable=SC2012
 ls -1t "$LOG_DIR"/librarian-*.log 2>/dev/null | tail -n "+$((KEEP + 1))" | while IFS= read -r old; do
