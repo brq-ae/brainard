@@ -632,7 +632,13 @@ async def test_bootstrap_notifications_no_config_is_honest(client, db_session):
     text = resp.json()["operating_instructions"]
     assert "### Notifications" in text
     assert "no notification channel configured yet" in text.lower()
-    assert "notify-me" not in text  # never fakes a channel that doesn't exist
+    # never fakes a channel that doesn't exist -- the generic framing may
+    # reference the notify-me tool by name (install-it guidance applies
+    # regardless of whether a channel is configured yet), but the concrete
+    # command form and curl fallback (which need real interpolated values)
+    # must never appear without a live config.
+    assert 'notify-me <event> <agent-name> "<summary>"' not in text
+    assert "curl -sSf" not in text
 
     md_resp = await client.get("/v1/bootstrap", params={"project": "brain"}, headers=headers)
     assert "no notification channel configured yet" in md_resp.text.lower()
@@ -648,10 +654,16 @@ async def test_bootstrap_notifications_with_config_interpolates_current_values(c
 
     assert "### Notifications" in text
     assert "rule **G9**" in text.lower() or "Rule **G9**" in text
-    # the two moments + never-sub-steps + dedup + self-identification + nothing-sensitive
-    assert "blocked and needs the owner" in text
-    assert "whole assignment" in text and "not per sub-step" in text
-    assert "must not also fire them manually" in text or "do not also fire them manually" in text
+    # hook-driven framing (2026-08-17 rework, replacing "exactly two moments
+    # / once per whole assignment / never sub-steps"): notify on input AND
+    # every stop/idle, via Stop->done / Notification->input hooks.
+    assert "each time you have stopped and are now idle" in text
+    assert "`Stop` -> `done`" in text and "`Notification` -> `input`" in text
+    assert "every turn-end" in text and "in a headless run" in text
+    assert "install and keep these hooks" in text.lower()
+    assert "never also fire manually" in text
+    assert "not on internal sub-steps" in text.lower()
+    assert "exactly two moments" not in text  # old framing fully replaced
     assert "never identify as" in text.lower() and '"claude"' in text
     assert "never invent a name" in text.lower()
     assert "nothing sensitive" in text.lower() or "never put secrets" in text.lower()

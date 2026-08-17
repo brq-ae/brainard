@@ -100,15 +100,18 @@ def _notifications_markdown(config: NotificationConfig | None) -> str:
     lines = [
         "### Notifications",
         "",
-        "Rule **G9** governs the owner-notification channel. Exactly two moments fire a notification -- "
-        "never for intermediate sub-steps within a larger assignment:",
-        "- **input** -- the session is blocked and needs the owner's decision or input to continue.",
-        "- **done** / **error** -- the owner's *whole assignment* has completed or failed, fired exactly "
-        "once at that point -- not per sub-step along the way.",
+        "Rule **G9** keeps the owner informed via notification hooks. The owner wants to know when you "
+        "need their input or a decision, and each time you have stopped and are now idle awaiting them.",
         "",
-        "**Dedup rule**: if this environment already fires these events automatically via hooks, do not "
-        "also fire them manually -- one source per environment, never both, or the owner receives "
-        "duplicate notifications for the same moment.",
+        "**Hooks fire automatically**: `Stop` -> `done` (every turn-end where you go idle in an "
+        "interactive session; once, at completion, in a headless run), `Notification` -> `input` (on a "
+        "pause that needs the owner). Install and keep these hooks (see the notify-me fleet howto) so the "
+        "owner is reliably informed. Rely on them where already installed -- never also fire manually, "
+        "that double-alerts; install them where missing, or fire `notify-me` manually at those two "
+        "moments until you do.",
+        "",
+        "**Not on internal sub-steps**: only the stop/idle and input moments above -- never for tool "
+        "calls or other activity within a turn.",
         "",
         "**Self-identification**: identify as the agent name the owner assigned for this session, if one "
         "was given. Absent that, fall back to the machine name, then the project name. Never invent a "
