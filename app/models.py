@@ -15,7 +15,20 @@ channel injected into bootstrap's operating instructions).
 
 from datetime import datetime
 
-from sqlalchemy import ARRAY, Boolean, Computed, DateTime, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import (
+    ARRAY,
+    Boolean,
+    CheckConstraint,
+    Computed,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -71,6 +84,17 @@ class Machine(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    # Commander/Builder division of labor (doctrine rule G10; see
+    # app/roles.py for the single-source-of-truth role text). 'solo' is the
+    # default -- no role text is injected into this machine's bootstrap, and
+    # no role paragraph appears in a generated onboarding prompt for it.
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="solo")
+    # Hint only, used to pre-fill generated onboarding prompts -- NEVER
+    # enforced: a token still bootstraps any project (contracts-v1.md §1
+    # binds a token to a machine, not to a project).
+    default_project: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (CheckConstraint("role IN ('solo', 'commander', 'builder')", name="ck_machines_role"),)
 
 
 class Project(Base):

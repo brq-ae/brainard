@@ -65,10 +65,11 @@ async def test_ui_mint_machine_shows_token_once(client, db_session):
     assert "ui-minted-machine" in listing.text
 
 
-async def test_ui_mint_machine_shows_paste_line(client, db_session):
-    """Phase 7 addition (docs/onboarding.md): the show-once mint page also
-    displays a ready-to-copy paste-line with the hub URL and the fresh
-    token already filled in.
+async def test_ui_mint_machine_shows_onboarding_prompt(client, db_session):
+    """Phase 7 addition (docs/onboarding.md), superseded by the "machine
+    roles + prebuilt onboarding prompt" feature: the show-once mint page
+    displays the FULL generated onboarding prompt with the hub URL and the
+    fresh token already filled in.
     """
     await _login(client, db_session)
     page = await client.get("/ui/admin/machines")
@@ -82,7 +83,7 @@ async def test_ui_mint_machine_shows_paste_line(client, db_session):
     minted_token = token_match.group(0)
 
     # Jinja2 autoescape turns '<'/'>'/"'" into HTML entities -- unescape
-    # before asserting on the literal paste-line text.
+    # before asserting on the literal prompt text.
     body = html.unescape(resp.text)
     assert "I run a private knowledge hub for my projects" in body
     assert "/v1/bootstrap?project=<PROJECT>" in body
@@ -93,16 +94,177 @@ async def test_ui_mint_machine_shows_paste_line(client, db_session):
     # well-defended AI elsewhere as prompt-injection-shaped).
     assert "apply it with your normal judgment" in body
     # Patch 2026-08-07 (docs/onboarding.md "Naming: the owner assigns
-    # project slugs"): the mint page reinforces, right under the
-    # paste-line, that <PROJECT> is the owner's call, never the AI's guess.
+    # project slugs"): the mint page reinforces, right under the prompt,
+    # that <PROJECT> is the owner's call, never the AI's guess.
     assert "Replace <PROJECT> with the project slug YOU choose" in body
     assert "don't let the AI pick" in body
     assert "it never overrides your safety rules" in body
+    # solo (the default role) contributes no role paragraph
+    assert "You are the Commander" not in body
+    assert "You are the Builder" not in body
 
-    # not shown again on a plain re-list of the page (same rule as the token itself)
+    # the REAL token is never shown again on a plain re-list of the page --
+    # every machine (including this one) does now show a regenerated
+    # onboarding prompt in its own expander, but always with the
+    # placeholder standing in for the token, never the real value.
     listing = await client.get("/ui/admin/machines")
     assert minted_token not in listing.text
-    assert "I run a private knowledge hub for my projects" not in listing.text
+    assert "id=\"new-prompt\"" not in listing.text
+    assert "id=\"new-token\"" not in listing.text
+    listing_body = html.unescape(listing.text)
+    assert "&lt;token&gt;" in listing_body or "<token>" in listing_body
+
+
+async def test_ui_mint_with_commander_role_renders_full_prompt(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/admin/machines",
+        data={
+            "name": "commander-box",
+            "role": "commander",
+            "default_project": "my-project",
+            "csrf_token": csrf,
+        },
+    )
+    assert resp.status_code == 201
+    body = html.unescape(resp.text)
+    assert "You are the Commander for this project." in body
+    assert "You own ALL writes to the hub" in body
+    assert "You are the Builder" not in body
+    # a given default project fills the prompt's project slot directly
+    assert "/v1/bootstrap?project=my-project" in body
+
+
+async def test_ui_mint_with_builder_role_renders_full_prompt(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/admin/machines", data={"name": "builder-box", "role": "builder", "csrf_token": csrf}
+    )
+    assert resp.status_code == 201
+    body = html.unescape(resp.text)
+    assert "You are the Builder for this project." in body
+    assert "do NOT deposit anything" in body
+    assert "You are the Commander" not in body
+
+
+async def test_ui_mint_with_solo_role_has_no_role_text(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post("/ui/admin/machines", data={"name": "solo-box", "csrf_token": csrf})
+    assert resp.status_code == 201
+    body = html.unescape(resp.text)
+    assert "You are the Commander" not in body
+    assert "You are the Builder" not in body
+
+
+async def test_ui_mint_rejects_bad_role(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/admin/machines", data={"name": "bad-role-box", "role": "overlord", "csrf_token": csrf}
+    )
+    assert resp.status_code == 422
+
+
+async def test_ui_mint_xss_probe_on_name_and_project_fields(client, db_session):
+    """Machine name and default_project both flow into the rendered
+    onboarding prompt (agent_name / project slot) -- confirm Jinja2
+    autoescape holds and a <script> payload never reaches the response
+    unescaped (contracts-v1.md/app/templates_env.py: autoescape forced on).
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    evil_name = "<script>alert('name')</script>"
+    evil_project = "<script>alert('project')</script>"
+    resp = await client.post(
+        "/ui/admin/machines",
+        data={"name": evil_name, "default_project": evil_project, "csrf_token": csrf},
+    )
+    assert resp.status_code == 201
+    assert "<script>alert('name')</script>" not in resp.text
+    assert "<script>alert('project')</script>" not in resp.text
+    # the escaped forms are present -- proves the values made it into the
+    # response (in the prompt / list row), just safely encoded
+    assert "&lt;script&gt;" in resp.text
+
+    listing = await client.get("/ui/admin/machines")
+    assert "<script>alert('name')</script>" not in listing.text
+    assert "<script>alert('project')</script>" not in listing.text
+
+
+async def test_ui_patch_role_via_csrf_form_works(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    mint_resp = await client.post("/ui/admin/machines", data={"name": "to-be-updated", "csrf_token": csrf})
+    assert mint_resp.status_code == 201
+    machine = (await db_session.execute(Machine.__table__.select().where(Machine.name == "to-be-updated"))).first()
+    machine_id = machine.id
+    assert machine.role == "solo"
+
+    resp = await client.post(
+        f"/ui/admin/machines/{machine_id}/update",
+        data={"role": "builder", "default_project": "updated-project", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/admin/machines"
+
+    from app.models import Machine as MachineModel
+
+    refreshed = await db_session.get(MachineModel, machine_id)
+    assert refreshed.role == "builder"
+    assert refreshed.default_project == "updated-project"
+
+    listing = await client.get("/ui/admin/machines")
+    assert "You are the Builder for this project." in html.unescape(listing.text)
+
+
+async def test_ui_patch_role_requires_csrf(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    mint_resp = await client.post("/ui/admin/machines", data={"name": "csrf-protected", "csrf_token": csrf})
+    machine = (await db_session.execute(Machine.__table__.select().where(Machine.name == "csrf-protected"))).first()
+
+    resp = await client.post(f"/ui/admin/machines/{machine.id}/update", data={"role": "builder"})
+    assert resp.status_code == 403
+
+
+async def test_ui_patch_unknown_machine_404(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/admin/machines/01UNKNOWNIDXXXXXXXXXXXXXX/update", data={"role": "builder", "csrf_token": csrf}
+    )
+    assert resp.status_code == 404
+
+
+async def test_ui_machine_token_cannot_reach_admin_machines(client, db_session):
+    """Machine tokens never authenticate the UI -- only owner sessions
+    (app/ui_auth.py). A bare bearer header on a /ui/* route has nothing to
+    do with the cookie-based session, so it's treated as unauthenticated.
+    """
+    machine_headers = await _machine_headers(db_session)
+    resp = await client.get("/ui/admin/machines", headers=machine_headers, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
 
 
 async def test_ui_revoke_machine_works(client, db_session):

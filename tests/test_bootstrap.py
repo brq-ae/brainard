@@ -17,9 +17,11 @@ from app.routers.bootstrap import (
 )
 
 
-async def _machine_headers(db_session) -> tuple[dict, str]:
+async def _machine_headers(db_session, *, role: str = "solo") -> tuple[dict, str]:
     token = generate_machine_token()
-    machine = Machine(id=str(ULID()), name="test-machine", token_hash=hash_token(token), status="active")
+    machine = Machine(
+        id=str(ULID()), name="test-machine", token_hash=hash_token(token), status="active", role=role
+    )
     db_session.add(machine)
     await db_session.commit()
     return {"Authorization": f"Bearer {token}"}, machine.id
@@ -720,3 +722,101 @@ async def test_bootstrap_notifications_section_never_trimmed(client, db_session)
     text = resp.json()["operating_instructions"]
     assert "### Notifications" in text
     assert "https://ntfy.example.org/deadbeefcafe1234" in text
+
+
+# --- "Your role" subsection (feature: machine roles + prebuilt onboarding prompt, doctrine G10) ---
+
+
+async def test_bootstrap_commander_token_shows_commander_role_text(client, db_session):
+    headers, _ = await _machine_headers(db_session, role="commander")
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "### Your role" in text
+    assert "You are the Commander for this project." in text
+    assert "You own ALL writes to the hub" in text
+    assert "**G10**" in text
+    assert "You are the Builder for this project." not in text
+
+    md_resp = await client.get("/v1/bootstrap", params={"project": "brain"}, headers=headers)
+    assert "You are the Commander for this project." in md_resp.text
+
+
+async def test_bootstrap_builder_token_shows_builder_role_text(client, db_session):
+    headers, _ = await _machine_headers(db_session, role="builder")
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "### Your role" in text
+    assert "You are the Builder for this project." in text
+    assert "do NOT deposit anything" in text
+    assert "**G10**" in text
+    assert "You are the Commander for this project." not in text
+
+
+async def test_bootstrap_solo_token_shows_no_role_section(client, db_session):
+    headers, _ = await _machine_headers(db_session, role="solo")
+    resp = await client.get("/v1/bootstrap", params={"project": "brain", "format": "json"}, headers=headers)
+    text = resp.json()["operating_instructions"]
+    assert "### Your role" not in text
+    assert "You are the Commander" not in text
+    assert "You are the Builder" not in text
+
+
+async def test_bootstrap_role_section_never_trimmed(client, db_session):
+    """Same never-trimmed guarantee as Notifications -- the role section is
+    part of operating instructions, only the lessons digest and overlay
+    content are ever trimmed (SIZE_BUDGET_BYTES mechanics)."""
+    owner_headers = await _owner_headers(db_session)
+    await _post_global(client, owner_headers)
+    db_session.add(Project(name="oversized-role-proj", status="active", created_at=datetime.now(UTC)))
+    await db_session.commit()
+    await _post_overlay(client, owner_headers, "oversized-role-proj", content="OVERLAY-MARKER " + ("x" * 50000))
+
+    headers, _ = await _machine_headers(db_session, role="commander")
+    resp = await client.get(
+        "/v1/bootstrap", params={"project": "oversized-role-proj", "format": "json"}, headers=headers
+    )
+    assert resp.status_code == 200
+    text = resp.json()["operating_instructions"]
+    assert "### Your role" in text
+    assert "You are the Commander for this project." in text
+
+
+async def test_bootstrap_typical_commander_response_stays_under_budget(client, db_session):
+    """The role section adds text to the never-trimmed operating
+    instructions -- confirm a realistic bootstrap for a commander machine
+    still lands comfortably under the 32 KB budget (same shape as
+    test_bootstrap_typical_response_fits_well_under_budget above)."""
+    owner_headers = await _owner_headers(db_session)
+    await _post_global(client, owner_headers)
+    db_session.add(Project(name="typical-commander-proj", status="active", created_at=datetime.now(UTC)))
+    await db_session.commit()
+    await _post_overlay(
+        client,
+        owner_headers,
+        "typical-commander-proj",
+        content="# Project overlay\n\nA normal, modestly-sized project overlay document.",
+        additions=[{"id": "P1", "text": "Run the test profile before committing."}],
+    )
+
+    headers, _ = await _machine_headers(db_session, role="commander")
+    for i in range(10):
+        body = _deposit_body(
+            project="typical-commander-proj",
+            knowledge=[
+                {
+                    "title": f"Ordinary lesson {i}",
+                    "namespace": "lessons",
+                    "body": f"A normal, realistically-sized lesson body for entry {i}.",
+                }
+            ],
+        )
+        assert (await client.post("/v1/deposits", json=body, headers=headers)).status_code == 200
+
+    resp = await client.get(
+        "/v1/bootstrap", params={"project": "typical-commander-proj", "format": "json"}, headers=headers
+    )
+    data = resp.json()
+    assert len(data["lessons_digest"]) == 10  # nothing trimmed
+
+    assert _markdown_bytes(data) <= SIZE_BUDGET_BYTES // 2  # comfortably under half the budget
+    assert _json_bytes(data) <= SIZE_BUDGET_BYTES // 2

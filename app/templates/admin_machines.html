@@ -10,9 +10,9 @@
   <div class="token-reveal" id="new-token">{{ newly_minted.token }}</div>
   <button type="button" class="btn" data-copy-target="new-token">Copy token</button>
 
-  <p>Paste this into a new AI session to connect it to the Brain (fill in the project name where marked):</p>
-  <div class="token-reveal" id="new-paste-line">{{ newly_minted.paste_line }}</div>
-  <button type="button" class="btn" data-copy-target="new-paste-line">Copy paste-line</button>
+  <p>Paste this into a new AI session to connect it to the Brain -- role and (if given) project are already spelled out; fill in the project only if left as the placeholder below:</p>
+  <div class="token-reveal" id="new-prompt">{{ newly_minted.prompt }}</div>
+  <button type="button" class="btn" data-copy-target="new-prompt">Copy prompt</button>
   <p class="meta">Replace &lt;PROJECT&gt; with the project slug YOU choose — don't let the AI pick.</p>
 </div>
 {% endif %}
@@ -25,6 +25,18 @@
       <label for="name">Name</label>
       <input type="text" id="name" name="name" placeholder="e.g. NUC — Proxmox container 111" required>
     </div>
+    <div class="field">
+      <label for="role">Role</label>
+      <select id="role" name="role">
+        <option value="solo" selected>Solo</option>
+        <option value="commander">Commander</option>
+        <option value="builder">Builder</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="default_project">Default project (optional -- a hint only, pre-fills generated prompts; never enforced)</label>
+      <input type="text" id="default_project" name="default_project" placeholder="e.g. my-project">
+    </div>
     <button type="submit" class="btn primary">Mint token</button>
   </form>
 </div>
@@ -34,18 +46,43 @@
   {% if machines %}
   <ul class="list">
     {% for m in machines %}
-    <li class="row">
-      <span class="row-main">
-        {{ m.name }}
-        <div class="meta">created {{ m.created_at|human_ts }} <span class="sep">·</span> last seen {{ m.last_seen|human_ts if m.last_seen else "never" }}</div>
-      </span>
-      <span class="badge {{ m.status }}">{{ m.status }}</span>
-      {% if m.status == "active" %}
-      <form class="inline" method="post" action="/ui/admin/machines/{{ m.id }}/revoke" data-confirm="Revoke machine &quot;{{ m.name }}&quot;? This cannot be undone.">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="btn danger">Revoke</button>
-      </form>
-      {% endif %}
+    <li>
+      <div class="row">
+        <span class="row-main">
+          {{ m.name }}
+          <div class="meta">created {{ m.created_at|human_ts }} <span class="sep">·</span> last seen {{ m.last_seen|human_ts if m.last_seen else "never" }}{% if m.default_project %} <span class="sep">·</span> default project: {{ m.default_project }}{% endif %}</div>
+        </span>
+        <span class="badge">{{ m.role }}</span>
+        <span class="badge {{ m.status }}">{{ m.status }}</span>
+        {% if m.status == "active" %}
+        <form class="inline" method="post" action="/ui/admin/machines/{{ m.id }}/revoke" data-confirm="Revoke machine &quot;{{ m.name }}&quot;? This cannot be undone.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn danger">Revoke</button>
+        </form>
+        {% endif %}
+      </div>
+      <details class="machine-details">
+        <summary>Role / default project / onboarding prompt</summary>
+        <form method="post" action="/ui/admin/machines/{{ m.id }}/update">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="field">
+            <label for="role-{{ m.id }}">Role</label>
+            <select id="role-{{ m.id }}" name="role">
+              <option value="solo" {% if m.role == "solo" %}selected{% endif %}>Solo</option>
+              <option value="commander" {% if m.role == "commander" %}selected{% endif %}>Commander</option>
+              <option value="builder" {% if m.role == "builder" %}selected{% endif %}>Builder</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="default_project-{{ m.id }}">Default project (hint only)</label>
+            <input type="text" id="default_project-{{ m.id }}" name="default_project" value="{{ m.default_project or '' }}" placeholder="e.g. my-project">
+          </div>
+          <button type="submit" class="btn">Save</button>
+        </form>
+        <p class="meta">Regenerated onboarding prompt (the token can't be retrieved after mint, so it's shown as a placeholder here):</p>
+        <div class="token-reveal" id="prompt-{{ m.id }}">{{ prompts[m.id] }}</div>
+        <button type="button" class="btn" data-copy-target="prompt-{{ m.id }}">Copy prompt</button>
+      </details>
     </li>
     {% endfor %}
   </ul>

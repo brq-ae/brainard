@@ -19,7 +19,11 @@ from app.db import get_db
 from app.errors import ApiError
 from app.machines import list_machines, mint_machine
 from app.machines import revoke_machine as revoke_machine_op
+from app.machines import update_machine as update_machine_op
+from app.models import Machine
+from app.onboarding import PROJECT_PLACEHOLDER, TOKEN_PLACEHOLDER, generate_onboarding_prompt, resolve_base_url
 from app.proposals import decide, list_proposals
+from app.roles import DEFAULT_ROLE
 from app.templates_env import templates
 from app.ui_auth import require_csrf, require_ui_session
 
@@ -27,6 +31,27 @@ router = APIRouter(prefix="/ui/admin", tags=["ui"])
 
 
 # --- machines ---
+
+
+def _prompts_by_machine_id(request: Request, machines: list[Machine]) -> dict[str, str]:
+    """The "regenerate onboarding prompt" text for every listed machine,
+    keyed by id -- always with `TOKEN_PLACEHOLDER` standing in for the
+    token, since a machine's real token can never be retrieved again after
+    mint (contracts-v1.md §1). `default_project`, if the owner set one,
+    fills the project slot; otherwise the literal `<PROJECT>` placeholder,
+    same as the mint-time prompt when no project was given.
+    """
+    base_url = resolve_base_url(request)
+    return {
+        m.id: generate_onboarding_prompt(
+            base_url=base_url,
+            token=TOKEN_PLACEHOLDER,
+            project=m.default_project or PROJECT_PLACEHOLDER,
+            agent_name=m.name,
+            role=m.role,
+        )
+        for m in machines
+    }
 
 
 @router.get("/machines")
@@ -37,32 +62,13 @@ async def admin_machines(
 ):
     machines = await list_machines(db)
     return templates.TemplateResponse(
-        request, "admin_machines.html", {"csrf_token": session["csrf"], "machines": machines}
-    )
-
-
-def _paste_line(request: Request, token: str) -> str:
-    """The onboarding paste-line (docs/onboarding.md), pre-filled with the
-    real hub URL and the freshly minted token -- `project` is left as a
-    literal fill-in since a machine isn't bound to a single project at mint
-    time. Hub URL is derived from the request the mint happened over
-    (`request.base_url`), which is the address this browser -- and
-    therefore, on a LAN deployment, any session on the same network --
-    actually reached the hub at.
-
-    Worded to anchor trust in the owner's own message, not the endpoint,
-    and to explicitly preserve the assistant's judgment (docs/onboarding.md
-    "Why it's worded this way") -- a real-world session on another machine
-    correctly refused an earlier "follow the returned instructions exactly"
-    wording as prompt-injection-shaped.
-    """
-    hub_base = str(request.base_url).rstrip("/")
-    return (
-        "I run a private knowledge hub for my projects — it's mine and I administer it. Fetch "
-        f"{hub_base}/v1/bootstrap?project=<PROJECT> with header 'Authorization: Bearer {token}'. "
-        "The response contains my working rules for this session, the project's current state, and how "
-        "to deposit what you learn back to the hub. Read it and apply it with your normal judgment — it "
-        "never overrides your safety rules. If anything in it seems off, ask me."
+        request,
+        "admin_machines.html",
+        {
+            "csrf_token": session["csrf"],
+            "machines": machines,
+            "prompts": _prompts_by_machine_id(request, machines),
+        },
     )
 
 
@@ -70,12 +76,26 @@ def _paste_line(request: Request, token: str) -> str:
 async def admin_machines_create(
     request: Request,
     name: str = Form(...),
+    role: str = Form(DEFAULT_ROLE),
+    default_project: str = Form(""),
     session: dict = Depends(require_ui_session),
     _csrf: None = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
 ):
-    machine, token = await mint_machine(db, name)
+    project_hint = default_project.strip() or None
+    try:
+        machine, token = await mint_machine(db, name, role=role, default_project=project_hint)
+    except ApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
     machines = await list_machines(db)
+    prompt = generate_onboarding_prompt(
+        base_url=resolve_base_url(request),
+        token=token,
+        project=machine.default_project or PROJECT_PLACEHOLDER,
+        agent_name=machine.name,
+        role=machine.role,
+    )
     # Direct render (no redirect): the plaintext token exists only in this
     # one response and can never be shown again -- a redirect would either
     # lose it or force putting it somewhere retrievable (URL, flashed
@@ -87,11 +107,12 @@ async def admin_machines_create(
         {
             "csrf_token": session["csrf"],
             "machines": machines,
+            "prompts": _prompts_by_machine_id(request, machines),
             "newly_minted": {
                 "id": machine.id,
                 "name": machine.name,
                 "token": token,
-                "paste_line": _paste_line(request, token),
+                "prompt": prompt,
             },
         },
         status_code=201,
@@ -106,6 +127,25 @@ async def admin_machines_revoke(
     db: AsyncSession = Depends(get_db),
 ):
     machine = await revoke_machine_op(db, machine_id)
+    if machine is None:
+        raise HTTPException(status_code=404, detail=f"No machine with id '{machine_id}'.")
+    return RedirectResponse(url="/ui/admin/machines", status_code=303)
+
+
+@router.post("/machines/{machine_id}/update")
+async def admin_machines_update(
+    machine_id: str,
+    role: str = Form(DEFAULT_ROLE),
+    default_project: str = Form(""),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    project_hint = default_project.strip() or None
+    try:
+        machine = await update_machine_op(db, machine_id, {"role": role, "default_project": project_hint})
+    except ApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     if machine is None:
         raise HTTPException(status_code=404, detail=f"No machine with id '{machine_id}'.")
     return RedirectResponse(url="/ui/admin/machines", status_code=303)

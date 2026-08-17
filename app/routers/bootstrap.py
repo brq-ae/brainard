@@ -26,6 +26,7 @@ from app.db import get_db
 from app.doctrine import current_global, current_overlay
 from app.models import BootstrapFetch, DoctrineVersion, Handoff, KnowledgeEntry, NotificationConfig, Project
 from app.notifications import current_config as current_notification_config
+from app.roles import ROLE_DESCRIPTIONS
 from app.routers.deposits import VALID_EVENT_KINDS
 
 router = APIRouter(prefix="/v1/bootstrap", tags=["bootstrap"])
@@ -164,7 +165,24 @@ def _notifications_markdown(config: NotificationConfig | None) -> str:
     return "\n".join(lines)
 
 
-def _operating_instructions_markdown(notification_config: NotificationConfig | None) -> str:
+def _role_markdown(role: str) -> str:
+    """The "Your role" subsection (doctrine rule G10, Commander/Builder
+    division of labor) -- omitted entirely for `role == 'solo'` (most
+    machines run a single undivided session and G10 doesn't apply). Text
+    comes from ROLE_DESCRIPTIONS (app/roles.py), the same single source of
+    truth the onboarding prompt generator uses (app/onboarding.py), so the
+    two surfaces can never say something different about what a role means.
+    Part of the never-trimmed operating instructions (see SIZE_BUDGET_BYTES
+    / `_apply_size_budget` below -- only the lessons digest and overlay
+    content are ever trimmed).
+    """
+    text = ROLE_DESCRIPTIONS.get(role)
+    if text is None:
+        return ""
+    return "### Your role\n\n" + text + " (Per doctrine rule **G10**.)\n\n"
+
+
+def _operating_instructions_markdown(notification_config: NotificationConfig | None, role: str = "solo") -> str:
     """Server-generated, written from the actual implemented routes (not
     aspiration) -- event kinds are pulled straight from the deposits
     router's own vocabulary constant, so this section can never drift out of
@@ -280,7 +298,7 @@ def _operating_instructions_markdown(notification_config: NotificationConfig | N
         '"knowledge":[{"title":"Example lesson","namespace":"lessons",'
         '"body":"Situation/Problem/Fix/Why it works."}]}\n'
         "```\n\n"
-    ) + _notifications_markdown(notification_config)
+    ) + _role_markdown(role) + _notifications_markdown(notification_config)
 
 
 def _compile_doctrine(global_row: DoctrineVersion | None, overlay_row: DoctrineVersion | None) -> dict:
@@ -559,7 +577,7 @@ async def get_bootstrap(
                 "received_at": latest_handoff.received_at.isoformat(),
             },
         },
-        "operating_instructions": _operating_instructions_markdown(notification_config),
+        "operating_instructions": _operating_instructions_markdown(notification_config, principal.machine.role),
         "templates": TEMPLATES,
         "lessons_digest": [
             {"id": e.id, "title": e.title, "snippet": _first_line_snippet(e.body)} for e in digest_rows

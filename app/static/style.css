@@ -218,6 +218,13 @@ form.inline { display: inline; }
   margin: 10px 0;
 }
 
+.machine-details { margin-top: 8px; }
+.machine-details summary { cursor: pointer; color: var(--text-dim); font-size: 0.88em; }
+.machine-details > form,
+.machine-details > .token-reveal,
+.machine-details > .btn,
+.machine-details > p { margin-top: 10px; }
+
 .pagination { display: flex; gap: 12px; margin-top: 16px; }
 
 .entry-body { margin-top: 16px; }

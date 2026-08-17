@@ -1,10 +1,14 @@
-"""Machine registry: mint, list, revoke. Owner token required for all three.
+"""Machine registry: mint, list, revoke, update. Owner token required for
+all four.
 
-The actual mint/list/revoke logic lives in app/machines.py, shared with the
-UI admin area (app/routers/ui_admin.py) so the two surfaces never drift.
+The actual mint/list/revoke/update logic lives in app/machines.py, shared
+with the UI admin area (app/routers/ui_admin.py) so the two surfaces never
+drift.
 """
 
-from fastapi import APIRouter, Depends
+from typing import Any
+
+from fastapi import APIRouter, Body, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import Principal, require_owner
@@ -13,6 +17,7 @@ from app.errors import ApiError
 from app.machines import list_machines as _list_machines
 from app.machines import mint_machine
 from app.machines import revoke_machine as revoke_machine_impl
+from app.machines import update_machine as update_machine_impl
 from app.models import Machine
 from app.schemas import MachineCreateRequest, MachineCreateResponse, MachineListItem, MachineRevokeResponse
 
@@ -25,8 +30,10 @@ async def create_machine(
     _owner: Principal = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ) -> MachineCreateResponse:
-    machine, token = await mint_machine(db, body.name)
-    return MachineCreateResponse(id=machine.id, name=machine.name, token=token)
+    machine, token = await mint_machine(db, body.name, role=body.role, default_project=body.default_project)
+    return MachineCreateResponse(
+        id=machine.id, name=machine.name, role=machine.role, default_project=machine.default_project, token=token
+    )
 
 
 @router.get("", response_model=list[MachineListItem])
@@ -47,3 +54,16 @@ async def revoke_machine(
     if machine is None:
         raise ApiError(404, "machine_not_found", f"No machine with id '{machine_id}'.")
     return MachineRevokeResponse(id=machine.id, status=machine.status)
+
+
+@router.patch("/{machine_id}", response_model=MachineListItem)
+async def update_machine(
+    machine_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> Machine:
+    machine = await update_machine_impl(db, machine_id, body)
+    if machine is None:
+        raise ApiError(404, "machine_not_found", f"No machine with id '{machine_id}'.")
+    return machine

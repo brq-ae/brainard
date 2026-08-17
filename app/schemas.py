@@ -8,11 +8,20 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class MachineCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    # Commander/Builder division of labor (doctrine rule G10; app/roles.py).
+    # `Literal` (not a plain str) so a bad value is FastAPI's ordinary 422 --
+    # same precedent as DepositRequest.reason above.
+    role: Literal["solo", "commander", "builder"] = "solo"
+    # Hint only, used to pre-fill generated onboarding prompts -- never
+    # enforced (see app/models.py Machine.default_project docstring).
+    default_project: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class MachineCreateResponse(BaseModel):
     id: str
     name: str
+    role: str
+    default_project: str | None
     token: str  # plaintext -- shown exactly once, never retrievable again
 
 
@@ -24,6 +33,8 @@ class MachineListItem(BaseModel):
     created_at: datetime
     last_seen: datetime | None
     status: str
+    role: str
+    default_project: str | None
 
 
 class MachineRevokeResponse(BaseModel):

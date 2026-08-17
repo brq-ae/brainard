@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     # behind TLS.
     ui_cookie_secure: bool = False
 
+    # --- Onboarding prompt generator (app/onboarding.py) ---
+    # Optional override for the hub base URL embedded in generated
+    # onboarding prompts -- for deployments reachable at a different
+    # address than the one the owner's own browser used to mint a machine
+    # (reverse proxy, port-forward, VPN). Unset (default): prompts use
+    # `request.base_url`, the address the request actually arrived on, same
+    # precedent as the pre-existing paste-line.
+    hub_public_url: str | None = None
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
