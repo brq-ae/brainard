@@ -14,6 +14,12 @@ from app.security import generate_machine_token, generate_owner_token, hash_toke
 
 XSS_SCRIPT = "<script>alert(1)</script>"
 XSS_IMG = '<img src=x onerror=alert(1)>'
+# Attribute/quote-breakout payloads -- distinct from XSS_IMG above in that
+# these specifically probe for a *missing* or partial escape (e.g. only `<`/
+# `>` escaped but not quotes) letting the payload break out of an HTML
+# attribute context rather than element content.
+XSS_ATTR_BREAKOUT = '"><img src=x onerror=alert(1)>'
+XSS_QUOTE_BREAKOUT = "agent'\"onmouseover=alert(1)x='"
 
 
 async def _create_owner_token(db_session) -> str:
@@ -426,6 +432,62 @@ async def test_xss_server_rendered_view_escapes_message_content(client, db_sessi
     # The escaped forms must be present instead (autoescape did its job).
     assert "&lt;script&gt;" in resp.text
     assert "&lt;img" in resp.text
+
+
+# --- join prompts (ADR-0006, phase C) ---
+
+
+async def test_room_view_renders_join_prompt_per_member(client, db_session):
+    from app.onboarding import TOKEN_PLACEHOLDER
+
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Join prompts" in resp.text
+    # One join-prompt box per member, each still carrying the token
+    # placeholder (a room member's real machine token can't be retrieved
+    # here -- see app/routers/ui_rooms.py's module docstring). The prompt
+    # text is rendered through Jinja2 autoescape same as everything else on
+    # this page, so the literal '<token>' placeholder appears HTML-escaped.
+    import html
+
+    assert resp.text.count(html.escape(TOKEN_PLACEHOLDER)) >= 2
+    assert "You are &#39;agent-a&#39;; the other participant is &#39;agent-b&#39;." in resp.text
+    assert "You are &#39;agent-b&#39;; the other participant is &#39;agent-a&#39;." in resp.text
+    assert "Paste to agent-a; it authenticates with its own machine token." in resp.text
+    assert "Paste to agent-b; it authenticates with its own machine token." in resp.text
+    assert f"/v1/rooms/{room['id']}/messages" in resp.text
+
+
+async def test_room_join_prompt_xss_member_name_escaped(client, db_session):
+    """A room member name is owner-supplied but still untrusted content that
+    flows into the generated join prompt (app/onboarding.py's
+    `generate_room_join_prompt`) -- both the member label and every mention
+    of the name inside the prompt body must render escaped, never as raw
+    executable markup. Covers a <script> tag, an <img onerror> tag, and two
+    attribute/quote-breakout payloads (a bare '"><img ...' close-and-inject,
+    and a mixed-quote 'onmouseover=' payload) -- each must render escaped in
+    the join-prompt boxes, never in its raw executable form.
+    """
+    # MarkupSafe's escape (not stdlib html.escape) to match Jinja2 autoescape
+    # exactly -- the two disagree on quote encoding (`&#34;`/`&#39;` vs.
+    # `&quot;`/`&#x27;`), which matters here since two of the payloads below
+    # contain quote characters.
+    from markupsafe import escape as markupsafe_escape
+
+    owner_headers = await _owner_headers_and_login(client, db_session)
+
+    for i, payload in enumerate((XSS_SCRIPT, XSS_IMG, XSS_ATTR_BREAKOUT, XSS_QUOTE_BREAKOUT)):
+        room = await _create_room_via_api(
+            client, owner_headers, name=f"xss-room-{i}", members=[payload, "agent-b"]
+        )
+
+        resp = await client.get(f"/ui/rooms/{room['id']}")
+        assert resp.status_code == 200
+        assert payload not in resp.text
+        assert str(markupsafe_escape(payload)) in resp.text
 
 
 def test_rooms_js_renders_via_textcontent_not_innerhtml():

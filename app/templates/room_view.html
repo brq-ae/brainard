@@ -60,5 +60,16 @@
   </form>
 </div>
 
+<div class="panel">
+  <details class="machine-details">
+    <summary>Join prompts</summary>
+    {% for m in members %}
+    <p class="meta">Paste to {{ m }}; it authenticates with its own machine token.</p>
+    <div class="token-reveal" id="join-prompt-{{ loop.index }}">{{ join_prompts[m] }}</div>
+    <button type="button" class="btn" data-copy-target="join-prompt-{{ loop.index }}">Copy prompt for {{ m }}</button>
+    {% endfor %}
+  </details>
+</div>
+
 <script src="/static/rooms.js"></script>
 {% endblock %}

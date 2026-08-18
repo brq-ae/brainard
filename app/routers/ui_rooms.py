@@ -43,6 +43,23 @@ must render it inert:
 This endpoint itself just returns the raw message text as a JSON string
 value, which is correct: JSON data is not HTML, and the two renderers above
 are what keep it from ever becoming HTML.
+
+Member names are the same kind of untrusted content (a room's `members`
+strings are owner-supplied at create time -- see app/rooms.py's
+`_validate_members` -- but the room view also flows them into the
+generated per-member join prompt below, so the same autoescape discipline
+applies there too: `room_view.html` renders each `join_prompts[m]` and the
+member label through ordinary Jinja2, never `|safe`).
+
+PHASE C -- JOIN PROMPTS: `_join_prompts_by_member` generates, for each of a
+room's two members, the copy-paste prompt (app/onboarding.py's
+`generate_room_join_prompt`) that drops that agent into the room's respond-
+loop -- the room-view analogue of app/routers/ui_admin.py's
+`_prompts_by_machine_id` for the onboarding prompt. Always rendered with
+`TOKEN_PLACEHOLDER` standing in for the token: a room member is identified
+by a free-text `agent_name` string, not a minted Machine row, so there is
+no real per-member token to look up here in the first place (same
+placeholder convention, different reason than the onboarding case).
 """
 
 from fastapi import APIRouter, Depends, Form, Query, Request
@@ -52,6 +69,7 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 from app.db import get_db
 from app.errors import ApiError
+from app.onboarding import TOKEN_PLACEHOLDER, generate_room_join_prompt, resolve_base_url
 from app.rooms import close_room as close_room_op
 from app.rooms import create_room as create_room_op
 from app.rooms import get_members, get_members_for_rooms, get_recent_messages, get_room
@@ -69,7 +87,29 @@ INITIAL_MESSAGE_LIMIT = 50
 SHORT_POLL_WAIT = 0
 
 
-async def _room_context(db: AsyncSession, room_id: str) -> dict | None:
+def _join_prompts_by_member(request: Request, room_id: str, members: list[str]) -> dict[str, str]:
+    """The generated room-join prompt (app/onboarding.py's
+    `generate_room_join_prompt`) for each of the room's members, keyed by
+    agent name -- always with `TOKEN_PLACEHOLDER` standing in for the token
+    (see this module's docstring, "PHASE C -- JOIN PROMPTS"). Phase A's
+    `create_room` enforces exactly two distinct members (app/rooms.py's
+    `REQUIRED_MEMBER_COUNT`), so each member's partner is simply "the other
+    one of the two" -- there is no 3+-member case to handle here.
+    """
+    base_url = resolve_base_url(request)
+    return {
+        agent_name: generate_room_join_prompt(
+            base_url=base_url,
+            room_id=room_id,
+            agent_name=agent_name,
+            partner_name=next(other for other in members if other != agent_name),
+            token=TOKEN_PLACEHOLDER,
+        )
+        for agent_name in members
+    }
+
+
+async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dict | None:
     """Shared fetch for the room view and for re-rendering it with an error
     after a failed post -- returns None if the room doesn't exist so callers
     can 404.
@@ -80,7 +120,13 @@ async def _room_context(db: AsyncSession, room_id: str) -> dict | None:
     members = await get_members(db, room_id)
     messages = await get_recent_messages(db, room_id, limit=INITIAL_MESSAGE_LIMIT)
     last_seq = messages[-1].seq if messages else 0
-    return {"room": room, "members": members, "messages": messages, "last_seq": last_seq}
+    return {
+        "room": room,
+        "members": members,
+        "messages": messages,
+        "last_seq": last_seq,
+        "join_prompts": _join_prompts_by_member(request, room_id, members),
+    }
 
 
 # --- list + create ---
@@ -172,7 +218,7 @@ async def room_view(
     session: dict = Depends(require_ui_session),
     db: AsyncSession = Depends(get_db),
 ):
-    ctx = await _room_context(db, room_id)
+    ctx = await _room_context(db, request, room_id)
     if ctx is None:
         raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.")
     return templates.TemplateResponse(
@@ -232,7 +278,7 @@ async def room_post(
         # sender-agnostic beyond the membership check it skips for 'owner').
         await post_message_op(db, room_id, "owner", text)
     except ApiError as exc:
-        ctx = await _room_context(db, room_id)
+        ctx = await _room_context(db, request, room_id)
         if ctx is None:
             raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.") from exc
         return templates.TemplateResponse(
