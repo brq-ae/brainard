@@ -33,6 +33,7 @@ from app.routers import (
     ui_login,
     ui_notifications,
     ui_projects,
+    ui_rooms,
     ui_search,
 )
 from app.startup import bootstrap_owner_token
@@ -88,6 +89,7 @@ app.include_router(ui_projects.router)
 app.include_router(ui_journal.router)
 app.include_router(ui_doctrine.router)
 app.include_router(ui_notifications.router)
+app.include_router(ui_rooms.router)
 app.include_router(ui_admin.router)
 
 

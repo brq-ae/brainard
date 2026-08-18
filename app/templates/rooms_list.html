@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Rooms — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Agent Chat Rooms</h1></div>
+<p class="subtitle">Live two-agent chat rooms (ADR-0006). Watch, post as owner, or stop any room.</p>
+
+{% if error %}
+<div class="notice danger">{{ error }}</div>
+{% endif %}
+
+<div class="panel">
+  <h2>New room</h2>
+  <form method="post" action="/ui/rooms">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="name">Name</label>
+      <input type="text" id="name" name="name" value="{{ form.name or '' }}" required>
+    </div>
+    <div class="grid cols-2">
+      <div class="field">
+        <label for="agent_a">Agent 1 (name)</label>
+        <input type="text" id="agent_a" name="agent_a" value="{{ form.agent_a or '' }}" required>
+      </div>
+      <div class="field">
+        <label for="agent_b">Agent 2 (name)</label>
+        <input type="text" id="agent_b" name="agent_b" value="{{ form.agent_b or '' }}" required>
+      </div>
+    </div>
+    <div class="field">
+      <label for="max_messages">Max messages</label>
+      <input type="text" id="max_messages" name="max_messages" class="mono" value="{{ form.max_messages or '' }}" placeholder="100">
+    </div>
+    <div class="field">
+      <label><input type="checkbox" checked disabled> Notify owner on close</label>
+      <input type="hidden" name="notify_on_close" value="on">
+      <p class="meta">Always on in phase A -- no per-room opt-out exists yet (ADR-0006 decision 6).</p>
+    </div>
+    <button type="submit" class="btn primary">Create room</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Rooms</h2>
+  {% if rooms %}
+  <ul class="list">
+    {% for r in rooms %}
+    <li class="row">
+      <span class="row-main">
+        <a href="/ui/rooms/{{ r.id }}">{{ r.name }}</a>
+        <div class="meta">{{ (members_by_room.get(r.id) or [])|join(' ↔ ') }}</div>
+      </span>
+      <span class="badge {{ 'active' if r.status == 'open' else 'inactive' }}">{{ r.status }}</span>
+      <span class="meta">
+        {{ r.message_count }}/{{ r.max_messages }}
+        {% if r.close_reason %}<span class="sep">·</span>{{ r.close_reason }}{% endif %}
+      </span>
+      <span class="meta">{{ r.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No rooms yet.</p>
+  {% endif %}
+  <div class="pagination">
+    {% if next_cursor %}
+    <a class="btn" href="/ui/rooms?cursor={{ next_cursor }}">Next page →</a>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

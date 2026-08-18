@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ room.name }} — Rooms — The Brain{% endblock %}
+{% block content %}
+<div class="breadcrumb"><a href="/ui/rooms">← Rooms</a></div>
+<div class="page-title">
+  <h1>{{ room.name }}</h1>
+  <span class="badge {{ 'active' if room.status == 'open' else 'inactive' }}" id="room-status-badge">{{ room.status }}</span>
+</div>
+<p class="subtitle">
+  {{ members|join(' ↔ ') }}
+  <span class="sep">·</span>
+  <span id="room-count">{{ room.message_count }}</span>/{{ room.max_messages }} messages
+</p>
+
+{% if error %}
+<div class="notice danger">{{ error }}</div>
+{% endif %}
+
+<div class="notice danger" id="room-closed-banner" {% if room.status != 'closed' %}style="display:none"{% endif %}>
+  Room closed{% if room.close_reason %} (reason: <span id="room-close-reason">{{ room.close_reason }}</span>){% endif %}. No further messages are accepted.
+</div>
+
+<!-- Config for app/static/rooms.js, read via data-* attributes only -- no
+     inline script, no server-generated JS literals. room.id is a
+     server-generated ULID and room.status is one of two fixed strings, so
+     neither needs any special escaping beyond Jinja2's normal autoescape. -->
+<div id="room-config" data-room-id="{{ room.id }}" data-last-seq="{{ last_seq }}" data-status="{{ room.status }}"></div>
+
+<div class="panel">
+  <h2>Transcript</h2>
+  <ul class="list" id="room-messages">
+    {% for m in messages %}
+    <li class="row" data-seq="{{ m.seq }}">
+      <span class="row-main"><strong>{{ m.sender }}</strong>: {{ m.text }}</span>
+      <span class="meta">{{ m.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="empty" id="room-messages-empty" {% if messages %}style="display:none"{% endif %}>No messages yet.</p>
+</div>
+
+<div class="panel" id="room-post-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>
+  <h2>Post as owner</h2>
+  <form method="post" action="/ui/rooms/{{ room.id }}/post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="text">Message</label>
+      <input type="text" id="text" name="text" required>
+    </div>
+    <button type="submit" class="btn primary">Send</button>
+  </form>
+</div>
+
+<div class="panel" id="room-stop-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>
+  <h2>Stop room</h2>
+  <p class="meta">Closes the room immediately (reason "owner"). Cannot be undone.</p>
+  <form method="post" action="/ui/rooms/{{ room.id }}/close" data-confirm="Stop this room? This cannot be undone.">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn danger">Stop room</button>
+  </form>
+</div>
+
+<script src="/static/rooms.js"></script>
+{% endblock %}
