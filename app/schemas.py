@@ -459,3 +459,97 @@ class EventListItem(BaseModel):
 class EventListResponse(BaseModel):
     results: list[EventListItem]
     next_cursor: str | None
+
+
+# --- Agent chat rooms (ADR-0006, phase A) ---
+
+
+class RoomCreateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    # Exactly 2 distinct non-empty agent-name strings -- validated in
+    # app/rooms.py (self-explaining ApiError, not a bare pydantic 422), same
+    # reasoning as EventIn.kind above.
+    members: list[str] = Field(default_factory=list)
+    max_messages: int | None = None
+
+
+class RoomCreateResponse(BaseModel):
+    id: str
+    name: str
+    status: str
+    members: list[str]
+    max_messages: int
+
+
+class RoomListItem(BaseModel):
+    id: str
+    name: str
+    status: str
+    members: list[str]
+    message_count: int
+    max_messages: int
+    created_at: datetime
+    close_reason: str | None
+
+
+class RoomListResponse(BaseModel):
+    results: list[RoomListItem]
+    next_cursor: str | None
+
+
+class RoomMessageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    seq: int
+    sender: str
+    text: str
+    kind: str
+    created_at: datetime
+
+
+class RoomDetailResponse(BaseModel):
+    id: str
+    name: str
+    status: str
+    members: list[str]
+    max_messages: int
+    message_count: int
+    notify_on_close: bool
+    created_at: datetime
+    closed_at: datetime | None
+    close_reason: str | None
+    # Most recent N messages, oldest first (chat reading order).
+    messages: list[RoomMessageOut]
+
+
+class RoomPostMessageRequest(BaseModel):
+    sender: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    # Plain str (not a pydantic Literal), validated in app/rooms.py -- same
+    # reasoning as EventIn.kind above: a self-explaining ApiError instead of
+    # a generic 422 validation error.
+    kind: str = "message"
+
+
+class RoomPostMessageResponse(BaseModel):
+    id: str
+    seq: int
+    room_status: str
+    close_reason: str | None
+
+
+class RoomCloseRequest(BaseModel):
+    reason: str | None = None
+
+
+class RoomCloseResponse(BaseModel):
+    id: str
+    status: str
+    close_reason: str | None
+    closed_at: datetime | None
+
+
+class RoomMessagesPollResponse(BaseModel):
+    room_status: str
+    messages: list[RoomMessageOut]

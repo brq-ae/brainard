@@ -26,6 +26,9 @@ from app.models import (
     NotificationConfig,
     OwnerToken,
     Project,
+    Room,
+    RoomMember,
+    RoomMessage,
 )
 
 
@@ -69,6 +72,9 @@ async def _clean_tables():
     machines/projects they reference.
     """
     async with AsyncSessionLocal() as session:
+        await session.execute(RoomMessage.__table__.delete())
+        await session.execute(RoomMember.__table__.delete())
+        await session.execute(Room.__table__.delete())
         await session.execute(Flag.__table__.delete())
         await session.execute(KnowledgeEntry.__table__.delete())
         await session.execute(MirroredDocument.__table__.delete())

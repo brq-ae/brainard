@@ -23,6 +23,7 @@ from app.routers import (
     notifications,
     projects,
     proposals,
+    rooms,
     search,
     ui_admin,
     ui_dashboard,
@@ -76,6 +77,7 @@ app.include_router(projects.router)
 app.include_router(bootstrap.router)
 app.include_router(export.router)
 app.include_router(notifications.router)
+app.include_router(rooms.router)
 
 # --- UI (owner cookie session; see app/ui_auth.py) ---
 app.include_router(ui_login.router)

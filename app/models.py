@@ -430,3 +430,85 @@ class NotificationConfig(Base):
     # Never shown to sessions via bootstrap -- owner-facing only.
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# --- Agent chat rooms (ADR-0006, phase A: core rooms/messages/long-poll/
+# guardrails/notify) ---
+
+
+class Room(Base):
+    """A live agent-to-agent chat room. v1 is two-agent only (enforced at
+    create time by app/rooms.py, not by this table -- `room_members` models
+    the general many-member concept per the ADR). `max_messages` is the hard
+    backstop cap (guardrail 3 of 3, ADR-0006 decision 5); `message_count` is
+    denormalized onto the room row so the cap check never needs a COUNT(*)
+    over room_messages on every post. `close_reason` records which of the
+    three guardrails (or an owner close) ended the room -- null while open.
+    """
+
+    __tablename__ = "rooms"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    max_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Owner notification on close (ADR-0006 decision 6) -- always true today
+    # (no API surface sets it false in phase A), but modeled as a column so a
+    # future per-room opt-out doesn't need a migration.
+    notify_on_close: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'closed')", name="ck_rooms_status"),
+        CheckConstraint(
+            "close_reason IN ('done', 'owner', 'cap', 'stall') OR close_reason IS NULL",
+            name="ck_rooms_close_reason",
+        ),
+    )
+
+
+class RoomMember(Base):
+    """A room participant. v1 enforces exactly 2 rows per room at create
+    time (app/rooms.py) -- this table itself models the general concept, per
+    ADR-0006's "the table models the general concept" note.
+    """
+
+    __tablename__ = "room_members"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    room_id: Mapped[str] = mapped_column(String(26), ForeignKey("rooms.id"), nullable=False, index=True)
+    agent_name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("ix_room_members_room_agent", "room_id", "agent_name", unique=True),)
+
+
+class RoomMessage(Base):
+    """One message in a room's transcript. `seq` is a monotonic, per-room
+    sequence starting at 1 -- the cursor `GET .../messages?since=<seq>`
+    long-polls against (app/rooms.py). `kind` 'done' is the agent-initiated
+    close signal (guardrail 1); 'system' is reserved for server-authored
+    messages (never accepted from POST .../messages -- see app/rooms.py's
+    VALID_POST_KINDS).
+    """
+
+    __tablename__ = "room_messages"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    room_id: Mapped[str] = mapped_column(String(26), ForeignKey("rooms.id"), nullable=False, index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    sender: Mapped[str] = mapped_column(Text, nullable=False)  # a member's agent_name, or the literal 'owner'
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="message")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('message', 'done', 'system')", name="ck_room_messages_kind"),
+        # Serves both the "index on (room_id, seq)" and "unique on
+        # (room_id, seq)" requirements at once -- a unique index is also a
+        # usable index for the ordinary range/cursor lookups.
+        Index("ix_room_messages_room_seq", "room_id", "seq", unique=True),
+    )
