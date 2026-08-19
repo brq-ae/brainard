@@ -13,7 +13,7 @@ a single DB session across its wait -- see that function's docstring.
 import asyncio
 import base64
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, tuple_
 from sqlalchemy.exc import IntegrityError
@@ -24,6 +24,7 @@ from app.db import AsyncSessionLocal
 from app.errors import ApiError
 from app.models import Room, RoomMember, RoomMessage
 from app.notify import notify_room_closed
+from app.room_modes import DEFAULT_MODE, ROOM_MODES, validate_mode
 
 # --- room creation ---
 
@@ -31,6 +32,12 @@ MAX_MESSAGES_MIN = 1
 MAX_MESSAGES_MAX = 10000
 DEFAULT_MAX_MESSAGES = 100
 REQUIRED_MEMBER_COUNT = 2
+
+# ADR-0007: optional wall-clock deadline. Either `duration_seconds` or an
+# explicit `expires_at` may be given (not both); 30 days is a sane upper
+# bound on how long an unattended room may run for.
+MIN_DURATION_SECONDS = 1
+MAX_DURATION_SECONDS = 30 * 24 * 3600
 
 _RECOVERY_ROOM_MEMBERS = "resend `members` as exactly two distinct non-empty agent-name strings"
 
@@ -70,13 +77,127 @@ def _validate_max_messages(max_messages: int | None) -> int:
     return max_messages
 
 
-async def create_room(db: AsyncSession, name: str, members: list[str], max_messages: int | None) -> Room:
+def _validate_topic(mode: str, topic: str | None) -> str | None:
+    """Non-freeform modes require a non-empty topic -- it's interpolated
+    into every mode's role text (app/room_modes.py). freeform ignores it:
+    accepted if given (stored, harmless) but never required, since
+    freeform's role text is None and never reads it.
+    """
+    cleaned = topic.strip() if isinstance(topic, str) else None
+    if mode != DEFAULT_MODE and not cleaned:
+        raise ApiError(
+            422,
+            "missing_room_topic",
+            f"`topic` is required and must be non-empty for mode {mode!r}. Recovery: resend with a "
+            "non-empty `topic`.",
+        )
+    return cleaned or None
+
+
+def _validate_sides(mode: str, members: list[str], sides: dict[str, str] | None) -> dict[str, str | None]:
+    """Symmetric modes (freeform, collaborate, brainstorm) ignore `sides`
+    entirely -- every member's side is None. Asymmetric modes (debate,
+    critique) require `sides` to assign each of the mode's two distinct
+    side keys (app/room_modes.py's `ROOM_MODES[mode].sides`) to exactly one
+    of the room's two members.
+    """
+    mode_def = ROOM_MODES[mode]
+    if mode_def.sides is None:
+        return dict.fromkeys(members)
+
+    expected_sides = set(mode_def.sides)
+    given = sides or {}
+    if set(given.keys()) != set(members) or set(given.values()) != expected_sides:
+        raise ApiError(
+            422,
+            "invalid_room_sides",
+            f"`sides` must assign exactly one of {sorted(expected_sides)} to each of {members} for mode "
+            f"{mode!r}, got {given!r}. Recovery: resend `sides` as {{member_name: side}} covering both "
+            "members with both distinct side values.",
+        )
+    return dict(given)
+
+
+def _validate_deadline(now: datetime, duration_seconds: int | None, expires_at: datetime | None) -> datetime | None:
+    """Either `duration_seconds` (computes `now + duration_seconds`) or an
+    explicit `expires_at` may be given, not both. Returns None (no
+    deadline) if neither is given. Enforces the deadline is in the future
+    and within MAX_DURATION_SECONDS (30 days) of now either way, so the two
+    input forms end up validated identically.
+    """
+    if duration_seconds is not None and expires_at is not None:
+        raise ApiError(
+            422,
+            "invalid_room_deadline",
+            "Provide at most one of `duration_seconds` or `expires_at`, not both. Recovery: resend with "
+            "only one of the two set.",
+        )
+
+    if duration_seconds is not None:
+        if (
+            not isinstance(duration_seconds, int)
+            or isinstance(duration_seconds, bool)
+            or not (MIN_DURATION_SECONDS <= duration_seconds <= MAX_DURATION_SECONDS)
+        ):
+            raise ApiError(
+                422,
+                "invalid_room_deadline",
+                f"`duration_seconds` must be an integer between {MIN_DURATION_SECONDS} and "
+                f"{MAX_DURATION_SECONDS} (30 days), got {duration_seconds!r}.",
+            )
+        return now + timedelta(seconds=duration_seconds)
+
+    if expires_at is not None:
+        resolved = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=UTC)
+        if resolved <= now:
+            raise ApiError(
+                422,
+                "invalid_room_deadline",
+                f"`expires_at` must be in the future, got {resolved.isoformat()!r}.",
+            )
+        if resolved > now + timedelta(seconds=MAX_DURATION_SECONDS):
+            raise ApiError(
+                422,
+                "invalid_room_deadline",
+                f"`expires_at` is more than {MAX_DURATION_SECONDS // 86400} days out, got "
+                f"{resolved.isoformat()!r}. Recovery: pick a closer deadline.",
+            )
+        return resolved
+
+    return None
+
+
+async def create_room(
+    db: AsyncSession,
+    name: str,
+    members: list[str],
+    max_messages: int | None,
+    *,
+    mode: str = DEFAULT_MODE,
+    topic: str | None = None,
+    sides: dict[str, str] | None = None,
+    duration_seconds: int | None = None,
+    expires_at: datetime | None = None,
+) -> Room:
+    """ADR-0007 extends room creation with an optional mode+topic (shapes
+    the join prompt's injected role text, app/onboarding.py) and an
+    optional deadline (`duration_seconds` or `expires_at`, enforced by the
+    background sweeper, app/room_sweeper.py). All new validation is
+    self-explaining ApiErrors, same posture as the phase A validators
+    above; mode/topic/sides are cross-validated together since which
+    `sides` shape is valid depends on the mode.
+    """
     if not name or not name.strip():
         raise ApiError(422, "invalid_room_name", "`name` must be non-empty. Recovery: resend with a non-empty name.")
     cleaned_members = _validate_members(members)
     resolved_max = _validate_max_messages(max_messages)
+    validate_mode(mode)
+    cleaned_topic = _validate_topic(mode, topic)
+    member_sides = _validate_sides(mode, cleaned_members, sides)
 
     now = datetime.now(UTC)
+    resolved_expires_at = _validate_deadline(now, duration_seconds, expires_at)
+
     room = Room(
         id=str(ULID()),
         name=name.strip(),
@@ -85,12 +206,23 @@ async def create_room(db: AsyncSession, name: str, members: list[str], max_messa
         message_count=0,
         notify_on_close=True,
         created_at=now,
+        mode=mode,
+        topic=cleaned_topic,
+        expires_at=resolved_expires_at,
     )
     db.add(room)
     await db.flush()  # room.id must exist before the member rows FK to it
 
     for agent_name in cleaned_members:
-        db.add(RoomMember(id=str(ULID()), room_id=room.id, agent_name=agent_name, created_at=now))
+        db.add(
+            RoomMember(
+                id=str(ULID()),
+                room_id=room.id,
+                agent_name=agent_name,
+                created_at=now,
+                side=member_sides.get(agent_name),
+            )
+        )
 
     await db.commit()
     return room
@@ -110,6 +242,43 @@ async def get_members(db: AsyncSession, room_id: str) -> list[str]:
         )
     ).all()
     return list(rows)
+
+
+async def get_member_sides(db: AsyncSession, room_id: str) -> dict[str, str | None]:
+    """ADR-0007: `{agent_name: side}` for a room's members -- `side` is None
+    for symmetric/freeform members. A separate function from `get_members`
+    (list[str], unchanged) rather than changing that function's return
+    shape, so the phase A callers that already depend on `get_members`
+    returning plain names (post_message's membership check, ui_rooms.py's
+    templates -- UI is out of scope for this part) are untouched.
+    """
+    rows = (
+        await db.execute(
+            select(RoomMember.agent_name, RoomMember.side)
+            .where(RoomMember.room_id == room_id)
+            .order_by(RoomMember.created_at)
+        )
+    ).all()
+    return {agent_name: side for agent_name, side in rows}
+
+
+async def get_member_sides_for_rooms(db: AsyncSession, room_ids: list[str]) -> dict[str, dict[str, str | None]]:
+    """Batched `get_member_sides` for GET /v1/rooms (list) -- one query for
+    the whole page, mirroring `get_members_for_rooms`.
+    """
+    if not room_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(RoomMember.room_id, RoomMember.agent_name, RoomMember.side)
+            .where(RoomMember.room_id.in_(room_ids))
+            .order_by(RoomMember.created_at)
+        )
+    ).all()
+    result: dict[str, dict[str, str | None]] = {}
+    for room_id, agent_name, side in rows:
+        result.setdefault(room_id, {})[agent_name] = side
+    return result
 
 
 async def get_members_for_rooms(db: AsyncSession, room_ids: list[str]) -> dict[str, list[str]]:
@@ -368,24 +537,108 @@ async def post_message(db: AsyncSession, room_id: str, sender: str, text: str, k
 
 # --- POST /v1/rooms/{id}/close ---
 
-VALID_CLOSE_REASONS = frozenset({"done", "owner", "cap", "stall"})
+VALID_CLOSE_REASONS = frozenset({"done", "owner", "cap", "stall", "time"})
 
 
 async def close_room(db: AsyncSession, room_id: str, reason: str | None) -> Room:
+    """Closes a room (owner Stop, or the sweeper's time-close --
+    app/room_sweeper.py -- reusing this same function, never hand-rolling a
+    close).
+
+    Takes the room's row lock -- same `SELECT ... FOR UPDATE` +
+    `populate_existing` pattern `post_message` and `post_closing_nudge` use
+    in this file -- before checking/applying the close, for the identical
+    reason `post_message`'s cap guardrail documents: without the lock, two
+    racing closers (an owner Stop racing the sweeper's time-close, or the
+    sweeper racing a concurrent 'done'/cap close from `post_message`, or
+    two owner Stops) could both read `status == 'open'` before either
+    commits, and the second writer's `_apply_close` would then blindly
+    overwrite the first winner's `close_reason`/`closed_at` and fire
+    `notify_room_closed` a second time with contradictory content. Holding
+    the lock across the re-check and the close makes "room closes exactly
+    once, with the first winner's reason, and notifies exactly once" true
+    under concurrency, not just in the common case.
+    """
     if reason is not None and reason not in VALID_CLOSE_REASONS:
         raise ApiError(
             422,
             "invalid_close_reason",
             f"`reason` must be one of {sorted(VALID_CLOSE_REASONS)}, got {reason!r}.",
         )
+    # Unlocked pre-check: existence never needs the row lock to be correct
+    # (mirrors post_message's own "unlocked pre-checks" reasoning) -- a 404
+    # for a genuinely nonexistent room doesn't need serializing on anything.
     room = await db.get(Room, room_id)
     if room is None:
         raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Serialization point: acquire the room's row lock. A concurrent closer
+    # that got here first holds this lock until its commit (inside
+    # `_apply_close` below); this call blocks until then, so this call
+    # always sees the *previous* closer's committed status/close_reason,
+    # never a stale snapshot. `populate_existing` is required in addition
+    # to `with_for_update` for the same reason `post_message` documents:
+    # `room` may already be in this Session's identity map from the
+    # unlocked `db.get` above, and without it SQLAlchemy would leave that
+    # already-loaded object's attributes untouched even though the FOR
+    # UPDATE SQL below legitimately re-fetches newer committed data.
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+    # Re-check status under the lock: another concurrent close (owner Stop,
+    # the sweeper's time-close, or post_message's own done/cap guardrail
+    # close) may have closed the room in the window between the unlocked
+    # check above and acquiring this lock -- this is the check that
+    # actually has to be race-free, and it now is.
     if room.status == "closed":
         return room  # idempotent: closing an already-closed room just returns its state
 
     await _apply_close(db, room, reason or "owner")
     return room
+
+
+# --- server-authored system messages (ADR-0007: the sweeper's closing nudge) ---
+
+
+async def post_closing_nudge(db: AsyncSession, room_id: str, text: str) -> RoomMessage | None:
+    """Posts the sweeper's one-time "closing soon" `kind='system'` message
+    (app/room_sweeper.py) under the room's row lock -- same
+    `SELECT ... FOR UPDATE` + `populate_existing` pattern `post_message`
+    uses -- and sets `closing_warned_at` in that SAME commit. Checking
+    "not already warned" and setting `closing_warned_at` under one lock (as
+    opposed to the sweeper's earlier unlocked scan-for-candidates query,
+    which is only ever a hint) is what actually prevents a double-post if
+    two sweep cycles overlap or a future multi-worker deployment races this
+    room -- the same reasoning `post_message`'s cap guardrail documents for
+    why its close has to happen under the lock, before the one commit.
+
+    Returns None (posts nothing) if, by the time the lock is acquired, the
+    room is missing, already closed, or already warned -- there's no
+    sender to report an ApiError to here, unlike `post_message`; the caller
+    just treats "not eligible anymore" as a no-op for this room this cycle.
+
+    Deliberately bypasses the done/cap guardrails `post_message` applies
+    (this must never trip the hard cap right as the room is being kept
+    open long enough to receive closing statements) -- it still increments
+    `message_count` and takes the next `seq`, so the message appears in the
+    transcript like any other, just without guardrail side effects.
+    """
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None or room.status != "open" or room.closing_warned_at is not None:
+        return None
+
+    now = datetime.now(UTC)
+    seq = await _next_seq(db, room.id)
+    message = RoomMessage(id=str(ULID()), room_id=room.id, seq=seq, sender="system", text=text, kind="system", created_at=now)
+    db.add(message)
+    room.message_count += 1
+    room.closing_warned_at = now
+    await db.commit()
+    return message
 
 
 # --- GET /v1/rooms/{id}/messages -- the long-poll ---

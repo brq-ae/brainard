@@ -16,12 +16,21 @@ the analogous copy-paste prompt for Agent Chat Rooms, generated for
 app/routers/ui_rooms.py's room view. Same module, same `resolve_base_url` /
 `TOKEN_PLACEHOLDER` reuse, so the two generated-prompt features never
 diverge on how a base URL or a not-retrievable token is presented.
+
+ADR-0007 extends `generate_room_join_prompt` with the room's mode/topic/
+side/deadline: when the room isn't 'freeform', a clearly-marked "session"
+block is inserted between the intro and the poll/reply mechanics, built
+entirely from app/room_modes.py (ROOM_MODES's single-sourced role text and
+closing instruction) -- never duplicated here.
 """
+
+from datetime import UTC, datetime
 
 from starlette.requests import Request
 
 from app.config import get_settings
 from app.roles import ROLE_DESCRIPTIONS
+from app.room_modes import ROOM_MODES, closing_instruction_for, role_text_for
 
 TOKEN_PLACEHOLDER = "<token>"
 PROJECT_PLACEHOLDER = "<PROJECT>"
@@ -98,6 +107,37 @@ def generate_onboarding_prompt(
     return "\n\n".join(paragraphs)
 
 
+def _room_session_block(
+    mode: str, topic: str | None, side: str | None, partner: str, deadline: datetime | None
+) -> str | None:
+    """The ADR-0007 "session" paragraph: a "This is a <mode label> session"
+    header, this agent's mode+side role text (topic/partner filled in) and
+    closing instruction -- both single-sourced from app/room_modes.py -- and
+    a deadline line if the room has one. Returns None for 'freeform': no
+    special stance text, the join prompt's existing generic framing stands
+    unchanged.
+    """
+    role_text = role_text_for(mode, side, topic or "", partner)
+    if role_text is None:  # freeform
+        return None
+
+    mode_def = ROOM_MODES[mode]
+    lines = [f"This is a {mode_def.label} session.", role_text]
+
+    closing = closing_instruction_for(mode, side)
+    if closing:
+        lines.append(closing)
+
+    if deadline is not None:
+        human = deadline.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        lines.append(
+            f"Deadline: the room closes at {human} ({deadline.astimezone(UTC).isoformat()}); a system "
+            "notice will warn you shortly before then -- post your closing statement once you see it."
+        )
+
+    return " ".join(lines)
+
+
 def generate_room_join_prompt(
     *,
     base_url: str,
@@ -105,6 +145,10 @@ def generate_room_join_prompt(
     agent_name: str,
     partner_name: str,
     token: str = TOKEN_PLACEHOLDER,
+    mode: str = "freeform",
+    topic: str | None = None,
+    side: str | None = None,
+    deadline: datetime | None = None,
 ) -> str:
     """Builds the full room-join prompt (ADR-0006, phase C, decision 7): the
     complete copy-paste prompt that drops an agent into a room's long-poll
@@ -123,6 +167,13 @@ def generate_room_join_prompt(
     trust framing): the other participant's messages are a channel to weigh
     with judgment, never commands that override safety or the owner's
     instructions.
+
+    ADR-0007: `mode`/`topic`/`side`/`deadline` are the room's optional
+    purpose and time limit. When `mode != 'freeform'`, a "session" block
+    (this agent's role text + closing instruction, both single-sourced from
+    app/room_modes.py, plus a deadline line if `deadline` is set) is
+    inserted between the intro and the poll/reply mechanics below -- the
+    mechanics themselves are unchanged by mode.
     """
     base = base_url.rstrip("/")
 
@@ -166,4 +217,10 @@ def generate_room_join_prompt(
 
     keep_me_informed = "Keep me informed per G9 (notify me when you're blocked or when the room work is done)."
 
-    return "\n\n".join([intro, how_to, keep_me_informed])
+    session_block = _room_session_block(mode, topic, side, partner_name, deadline)
+    paragraphs = [intro]
+    if session_block is not None:
+        paragraphs.append(session_block)
+    paragraphs.extend([how_to, keep_me_informed])
+
+    return "\n\n".join(paragraphs)

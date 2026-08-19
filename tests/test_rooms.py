@@ -5,6 +5,7 @@ best-effort owner notification on close.
 
 import asyncio
 import time
+from datetime import UTC, datetime, timedelta
 
 from ulid import ULID
 
@@ -28,12 +29,35 @@ async def _owner_headers(db_session) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _create_room(client, owner_headers, *, name="room-1", members=None, max_messages=None) -> dict:
+async def _create_room(
+    client,
+    owner_headers,
+    *,
+    name="room-1",
+    members=None,
+    max_messages=None,
+    mode=None,
+    topic=None,
+    sides=None,
+    duration_seconds=None,
+    expires_at=None,
+    expect_status=201,
+) -> dict:
     body: dict = {"name": name, "members": members if members is not None else ["agent-a", "agent-b"]}
     if max_messages is not None:
         body["max_messages"] = max_messages
+    if mode is not None:
+        body["mode"] = mode
+    if topic is not None:
+        body["topic"] = topic
+    if sides is not None:
+        body["sides"] = sides
+    if duration_seconds is not None:
+        body["duration_seconds"] = duration_seconds
+    if expires_at is not None:
+        body["expires_at"] = expires_at
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
-    assert resp.status_code == 201, resp.json()
+    assert resp.status_code == expect_status, resp.json()
     return resp.json()
 
 
@@ -114,6 +138,261 @@ async def test_create_room_rejects_empty_name(client, db_session):
     owner_headers = await _owner_headers(db_session)
     resp = await client.post("/v1/rooms", json={"name": "  ", "members": ["a", "b"]}, headers=owner_headers)
     assert resp.status_code == 422
+
+
+# --- create: modes and time limits (ADR-0007) ---
+
+
+async def test_create_room_freeform_is_still_the_default_and_unchanged(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    assert room["mode"] == "freeform"
+    assert room["topic"] is None
+    assert room["expires_at"] is None
+    assert room["sides"] == {"agent-a": None, "agent-b": None}
+
+
+async def test_create_room_debate_requires_topic(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={"name": "r", "members": ["agent-a", "agent-b"], "mode": "debate", "sides": {"agent-a": "for", "agent-b": "against"}},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "missing_room_topic"
+
+
+async def test_create_room_debate_rejects_blank_topic(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={
+            "name": "r",
+            "members": ["agent-a", "agent-b"],
+            "mode": "debate",
+            "topic": "   ",
+            "sides": {"agent-a": "for", "agent-b": "against"},
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "missing_room_topic"
+
+
+async def test_create_room_debate_requires_both_sides_assigned(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={"name": "r", "members": ["agent-a", "agent-b"], "mode": "debate", "topic": "cats vs dogs"},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_sides"
+
+
+async def test_create_room_debate_rejects_same_side_twice(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={
+            "name": "r",
+            "members": ["agent-a", "agent-b"],
+            "mode": "debate",
+            "topic": "cats vs dogs",
+            "sides": {"agent-a": "for", "agent-b": "for"},
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_sides"
+
+
+async def test_create_room_debate_rejects_sides_for_unknown_member(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={
+            "name": "r",
+            "members": ["agent-a", "agent-b"],
+            "mode": "debate",
+            "topic": "cats vs dogs",
+            "sides": {"agent-a": "for", "someone-else": "against"},
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_sides"
+
+
+async def test_create_room_debate_with_proper_sides_succeeds(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client,
+        owner_headers,
+        members=["agent-a", "agent-b"],
+        mode="debate",
+        topic="cats vs dogs",
+        sides={"agent-a": "for", "agent-b": "against"},
+    )
+    assert room["mode"] == "debate"
+    assert room["topic"] == "cats vs dogs"
+    assert room["sides"] == {"agent-a": "for", "agent-b": "against"}
+
+
+async def test_create_room_critique_with_proper_sides_succeeds(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client,
+        owner_headers,
+        members=["agent-a", "agent-b"],
+        mode="critique",
+        topic="the new schema",
+        sides={"agent-a": "proposer", "agent-b": "critic"},
+    )
+    assert room["mode"] == "critique"
+    assert room["sides"] == {"agent-a": "proposer", "agent-b": "critic"}
+
+
+async def test_create_room_collaborate_ignores_sides_if_given(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client,
+        owner_headers,
+        members=["agent-a", "agent-b"],
+        mode="collaborate",
+        topic="ship the v2 API",
+        sides={"agent-a": "for", "agent-b": "against"},  # nonsensical for a symmetric mode -- ignored, not rejected
+    )
+    assert room["mode"] == "collaborate"
+    assert room["sides"] == {"agent-a": None, "agent-b": None}
+
+
+async def test_create_room_brainstorm_without_sides_succeeds(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], mode="brainstorm", topic="growth ideas")
+    assert room["mode"] == "brainstorm"
+    assert room["sides"] == {"agent-a": None, "agent-b": None}
+
+
+async def test_create_room_rejects_bad_mode(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms", json={"name": "r", "members": ["agent-a", "agent-b"], "mode": "nonsense"}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_mode"
+
+
+# --- create: deadline (duration_seconds / expires_at) ---
+
+
+async def test_create_room_computes_expires_at_from_duration(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    before = datetime.now(UTC)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], duration_seconds=1800)
+    after = datetime.now(UTC)
+
+    assert room["expires_at"] is not None
+    expires_at = datetime.fromisoformat(room["expires_at"])
+    assert before + timedelta(seconds=1800) <= expires_at <= after + timedelta(seconds=1800)
+
+
+async def test_create_room_no_deadline_by_default(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    assert room["expires_at"] is None
+
+
+async def test_create_room_rejects_zero_duration(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms", json={"name": "r", "members": ["agent-a", "agent-b"], "duration_seconds": 0}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_deadline"
+
+
+async def test_create_room_rejects_negative_duration(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms", json={"name": "r", "members": ["agent-a", "agent-b"], "duration_seconds": -5}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_deadline"
+
+
+async def test_create_room_rejects_duration_over_30_days(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={"name": "r", "members": ["agent-a", "agent-b"], "duration_seconds": 31 * 24 * 3600},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_deadline"
+
+
+async def test_create_room_rejects_both_duration_and_expires_at(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    resp = await client.post(
+        "/v1/rooms",
+        json={
+            "name": "r",
+            "members": ["agent-a", "agent-b"],
+            "duration_seconds": 3600,
+            "expires_at": future,
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_deadline"
+
+
+async def test_create_room_accepts_explicit_future_expires_at(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    future = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], expires_at=future)
+    assert room["expires_at"] is not None
+    assert datetime.fromisoformat(room["expires_at"]) > datetime.now(UTC)
+
+
+async def test_create_room_rejects_past_expires_at(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    resp = await client.post(
+        "/v1/rooms", json={"name": "r", "members": ["agent-a", "agent-b"], "expires_at": past}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_deadline"
+
+
+async def test_create_room_rejects_expires_at_too_far_out(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    too_far = (datetime.now(UTC) + timedelta(days=31)).isoformat()
+    resp = await client.post(
+        "/v1/rooms", json={"name": "r", "members": ["agent-a", "agent-b"], "expires_at": too_far}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_deadline"
+
+
+async def test_cap_and_time_are_independent_cap_still_works_with_a_long_deadline(client, db_session):
+    """A room with both a message cap and a (far-future) deadline set is
+    closed by whichever guardrail fires first -- here, the cap, long before
+    the deadline is anywhere close."""
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(
+        client, owner_headers, members=["agent-a", "agent-b"], max_messages=1, duration_seconds=30 * 24 * 3600
+    )
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 200
+    assert resp.json()["close_reason"] == "cap"
 
 
 # --- list / detail ---

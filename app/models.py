@@ -460,12 +460,29 @@ class Room(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     close_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ADR-0007: room modes and time limits. `mode` shapes the join prompt's
+    # injected role text (app/room_modes.py is the single source of what
+    # each mode means); 'freeform' (default) carries no special stance.
+    # `topic` is required by create_room whenever mode != 'freeform'.
+    # `expires_at` is the optional wall-clock deadline the background
+    # sweeper (app/room_sweeper.py) closes the room against (close_reason
+    # 'time') -- an independent second backstop alongside the message cap.
+    # `closing_warned_at` guards the sweeper's one-time "closing soon"
+    # system-message nudge so it never double-posts.
+    mode: Mapped[str] = mapped_column(Text, nullable=False, default="freeform")
+    topic: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closing_warned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN ('open', 'closed')", name="ck_rooms_status"),
         CheckConstraint(
-            "close_reason IN ('done', 'owner', 'cap', 'stall') OR close_reason IS NULL",
+            "close_reason IN ('done', 'owner', 'cap', 'stall', 'time') OR close_reason IS NULL",
             name="ck_rooms_close_reason",
+        ),
+        CheckConstraint(
+            "mode IN ('freeform', 'debate', 'collaborate', 'brainstorm', 'critique')",
+            name="ck_rooms_mode",
         ),
     )
 
@@ -482,6 +499,11 @@ class RoomMember(Base):
     room_id: Mapped[str] = mapped_column(String(26), ForeignKey("rooms.id"), nullable=False, index=True)
     agent_name: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # ADR-0007: this member's stance in an asymmetric mode -- 'for'/'against'
+    # (debate) or 'proposer'/'critic' (critique), per app/room_modes.py's
+    # ROOM_MODES[mode].sides. NULL for symmetric modes (collaborate,
+    # brainstorm) and freeform.
+    side: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (Index("ix_room_members_room_agent", "room_id", "agent_name", unique=True),)
 

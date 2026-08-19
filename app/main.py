@@ -1,5 +1,7 @@
 """FastAPI application entrypoint."""
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
 from app.errors import ApiError, api_error_handler
+from app.room_sweeper import run_sweeper
 from app.routers import (
     bootstrap,
     deposits,
@@ -43,7 +46,20 @@ from app.ui_auth import UIAuthRequired
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await bootstrap_owner_token()
-    yield
+    # ADR-0007: the room-modes-and-time-limits background sweeper -- the
+    # Brain's first always-on task. Started here (not module-level) so it
+    # shares the app's event loop and is reliably cancelled on shutdown,
+    # rather than leaking a task across test-suite app instantiations or
+    # reloads. app/room_sweeper.py's run_sweeper() already wraps every
+    # cycle in its own try/except, so a bad cycle never crashes the app;
+    # this shutdown path just ensures the task itself is stopped cleanly.
+    sweeper_task = asyncio.create_task(run_sweeper())
+    try:
+        yield
+    finally:
+        sweeper_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweeper_task
 
 
 app = FastAPI(title="The Brain", version="0.1.0", lifespan=lifespan)

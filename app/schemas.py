@@ -471,6 +471,23 @@ class RoomCreateRequest(BaseModel):
     # reasoning as EventIn.kind above.
     members: list[str] = Field(default_factory=list)
     max_messages: int | None = None
+    # --- ADR-0007: room modes and time limits ---
+    # Plain str (not a pydantic Literal) validated in app/rooms.py via
+    # app/room_modes.py's validate_mode -- same self-explaining-ApiError
+    # reasoning as `kind` above.
+    mode: str = "freeform"
+    # Required (non-empty) whenever mode != 'freeform'; ignored for
+    # freeform -- enforced in app/rooms.py, not here.
+    topic: str | None = None
+    # Required for asymmetric modes (debate, critique): {agent_name: side},
+    # covering both `members` with both of the mode's distinct side values.
+    # Ignored for symmetric modes (freeform, collaborate, brainstorm).
+    sides: dict[str, str] | None = None
+    # At most one of `duration_seconds`/`expires_at` -- app/rooms.py
+    # computes the room's `expires_at` from whichever is given (or leaves
+    # it null: no deadline).
+    duration_seconds: int | None = None
+    expires_at: datetime | None = None
 
 
 class RoomCreateResponse(BaseModel):
@@ -479,6 +496,11 @@ class RoomCreateResponse(BaseModel):
     status: str
     members: list[str]
     max_messages: int
+    mode: str
+    topic: str | None
+    expires_at: datetime | None
+    # {agent_name: side} -- side is null for symmetric/freeform members.
+    sides: dict[str, str | None]
 
 
 class RoomListItem(BaseModel):
@@ -490,6 +512,10 @@ class RoomListItem(BaseModel):
     max_messages: int
     created_at: datetime
     close_reason: str | None
+    mode: str
+    topic: str | None
+    expires_at: datetime | None
+    sides: dict[str, str | None]
 
 
 class RoomListResponse(BaseModel):
@@ -519,6 +545,10 @@ class RoomDetailResponse(BaseModel):
     created_at: datetime
     closed_at: datetime | None
     close_reason: str | None
+    mode: str
+    topic: str | None
+    expires_at: datetime | None
+    sides: dict[str, str | None]
     # Most recent N messages, oldest first (chat reading order).
     messages: list[RoomMessageOut]
 

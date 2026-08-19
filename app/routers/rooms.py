@@ -16,6 +16,8 @@ from app.db import get_db
 from app.errors import ApiError
 from app.rooms import (
     create_room,
+    get_member_sides,
+    get_member_sides_for_rooms,
     get_members,
     get_members_for_rooms,
     get_recent_messages,
@@ -48,9 +50,30 @@ async def create_room_endpoint(
     _owner: Principal = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ) -> RoomCreateResponse:
-    room = await create_room(db, body.name, body.members, body.max_messages)
+    room = await create_room(
+        db,
+        body.name,
+        body.members,
+        body.max_messages,
+        mode=body.mode,
+        topic=body.topic,
+        sides=body.sides,
+        duration_seconds=body.duration_seconds,
+        expires_at=body.expires_at,
+    )
     members = await get_members(db, room.id)
-    return RoomCreateResponse(id=room.id, name=room.name, status=room.status, members=members, max_messages=room.max_messages)
+    sides = await get_member_sides(db, room.id)
+    return RoomCreateResponse(
+        id=room.id,
+        name=room.name,
+        status=room.status,
+        members=members,
+        max_messages=room.max_messages,
+        mode=room.mode,
+        topic=room.topic,
+        expires_at=room.expires_at,
+        sides=sides,
+    )
 
 
 @router.get("", response_model=RoomListResponse)
@@ -61,7 +84,9 @@ async def list_rooms_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> RoomListResponse:
     rows, next_cursor = await list_rooms_op(db, cursor=cursor, limit=limit)
-    members_by_room = await get_members_for_rooms(db, [r.id for r in rows])
+    room_ids = [r.id for r in rows]
+    members_by_room = await get_members_for_rooms(db, room_ids)
+    sides_by_room = await get_member_sides_for_rooms(db, room_ids)
     return RoomListResponse(
         results=[
             RoomListItem(
@@ -73,6 +98,10 @@ async def list_rooms_endpoint(
                 max_messages=r.max_messages,
                 created_at=r.created_at,
                 close_reason=r.close_reason,
+                mode=r.mode,
+                topic=r.topic,
+                expires_at=r.expires_at,
+                sides=sides_by_room.get(r.id, {}),
             )
             for r in rows
         ],
@@ -90,6 +119,7 @@ async def get_room_endpoint(
     if room is None:
         raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
     members = await get_members(db, room_id)
+    sides = await get_member_sides(db, room_id)
     messages = await get_recent_messages(db, room_id)
     return RoomDetailResponse(
         id=room.id,
@@ -102,6 +132,10 @@ async def get_room_endpoint(
         created_at=room.created_at,
         closed_at=room.closed_at,
         close_reason=room.close_reason,
+        mode=room.mode,
+        topic=room.topic,
+        expires_at=room.expires_at,
+        sides=sides,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
     )
 
