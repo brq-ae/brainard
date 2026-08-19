@@ -176,6 +176,7 @@ form.inline { display: inline; }
 .field label { display: block; font-size: 0.85em; color: var(--text-dim); margin-bottom: 4px; }
 .field input[type="text"],
 .field input[type="password"],
+.field input[type="number"],
 .field select,
 .field textarea {
   width: 100%;

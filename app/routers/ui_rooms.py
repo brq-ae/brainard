@@ -51,6 +51,17 @@ generated per-member join prompt below, so the same autoescape discipline
 applies there too: `room_view.html` renders each `join_prompts[m]` and the
 member label through ordinary Jinja2, never `|safe`).
 
+A room's `topic` is the same kind of owner-supplied-but-untrusted content
+(ADR-0007) and now renders in two places: room_view.html's header
+(`{{ room.topic }}`, plain Jinja2 autoescape, no `|safe`) and inside every
+join-prompt box's generated text (`join_prompts[m]`, same rendering as
+member names above -- the generator, app.onboarding's
+`generate_room_join_prompt`/`_room_session_block`, only ever builds plain
+text, so escaping happens once, at render time, same as everywhere else on
+this page). The mode label and side labels shown alongside it come from
+ROOM_MODES (app/room_modes.py), which is trusted, static, server-authored
+text -- not user input -- so no escaping concern applies there.
+
 PHASE C -- JOIN PROMPTS: `_join_prompts_by_member` generates, for each of a
 room's two members, the copy-paste prompt (app/onboarding.py's
 `generate_room_join_prompt`) that drops that agent into the room's respond-
@@ -60,19 +71,40 @@ loop -- the room-view analogue of app/routers/ui_admin.py's
 by a free-text `agent_name` string, not a minted Machine row, so there is
 no real per-member token to look up here in the first place (same
 placeholder convention, different reason than the onboarding case).
+
+ADR-0007 (PART 2 -- MODES + TIME LIMITS UI): the create-room form gains a
+mode dropdown, a topic field, and a time-limit preset (both sourced from
+app/room_modes.py's ROOM_MODES -- see `ROOM_MODES_JSON` and
+`_sides_for_mode`/`_parse_duration_seconds` below); the live view's header
+shows the mode/topic and a live countdown to `expires_at`
+(app/static/rooms.js). All of ADR-0007's actual validation (mode, topic,
+sides, deadline range) still lives entirely in app/rooms.py's create_room --
+this module only resolves the HTML form's shape into that function's plain
+keyword arguments and lets its ApiErrors render as the existing clean
+422/etc. responses on this page, same as phase A's max_messages handling
+already does. `_join_prompts_by_member` now also threads the room's
+mode/topic/side/deadline through to `generate_room_join_prompt` (previously
+dead/defaulted params flagged by a prior review) so a debate/critique room's
+join prompts carry the real stance + topic + deadline text, not just the
+generic freeform framing.
 """
 
+import json
+
 from fastapi import APIRouter, Depends, Form, Query, Request
+from markupsafe import Markup
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse, RedirectResponse
 
 from app.db import get_db
 from app.errors import ApiError
+from app.models import Room
 from app.onboarding import TOKEN_PLACEHOLDER, generate_room_join_prompt, resolve_base_url
+from app.room_modes import DEFAULT_MODE, ROOM_MODES
 from app.rooms import close_room as close_room_op
 from app.rooms import create_room as create_room_op
-from app.rooms import get_members, get_members_for_rooms, get_recent_messages, get_room
+from app.rooms import get_member_sides, get_members, get_members_for_rooms, get_recent_messages, get_room
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_message as post_message_op
@@ -86,8 +118,92 @@ INITIAL_MESSAGE_LIMIT = 50
 # Always wait=0 here -- see module docstring's "LIVENESS" section.
 SHORT_POLL_WAIT = 0
 
+# --- ADR-0007: room modes + time limits (Part 2, UI only) ---
+#
+# The create-room form's mode dropdown and its mode->sides/labels JS handler
+# (app/static/room_form.js) are both sourced from this single ROOM_MODES
+# import -- never a hardcoded, divergent list of modes in the template or JS.
+# ROOM_MODES_JSON is computed once at import time (the data is static/
+# trusted, defined entirely in app/room_modes.py -- never user input), and
+# wrapped in `Markup` so Jinja2's autoescape (HTML-entity escaping) does not
+# corrupt the JSON when it's embedded in a `<script type="application/json">`
+# block: HTML parsers treat `<script>` contents as raw text, so an
+# HTML-entity-escaped `"` (`&#34;`) would reach `JSON.parse` unescaped and
+# fail to parse. This is safe *only* because the payload is fully
+# server-controlled static data with no user-supplied substrings (e.g. no
+# room topic/agent name is ever included here). As defense-in-depth for a
+# future field that might add user-derived data to this payload, every `<`
+# is additionally escaped to `<` (a valid JSON escape -- JSON.parse
+# still parses it identically to a literal `<`) so a `</script>` sequence
+# could never prematurely close the enclosing <script> tag either way.
+_ROOM_MODES_PAYLOAD = {
+    key: {
+        "label": mode_def.label,
+        "symmetric": mode_def.symmetric,
+        # Ordered [first_side_label, second_side_label] matching
+        # RoomMode.sides's tuple order, so the JS can map agent_a/agent_b's
+        # form position to the correct side without re-deriving mode
+        # semantics -- None for symmetric modes (no sides).
+        "side_labels": [mode_def.side_labels[s] for s in mode_def.sides] if mode_def.sides else None,
+    }
+    for key, mode_def in ROOM_MODES.items()
+}
+ROOM_MODES_JSON = Markup(json.dumps(_ROOM_MODES_PAYLOAD).replace("<", "\\u003c"))
 
-def _join_prompts_by_member(request: Request, room_id: str, members: list[str]) -> dict[str, str]:
+_CUSTOM_DURATION_UNIT_SECONDS = {"minutes": 60, "hours": 3600}
+
+
+def _sides_for_mode(mode: str, agent_a: str, agent_b: str) -> dict[str, str] | None:
+    """Builds `{agent_name: side}` for asymmetric modes by assigning the
+    mode's two distinct side keys (app/room_modes.py's `ROOM_MODES[mode]
+    .sides`, e.g. ('for', 'against')) in order to agent_a/agent_b -- i.e.
+    the first form field always gets the mode's first side, matching the
+    labels app/static/room_form.js renders onto those same two fields.
+    Returns None for symmetric/freeform modes (sides ignored) and for an
+    unrecognized `mode` string (create_room's own `validate_mode` raises
+    the self-explaining error for that case; this just avoids a KeyError
+    here so that error is the one the owner sees).
+    """
+    mode_def = ROOM_MODES.get(mode)
+    if mode_def is None or mode_def.sides is None:
+        return None
+    first_side, second_side = mode_def.sides
+    return {agent_a: first_side, agent_b: second_side}
+
+
+def _parse_duration_seconds(preset: str, custom_value: str, custom_unit: str) -> int | None:
+    """Maps the create-room form's time-limit dropdown to `duration_seconds`
+    for app.rooms.create_room -- which is the sole owner of range/type
+    validation (self-explaining ApiError; ADR-0007 decision leaves
+    out-of-range customs to "the domain's _validate_deadline"). This only
+    resolves the UI's preset-or-custom selection down to a single int or
+    None; it never validates a range itself. Mirrors the existing
+    `max_messages` parsing below: an unparseable/empty custom amount maps to
+    0 (or "" -> None for a bad preset), a value guaranteed to be rejected by
+    the domain's own range check rather than silently guessed at here.
+    """
+    preset = preset.strip()
+    if not preset:
+        return None  # "No limit"
+    if preset == "custom":
+        value = custom_value.strip()
+        if not value:
+            return 0
+        try:
+            amount = int(value)
+        except ValueError:
+            return 0
+        unit_seconds = _CUSTOM_DURATION_UNIT_SECONDS.get(custom_unit, 60)
+        return amount * unit_seconds
+    try:
+        return int(preset)
+    except ValueError:
+        return 0
+
+
+def _join_prompts_by_member(
+    request: Request, room: Room, members: list[str], sides: dict[str, str | None]
+) -> dict[str, str]:
     """The generated room-join prompt (app/onboarding.py's
     `generate_room_join_prompt`) for each of the room's members, keyed by
     agent name -- always with `TOKEN_PLACEHOLDER` standing in for the token
@@ -95,15 +211,26 @@ def _join_prompts_by_member(request: Request, room_id: str, members: list[str]) 
     `create_room` enforces exactly two distinct members (app/rooms.py's
     `REQUIRED_MEMBER_COUNT`), so each member's partner is simply "the other
     one of the two" -- there is no 3+-member case to handle here.
+
+    ADR-0007: also passes the room's mode/topic/expires_at and this member's
+    own side (from `sides`, app.rooms.get_member_sides) through to
+    `generate_room_join_prompt` -- these were previously dead/defaulted
+    params (a prior review flagged this), so e.g. a debate room's join
+    prompts now actually carry the For/Against stance text, the topic, and
+    the deadline line, not just the generic freeform framing.
     """
     base_url = resolve_base_url(request)
     return {
         agent_name: generate_room_join_prompt(
             base_url=base_url,
-            room_id=room_id,
+            room_id=room.id,
             agent_name=agent_name,
             partner_name=next(other for other in members if other != agent_name),
             token=TOKEN_PLACEHOLDER,
+            mode=room.mode,
+            topic=room.topic,
+            side=sides.get(agent_name),
+            deadline=room.expires_at,
         )
         for agent_name in members
     }
@@ -118,14 +245,19 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
     if room is None:
         return None
     members = await get_members(db, room_id)
+    sides = await get_member_sides(db, room_id)
     messages = await get_recent_messages(db, room_id, limit=INITIAL_MESSAGE_LIMIT)
     last_seq = messages[-1].seq if messages else 0
+    mode_def = ROOM_MODES[room.mode]
     return {
         "room": room,
         "members": members,
+        "sides": sides,
+        "mode_label": mode_def.label,
+        "side_labels": mode_def.side_labels,
         "messages": messages,
         "last_seq": last_seq,
-        "join_prompts": _join_prompts_by_member(request, room_id, members),
+        "join_prompts": _join_prompts_by_member(request, room, members, sides),
     }
 
 
@@ -151,6 +283,8 @@ async def rooms_list(
             "next_cursor": next_cursor,
             "error": None,
             "form": {},
+            "room_modes": ROOM_MODES,
+            "room_modes_json": ROOM_MODES_JSON,
         },
     )
 
@@ -172,6 +306,24 @@ async def rooms_create(
     # is rendered checked+disabled in the template rather than pretending
     # unchecking it would do something it can't.
     notify_on_close: str = Form(default=""),
+    # --- ADR-0007: room modes and time limits ---
+    # `mode`/`topic` and the time-limit preset drive app.rooms.create_room's
+    # own mode/topic/sides/duration_seconds validation (self-explaining
+    # ApiErrors) -- nothing about mode/topic/side/duration validity is
+    # re-checked here beyond what's needed to resolve the form's shape into
+    # that function's plain parameters. `side_a`/`side_b` are NOT read from
+    # the form: app/static/room_form.js only ever changes the two agent
+    # fields' *labels* client-side, never submits separate side values, so
+    # the sides mapping is derived server-side in `_sides_for_mode` from the
+    # mode alone (agent_a always gets the mode's first side, agent_b the
+    # second -- the same order the JS labels them in), which also means a
+    # JS-disabled submission still produces a correct, non-spoofable sides
+    # assignment.
+    mode: str = Form(default=DEFAULT_MODE),
+    topic: str = Form(default=""),
+    duration_preset: str = Form(default=""),
+    custom_duration_value: str = Form(default=""),
+    custom_duration_unit: str = Form(default="minutes"),
     session: dict = Depends(require_ui_session),
     _csrf: None = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
@@ -187,8 +339,21 @@ async def rooms_create(
             # than duplicating that validation here.
             parsed_max = 0
 
+    cleaned_topic = topic.strip() or None
+    sides = _sides_for_mode(mode, agent_a, agent_b)
+    duration_seconds = _parse_duration_seconds(duration_preset, custom_duration_value, custom_duration_unit)
+
     try:
-        room = await create_room_op(db, name, [agent_a, agent_b], parsed_max)
+        room = await create_room_op(
+            db,
+            name,
+            [agent_a, agent_b],
+            parsed_max,
+            mode=mode,
+            topic=cleaned_topic,
+            sides=sides,
+            duration_seconds=duration_seconds,
+        )
     except ApiError as exc:
         rows, next_cursor = await list_rooms_op(db, limit=ROOM_LIST_LIMIT)
         members_by_room = await get_members_for_rooms(db, [r.id for r in rows])
@@ -201,7 +366,19 @@ async def rooms_create(
                 "members_by_room": members_by_room,
                 "next_cursor": next_cursor,
                 "error": exc.detail,
-                "form": {"name": name, "agent_a": agent_a, "agent_b": agent_b, "max_messages": max_messages},
+                "form": {
+                    "name": name,
+                    "agent_a": agent_a,
+                    "agent_b": agent_b,
+                    "max_messages": max_messages,
+                    "mode": mode,
+                    "topic": topic,
+                    "duration_preset": duration_preset,
+                    "custom_duration_value": custom_duration_value,
+                    "custom_duration_unit": custom_duration_unit,
+                },
+                "room_modes": ROOM_MODES,
+                "room_modes_json": ROOM_MODES_JSON,
             },
             status_code=exc.status_code,
         )

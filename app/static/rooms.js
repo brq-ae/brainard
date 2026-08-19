@@ -27,6 +27,11 @@
   var roomId = config.dataset.roomId;
   var lastSeq = parseInt(config.dataset.lastSeq, 10) || 0;
   var initialStatus = config.dataset.status;
+  // ADR-0007: optional deadline. Empty string (no data-expires-at value, or
+  // the attribute absent) means the room has no time limit -- expiresAt
+  // stays null and the countdown block below is a no-op.
+  var expiresAtRaw = config.dataset.expiresAt;
+  var expiresAt = expiresAtRaw ? new Date(expiresAtRaw) : null;
 
   var list = document.getElementById("room-messages");
   var emptyNotice = document.getElementById("room-messages-empty");
@@ -36,6 +41,52 @@
   var closeReasonEl = document.getElementById("room-close-reason");
   var postPanel = document.getElementById("room-post-panel");
   var stopPanel = document.getElementById("room-stop-panel");
+  var countdownEl = document.getElementById("room-countdown");
+  var countdownTimer = null;
+
+  // ADR-0007: a live-ticking "closes in Hh Mm Ss" display, purely a display
+  // aid -- it never closes the room itself. The real close (and the real
+  // close_reason, which may be 'time' from the background sweeper, or
+  // 'done'/'cap'/'owner' if something else closes the room first) is always
+  // driven by the short-poll below, same as before this feature. Once the
+  // countdown reaches zero it just says so and stops ticking; it does not
+  // synthesize a close_reason it doesn't actually have yet.
+  function formatCountdown(remainingMs) {
+    var totalSeconds = Math.max(0, Math.floor(remainingMs / 1000));
+    var hours = Math.floor(totalSeconds / 3600);
+    var minutes = Math.floor((totalSeconds % 3600) / 60);
+    var seconds = totalSeconds % 60;
+    return hours + "h " + minutes + "m " + seconds + "s";
+  }
+
+  function tickCountdown() {
+    if (!countdownEl || !expiresAt) return;
+    var remaining = expiresAt.getTime() - Date.now();
+    if (remaining <= 0) {
+      countdownEl.textContent = "closing…";
+      if (countdownTimer) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }
+      return;
+    }
+    countdownEl.textContent = formatCountdown(remaining);
+  }
+
+  function stopCountdown(finalText) {
+    if (countdownTimer) {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    }
+    if (countdownEl) {
+      countdownEl.textContent = finalText;
+    }
+  }
+
+  if (countdownEl && expiresAt) {
+    tickCountdown();
+    countdownTimer = setInterval(tickCountdown, 1000);
+  }
 
   // Appends one message row. Built entirely with createElement/textContent
   // -- see file header. `m.sender`/`m.text` are never passed to innerHTML.
@@ -80,6 +131,7 @@
     }
     if (postPanel) postPanel.style.display = "none";
     if (stopPanel) stopPanel.style.display = "none";
+    stopCountdown("closed");
   }
 
   function poll() {

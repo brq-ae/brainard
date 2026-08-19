@@ -7,10 +7,15 @@
   <span class="badge {{ 'active' if room.status == 'open' else 'inactive' }}" id="room-status-badge">{{ room.status }}</span>
 </div>
 <p class="subtitle">
-  {{ members|join(' ↔ ') }}
+  {% for m in members %}{{ m }}{% if sides.get(m) %} ({{ side_labels[sides[m]] }}){% endif %}{% if not loop.last %} ↔ {% endif %}{% endfor %}
   <span class="sep">·</span>
   <span id="room-count">{{ room.message_count }}</span>/{{ room.max_messages }} messages
+  <span class="sep">·</span>
+  {{ mode_label }}{% if room.topic %}: {{ room.topic }}{% endif %}
 </p>
+{% if room.expires_at %}
+<p class="meta" id="room-countdown-wrap">Closes in <span id="room-countdown">…</span></p>
+{% endif %}
 
 {% if error %}
 <div class="notice danger">{{ error }}</div>
@@ -22,9 +27,12 @@
 
 <!-- Config for app/static/rooms.js, read via data-* attributes only -- no
      inline script, no server-generated JS literals. room.id is a
-     server-generated ULID and room.status is one of two fixed strings, so
-     neither needs any special escaping beyond Jinja2's normal autoescape. -->
-<div id="room-config" data-room-id="{{ room.id }}" data-last-seq="{{ last_seq }}" data-status="{{ room.status }}"></div>
+     server-generated ULID, room.status is one of two fixed strings, and
+     expires_at (when set) is an ISO-8601 timestamp -- none of these need any
+     special escaping beyond Jinja2's normal autoescape, and none of them are
+     ever user-supplied text (unlike the topic/message content elsewhere on
+     this page). -->
+<div id="room-config" data-room-id="{{ room.id }}" data-last-seq="{{ last_seq }}" data-status="{{ room.status }}" data-expires-at="{{ room.expires_at.isoformat() if room.expires_at else '' }}"></div>
 
 <div class="panel">
   <h2>Transcript</h2>

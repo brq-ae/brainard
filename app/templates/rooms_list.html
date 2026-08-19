@@ -16,19 +16,59 @@
       <label for="name">Name</label>
       <input type="text" id="name" name="name" value="{{ form.name or '' }}" required>
     </div>
+    <div class="field">
+      <label for="mode">Mode</label>
+      <select id="mode" name="mode">
+        {% for key, m in room_modes.items() %}
+        <option value="{{ key }}" {% if (form.mode or 'freeform') == key %}selected{% endif %}>{{ m.label }}</option>
+        {% endfor %}
+      </select>
+      <p class="meta">Shapes each agent's join prompt (ADR-0007). Freeform has no special stance text.</p>
+    </div>
+    <div class="field">
+      <label for="topic" id="topic-label">Topic</label>
+      <input type="text" id="topic" name="topic" value="{{ form.topic or '' }}" placeholder="Required for non-freeform modes">
+    </div>
     <div class="grid cols-2">
       <div class="field">
-        <label for="agent_a">Agent 1 (name)</label>
+        <label for="agent_a" id="agent_a_label">Agent 1 (name)</label>
         <input type="text" id="agent_a" name="agent_a" value="{{ form.agent_a or '' }}" required>
       </div>
       <div class="field">
-        <label for="agent_b">Agent 2 (name)</label>
+        <label for="agent_b" id="agent_b_label">Agent 2 (name)</label>
         <input type="text" id="agent_b" name="agent_b" value="{{ form.agent_b or '' }}" required>
       </div>
     </div>
     <div class="field">
       <label for="max_messages">Max messages</label>
       <input type="text" id="max_messages" name="max_messages" class="mono" value="{{ form.max_messages or '' }}" placeholder="100">
+    </div>
+    <div class="field">
+      <label for="duration_preset">Time limit</label>
+      <select id="duration_preset" name="duration_preset">
+        <option value="" {% if not form.duration_preset %}selected{% endif %}>No limit</option>
+        <option value="900" {% if form.duration_preset == '900' %}selected{% endif %}>15 minutes</option>
+        <option value="1800" {% if form.duration_preset == '1800' %}selected{% endif %}>30 minutes</option>
+        <option value="3600" {% if form.duration_preset == '3600' %}selected{% endif %}>1 hour</option>
+        <option value="7200" {% if form.duration_preset == '7200' %}selected{% endif %}>2 hours</option>
+        <option value="14400" {% if form.duration_preset == '14400' %}selected{% endif %}>4 hours</option>
+        <option value="28800" {% if form.duration_preset == '28800' %}selected{% endif %}>8 hours</option>
+        <option value="86400" {% if form.duration_preset == '86400' %}selected{% endif %}>24 hours</option>
+        <option value="custom" {% if form.duration_preset == 'custom' %}selected{% endif %}>Custom…</option>
+      </select>
+    </div>
+    <div class="grid cols-2" id="custom-duration-fields" style="display:none">
+      <div class="field">
+        <label for="custom_duration_value">Custom duration</label>
+        <input type="number" id="custom_duration_value" name="custom_duration_value" min="1" value="{{ form.custom_duration_value or '' }}">
+      </div>
+      <div class="field">
+        <label for="custom_duration_unit">Unit</label>
+        <select id="custom_duration_unit" name="custom_duration_unit">
+          <option value="minutes" {% if (form.custom_duration_unit or 'minutes') == 'minutes' %}selected{% endif %}>Minutes</option>
+          <option value="hours" {% if form.custom_duration_unit == 'hours' %}selected{% endif %}>Hours</option>
+        </select>
+      </div>
     </div>
     <div class="field">
       <label><input type="checkbox" checked disabled> Notify owner on close</label>
@@ -38,6 +78,15 @@
     <button type="submit" class="btn primary">Create room</button>
   </form>
 </div>
+
+<!-- Data for app/static/room_form.js's mode->sides/labels handler --
+     sourced entirely from app/room_modes.py's ROOM_MODES (server-trusted,
+     static; never user input) and pre-serialized as JSON in
+     app/routers/ui_rooms.py. A <script type="application/json"> block, not
+     a data-* attribute, since this is structured mode data, not a single
+     scalar -- read via JSON.parse(textContent), never executed. -->
+<script type="application/json" id="room-modes-data">{{ room_modes_json }}</script>
+<script src="/static/room_form.js"></script>
 
 <div class="panel">
   <h2>Rooms</h2>

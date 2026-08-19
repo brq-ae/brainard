@@ -6,6 +6,7 @@ for the API-side equivalent.
 """
 
 import re
+from datetime import UTC, datetime, timedelta
 
 from ulid import ULID
 
@@ -67,10 +68,35 @@ async def _machine_headers(db_session, name: str = "test-machine") -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _create_room_via_api(client, owner_headers, *, name="room-1", members=None, max_messages=None) -> dict:
+async def _create_room_via_api(
+    client,
+    owner_headers,
+    *,
+    name="room-1",
+    members=None,
+    max_messages=None,
+    mode=None,
+    topic=None,
+    sides=None,
+    duration_seconds=None,
+) -> dict:
+    """Room setup via the phase-A /v1/rooms API -- used by UI tests that need
+    a room already in a particular mode/topic/sides/deadline state to then
+    exercise the *view* (room_view.html) independently of the create-*form*
+    path (which has its own dedicated tests below, under "create room form:
+    modes + sides + time limits").
+    """
     body: dict = {"name": name, "members": members if members is not None else ["agent-a", "agent-b"]}
     if max_messages is not None:
         body["max_messages"] = max_messages
+    if mode is not None:
+        body["mode"] = mode
+    if topic is not None:
+        body["topic"] = topic
+    if sides is not None:
+        body["sides"] = sides
+    if duration_seconds is not None:
+        body["duration_seconds"] = duration_seconds
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == 201, resp.json()
     return resp.json()
@@ -196,6 +222,254 @@ async def test_create_room_form_without_csrf_rejected(client, db_session):
     assert len(rows) == 0
 
 
+# --- create room form: modes, sides, time limits (ADR-0007, Part 2 UI) ---
+
+
+async def test_create_room_form_freeform_default_mode_and_topic(client, db_session):
+    """Freeform is the default and works with no topic at all -- unchanged
+    from phase A behavior, just asserted explicitly against the new mode
+    field this time.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={"name": "freeform-room", "agent_a": "a1", "agent_b": "a2", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+    room = await db_session.get(Room, room_id)
+    assert room.mode == "freeform"
+    assert room.topic is None
+
+
+async def test_create_room_form_debate_mode_sets_topic_and_sides(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "debate-room",
+            "agent_a": "alice",
+            "agent_b": "bob",
+            "mode": "debate",
+            "topic": "Cats are better than dogs",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.mode == "debate"
+    assert room.topic == "Cats are better than dogs"
+
+    # The form's two agent-name fields are labeled by side, in order, by
+    # app/static/room_form.js -- the server independently assigns the
+    # mode's two distinct sides in that same order (app/routers/ui_rooms.py's
+    # `_sides_for_mode`), agent_a first: 'for' to alice, 'against' to bob.
+    detail = await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)
+    assert detail.status_code == 200
+    assert detail.json()["sides"] == {"alice": "for", "bob": "against"}
+
+
+async def test_create_room_form_critique_mode_sets_topic_and_sides(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "critique-room",
+            "agent_a": "alice",
+            "agent_b": "bob",
+            "mode": "critique",
+            "topic": "A new caching layer design",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.mode == "critique"
+    assert room.topic == "A new caching layer design"
+
+    detail = await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)
+    assert detail.status_code == 200
+    assert detail.json()["sides"] == {"alice": "proposer", "bob": "critic"}
+
+
+async def test_create_room_form_collaborate_mode_is_symmetric_no_sides(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "collaborate-room",
+            "agent_a": "alice",
+            "agent_b": "bob",
+            "mode": "collaborate",
+            "topic": "Draft the release notes",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.mode == "collaborate"
+
+    detail = await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)
+    assert detail.json()["sides"] == {"alice": None, "bob": None}
+
+
+async def test_create_room_form_brainstorm_mode_is_symmetric_no_sides(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "brainstorm-room",
+            "agent_a": "alice",
+            "agent_b": "bob",
+            "mode": "brainstorm",
+            "topic": "Names for the new feature",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.mode == "brainstorm"
+
+    detail = await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)
+    assert detail.json()["sides"] == {"alice": None, "bob": None}
+
+
+async def test_create_room_form_non_freeform_blank_topic_shows_clean_error(client, db_session):
+    """Non-freeform modes require a topic (enforced by app.rooms._validate_topic).
+    Submitting one blank must render the domain's self-explaining error
+    cleanly on the rooms-list page, never a 500.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "debate-no-topic",
+            "agent_a": "a1",
+            "agent_b": "a2",
+            "mode": "debate",
+            "topic": "",
+            "csrf_token": csrf,
+        },
+    )
+    assert resp.status_code == 422
+    assert "topic" in resp.text.lower()
+    assert "New room" in resp.text  # the form itself is still rendered, not a bare error page
+
+    rows = (await db_session.execute(Room.__table__.select())).all()
+    assert len(rows) == 0
+
+
+async def test_create_room_form_time_preset_maps_to_duration_seconds(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    before = datetime.now(UTC)
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "timed-room",
+            "agent_a": "a1",
+            "agent_b": "a2",
+            "duration_preset": "3600",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    after = datetime.now(UTC)
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.expires_at is not None
+    expires_at = room.expires_at if room.expires_at.tzinfo else room.expires_at.replace(tzinfo=UTC)
+    assert before + timedelta(seconds=3600) <= expires_at <= after + timedelta(seconds=3600)
+
+
+async def test_create_room_form_custom_time_limit_maps_to_duration_seconds(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    before = datetime.now(UTC)
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "custom-timed-room",
+            "agent_a": "a1",
+            "agent_b": "a2",
+            "duration_preset": "custom",
+            "custom_duration_value": "2",
+            "custom_duration_unit": "hours",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    after = datetime.now(UTC)
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.expires_at is not None
+    expires_at = room.expires_at if room.expires_at.tzinfo else room.expires_at.replace(tzinfo=UTC)
+    # 2 hours = 7200 seconds
+    assert before + timedelta(seconds=7200) <= expires_at <= after + timedelta(seconds=7200)
+
+
+async def test_create_room_form_no_limit_leaves_expires_at_null(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "no-limit-room",
+            "agent_a": "a1",
+            "agent_b": "a2",
+            "duration_preset": "",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.expires_at is None
+
+
 # --- room live view ---
 
 
@@ -230,6 +504,77 @@ async def test_room_view_missing_room_404s(client, db_session):
     await _login(client, db_session)
     resp = await client.get("/ui/rooms/nonexistent-id")
     assert resp.status_code == 404
+
+
+# --- room live view: mode/topic header + countdown (ADR-0007, Part 2 UI) ---
+
+
+async def test_room_view_header_shows_mode_and_topic(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(
+        client,
+        owner_headers,
+        name="debate-header",
+        members=["agent-a", "agent-b"],
+        mode="debate",
+        topic="Tabs vs spaces",
+        sides={"agent-a": "for", "agent-b": "against"},
+    )
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Debate" in resp.text
+    assert "Tabs vs spaces" in resp.text
+    assert "(For)" in resp.text
+    assert "(Against)" in resp.text
+
+
+async def test_room_view_header_shows_freeform_mode_label(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="freeform-header")
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Freeform" in resp.text
+
+
+async def test_room_view_countdown_present_when_deadline_set(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="deadline-room", duration_seconds=1800)
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert 'id="room-countdown"' in resp.text
+    assert 'data-expires-at="' in resp.text
+    assert 'data-expires-at=""' not in resp.text
+
+
+async def test_room_view_countdown_absent_when_no_deadline(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="no-deadline-room")
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert 'id="room-countdown"' not in resp.text
+    assert 'data-expires-at=""' in resp.text
+
+
+async def test_room_view_closed_room_shows_time_close_reason(client, db_session):
+    """The sweeper (app/room_sweeper.py, out of scope for this UI part) uses
+    the same app.rooms.close_room path exercised here directly via the v1
+    API's close endpoint (which accepts 'time' as a valid reason) -- the
+    live view's existing generic close_reason rendering must show it
+    (ADR-0007: "Closed/expired rooms show the close_reason (incl. 'time')").
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="time-closed-room", duration_seconds=1800)
+    close_resp = await client.post(f"/v1/rooms/{room['id']}/close", json={"reason": "time"}, headers=owner_headers)
+    assert close_resp.status_code == 200
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Room closed" in resp.text
+    assert "time" in resp.text.lower()
 
 
 # --- JSON short-poll endpoint ---
@@ -488,6 +833,76 @@ async def test_room_join_prompt_xss_member_name_escaped(client, db_session):
         assert resp.status_code == 200
         assert payload not in resp.text
         assert str(markupsafe_escape(payload)) in resp.text
+
+
+# --- ADR-0007: mode/topic/side/deadline now flow into join prompts too ---
+
+
+async def test_room_join_prompt_debate_contains_stance_topic_and_deadline(client, db_session):
+    """Fixes the previously-dead mode/topic/side/deadline params flagged by
+    a prior review: a debate room's join prompts must actually contain the
+    For/Against stance text (app/room_modes.py's `_debate_role_text`), the
+    topic, the closing-statement instruction, and a deadline line -- not
+    just the generic freeform framing.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(
+        client,
+        owner_headers,
+        name="debate-prompt-room",
+        members=["alice", "bob"],
+        mode="debate",
+        topic="Cats vs dogs",
+        sides={"alice": "for", "bob": "against"},
+        duration_seconds=1800,
+    )
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "This is a Debate session." in resp.text
+    assert "You argue FOR the proposition: Cats vs dogs" in resp.text
+    assert "You argue AGAINST the proposition: Cats vs dogs" in resp.text
+    assert "closing statement" in resp.text.lower()
+    assert "Deadline: the room closes at" in resp.text
+
+
+async def test_room_view_topic_xss_escaped_in_header_and_join_prompts(client, db_session):
+    """A room topic is owner-supplied but untrusted content (ADR-0007) that
+    now renders in two places: the live-view header and inside every
+    join-prompt box's generated role text. Both must render it escaped --
+    the raw, executable form must never appear anywhere on the page.
+    """
+    from markupsafe import escape as markupsafe_escape
+
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(
+        client,
+        owner_headers,
+        name="xss-topic-room",
+        members=["agent-a", "agent-b"],
+        mode="debate",
+        topic=XSS_SCRIPT,
+        sides={"agent-a": "for", "agent-b": "against"},
+    )
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert XSS_SCRIPT not in resp.text
+
+    escaped = str(markupsafe_escape(XSS_SCRIPT))
+    assert escaped in resp.text
+
+    # Split the page at the "Join prompts" section so the header portion and
+    # the join-prompt-boxes portion are each checked independently.
+    marker = "Join prompts"
+    assert marker in resp.text
+    header_part, join_part = resp.text.split(marker, 1)
+
+    assert XSS_SCRIPT not in header_part
+    assert escaped in header_part  # topic shown in the header, escaped
+
+    assert XSS_SCRIPT not in join_part
+    assert escaped in join_part  # topic shown inside the join-prompt boxes' role text, escaped
 
 
 def test_rooms_js_renders_via_textcontent_not_innerhtml():
