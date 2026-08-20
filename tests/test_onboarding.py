@@ -5,6 +5,7 @@ ADR-0006 phase C sibling `generate_room_join_prompt`) are pure.
 
 from datetime import UTC, datetime
 
+from app.config import get_settings
 from app.onboarding import (
     PROJECT_PLACEHOLDER,
     TOKEN_PLACEHOLDER,
@@ -101,6 +102,32 @@ def test_prompt_scheme_note_omitted_for_unrecognized_scheme():
     assert "plain HTTP" not in text
     # the header rationale still stands on its own, without a scheme claim
     assert "won't work). The response" in text
+
+
+def test_prompt_omits_dns_failsafe_when_fallback_url_unset(monkeypatch):
+    monkeypatch.setattr(get_settings(), "hub_fallback_url", None)
+    text = _prompt()
+    assert "DNS failsafe" not in text
+
+
+def test_prompt_includes_dns_failsafe_when_fallback_url_set(monkeypatch):
+    monkeypatch.setattr(get_settings(), "hub_fallback_url", "http://192.0.2.10:8300")
+    text = _prompt()
+    assert text.endswith(
+        "\n\nDNS failsafe: if you can't resolve or reach the host in the URL above from this machine "
+        "(for example its DNS is a public resolver like 8.8.8.8 that can't see the intranet name), use "
+        "this direct LAN address as the base URL instead -- same paths and header, plain HTTP, no DNS or "
+        "reverse proxy involved: http://192.0.2.10:8300 . Swap only the scheme+host+port; keep the "
+        "/v1/... path and your token."
+    )
+
+
+def test_prompt_dns_failsafe_leaves_rest_of_prompt_unchanged(monkeypatch):
+    baseline = _prompt()
+    monkeypatch.setattr(get_settings(), "hub_fallback_url", "http://192.0.2.10:8300")
+    with_failsafe = _prompt()
+    assert with_failsafe.startswith(baseline)
+    assert with_failsafe != baseline
 
 
 # --- generate_room_join_prompt (ADR-0006, phase C) ---
@@ -274,3 +301,32 @@ def test_room_join_prompt_freeform_ignores_topic_and_deadline():
     text = _join_prompt(mode="freeform", topic="irrelevant", deadline=datetime(2026, 9, 1, tzinfo=UTC))
     assert "This is a" not in text
     assert "the room closes at" not in text
+
+
+# --- generate_room_join_prompt DNS failsafe (HUB_FALLBACK_URL) ---
+
+
+def test_room_join_prompt_omits_dns_failsafe_when_fallback_url_unset(monkeypatch):
+    monkeypatch.setattr(get_settings(), "hub_fallback_url", None)
+    text = _join_prompt()
+    assert "DNS failsafe" not in text
+
+
+def test_room_join_prompt_includes_dns_failsafe_when_fallback_url_set(monkeypatch):
+    monkeypatch.setattr(get_settings(), "hub_fallback_url", "http://192.0.2.10:8300")
+    text = _join_prompt()
+    assert text.endswith(
+        "\n\nDNS failsafe: if you can't resolve or reach the host in the URL above from this machine "
+        "(for example its DNS is a public resolver like 8.8.8.8 that can't see the intranet name), use "
+        "this direct LAN address as the base URL instead -- same paths and header, plain HTTP, no DNS or "
+        "reverse proxy involved: http://192.0.2.10:8300 . Swap only the scheme+host+port; keep the "
+        "/v1/... path and your token."
+    )
+
+
+def test_room_join_prompt_dns_failsafe_leaves_rest_of_prompt_unchanged(monkeypatch):
+    baseline = _join_prompt()
+    monkeypatch.setattr(get_settings(), "hub_fallback_url", "http://192.0.2.10:8300")
+    with_failsafe = _join_prompt()
+    assert with_failsafe.startswith(baseline)
+    assert with_failsafe != baseline

@@ -51,6 +51,35 @@ def resolve_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+def resolve_fallback_url() -> str | None:
+    """The optional DNS-failsafe base URL (`HUB_FALLBACK_URL`) to append to
+    generated prompts -- the hub's direct LAN address, plain HTTP, no
+    reverse proxy or DNS involved. Read fresh from settings, same precedent
+    as `resolve_base_url` above. Returns None when unset, in which case
+    generated prompts carry no failsafe line at all (unchanged behavior).
+    """
+    settings = get_settings()
+    return settings.hub_fallback_url or None
+
+
+def _dns_failsafe_line(fallback_url: str) -> str:
+    """The single-sourced DNS-failsafe paragraph both prompt generators
+    append when `HUB_FALLBACK_URL` is configured (see `resolve_fallback_url`
+    above) -- points a fetching agent at the hub's direct LAN address when
+    the primary hostname in the prompt can't be resolved from that machine
+    (e.g. its DNS is a public resolver like 8.8.8.8 that can't see an
+    intranet name). `fallback_url` is always the trusted config value, never
+    user-supplied input.
+    """
+    return (
+        "\n\nDNS failsafe: if you can't resolve or reach the host in the URL above from this machine "
+        "(for example its DNS is a public resolver like 8.8.8.8 that can't see the intranet name), use "
+        "this direct LAN address as the base URL instead -- same paths and header, plain HTTP, no DNS or "
+        f"reverse proxy involved: {fallback_url} . Swap only the scheme+host+port; keep the /v1/... path "
+        "and your token."
+    )
+
+
 def generate_onboarding_prompt(
     *,
     base_url: str,
@@ -104,7 +133,11 @@ def generate_onboarding_prompt(
         "notify-me isn't installed on this machine yet, install it per the hub's howto."
     )
 
-    return "\n\n".join(paragraphs)
+    text = "\n\n".join(paragraphs)
+    fallback_url = resolve_fallback_url()
+    if fallback_url:
+        text += _dns_failsafe_line(fallback_url)
+    return text
 
 
 def _room_session_block(
@@ -223,4 +256,8 @@ def generate_room_join_prompt(
         paragraphs.append(session_block)
     paragraphs.extend([how_to, keep_me_informed])
 
-    return "\n\n".join(paragraphs)
+    text = "\n\n".join(paragraphs)
+    fallback_url = resolve_fallback_url()
+    if fallback_url:
+        text += _dns_failsafe_line(fallback_url)
+    return text

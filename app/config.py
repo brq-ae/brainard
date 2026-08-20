@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     # precedent as the pre-existing paste-line.
     hub_public_url: str | None = None
 
+    # Optional DNS failsafe appended to generated prompts (app/onboarding.py)
+    # -- the hub's direct LAN address (plain http, no reverse proxy, no DNS
+    # involved), for agent machines whose DNS is a public resolver (e.g.
+    # 8.8.8.8) that can't resolve an intranet hostname like the one
+    # HUB_PUBLIC_URL (or the request's own base URL) might point at. Unset
+    # (default): generated prompts carry no failsafe line, unchanged from
+    # before this setting existed.
+    hub_fallback_url: str | None = None
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
