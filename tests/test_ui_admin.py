@@ -217,7 +217,12 @@ async def test_ui_patch_role_via_csrf_form_works(client, db_session):
 
     resp = await client.post(
         f"/ui/admin/machines/{machine_id}/update",
-        data={"role": "builder", "default_project": "updated-project", "csrf_token": csrf},
+        data={
+            "name": "to-be-updated",
+            "role": "builder",
+            "default_project": "updated-project",
+            "csrf_token": csrf,
+        },
         follow_redirects=False,
     )
     assert resp.status_code == 303
@@ -241,7 +246,9 @@ async def test_ui_patch_role_requires_csrf(client, db_session):
     mint_resp = await client.post("/ui/admin/machines", data={"name": "csrf-protected", "csrf_token": csrf})
     machine = (await db_session.execute(Machine.__table__.select().where(Machine.name == "csrf-protected"))).first()
 
-    resp = await client.post(f"/ui/admin/machines/{machine.id}/update", data={"role": "builder"})
+    resp = await client.post(
+        f"/ui/admin/machines/{machine.id}/update", data={"name": "csrf-protected", "role": "builder"}
+    )
     assert resp.status_code == 403
 
 
@@ -251,9 +258,103 @@ async def test_ui_patch_unknown_machine_404(client, db_session):
     csrf = _extract_csrf(page.text)
 
     resp = await client.post(
-        "/ui/admin/machines/01UNKNOWNIDXXXXXXXXXXXXXX/update", data={"role": "builder", "csrf_token": csrf}
+        "/ui/admin/machines/01UNKNOWNIDXXXXXXXXXXXXXX/update",
+        data={"name": "whatever", "role": "builder", "csrf_token": csrf},
     )
     assert resp.status_code == 404
+
+
+# --- rename (feature: change a machine's name via the admin update form) ---
+
+
+async def test_ui_rename_machine_via_update_form_persists(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    mint_resp = await client.post("/ui/admin/machines", data={"name": "rename-me", "csrf_token": csrf})
+    assert mint_resp.status_code == 201
+    machine = (await db_session.execute(Machine.__table__.select().where(Machine.name == "rename-me"))).first()
+    machine_id = machine.id
+
+    resp = await client.post(
+        f"/ui/admin/machines/{machine_id}/update",
+        data={
+            "name": "renamed-machine",
+            "role": machine.role,
+            "default_project": "",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/admin/machines"
+
+    from app.models import Machine as MachineModel
+
+    refreshed = await db_session.get(MachineModel, machine_id)
+    assert refreshed.name == "renamed-machine"
+
+    listing = await client.get("/ui/admin/machines")
+    assert "renamed-machine" in listing.text
+    assert "rename-me" not in listing.text
+
+
+async def test_ui_rename_machine_blank_name_rejected(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    mint_resp = await client.post("/ui/admin/machines", data={"name": "blank-rename-box", "csrf_token": csrf})
+    assert mint_resp.status_code == 201
+    machine = (
+        await db_session.execute(Machine.__table__.select().where(Machine.name == "blank-rename-box"))
+    ).first()
+
+    resp = await client.post(
+        f"/ui/admin/machines/{machine.id}/update",
+        data={"name": "   ", "role": "solo", "default_project": "", "csrf_token": csrf},
+    )
+    assert resp.status_code == 422
+
+    from app.models import Machine as MachineModel
+
+    refreshed = await db_session.get(MachineModel, machine.id)
+    assert refreshed.name == "blank-rename-box"  # unchanged
+
+
+async def test_ui_rename_machine_xss_probe_escaped_in_list(client, db_session):
+    """A machine renamed to a value containing `<script>` must render
+    escaped in the admin list -- same autoescape guarantee as the mint-time
+    XSS probe above (test_ui_mint_xss_probe_on_name_and_project_fields),
+    now exercised through the rename path.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    mint_resp = await client.post("/ui/admin/machines", data={"name": "xss-rename-box", "csrf_token": csrf})
+    assert mint_resp.status_code == 201
+    machine = (
+        await db_session.execute(Machine.__table__.select().where(Machine.name == "xss-rename-box"))
+    ).first()
+
+    evil_name = "<script>alert('renamed')</script>"
+    resp = await client.post(
+        f"/ui/admin/machines/{machine.id}/update",
+        data={"name": evil_name, "role": "solo", "default_project": "", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    listing = await client.get("/ui/admin/machines")
+    assert "<script>alert('renamed')</script>" not in listing.text
+    assert "&lt;script&gt;alert(&#39;renamed&#39;)&lt;/script&gt;" in listing.text or "&lt;script&gt;" in listing.text
+
+    from app.models import Machine as MachineModel
+
+    refreshed = await db_session.get(MachineModel, machine.id)
+    assert refreshed.name == evil_name  # stored raw -- only rendering is escaped
 
 
 async def test_ui_machine_token_cannot_reach_admin_machines(client, db_session):

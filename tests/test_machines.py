@@ -185,9 +185,76 @@ async def test_patch_machine_rejects_bad_role(client, db_session):
 async def test_patch_machine_rejects_unknown_field(client, db_session):
     headers = await _owner_headers(db_session)
     minted = (await client.post("/v1/machines", json={"name": "patch-unknown-field-box"}, headers=headers)).json()
-    resp = await client.patch(f"/v1/machines/{minted['id']}", json={"name": "renamed"}, headers=headers)
+    resp = await client.patch(f"/v1/machines/{minted['id']}", json={"nickname": "renamed"}, headers=headers)
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "invalid_machine_update"
+
+
+# --- rename (feature: change a machine's name via PATCH) ---
+
+
+async def test_patch_machine_renames_and_returns_updated_name(client, db_session):
+    headers = await _owner_headers(db_session)
+    minted = (await client.post("/v1/machines", json={"name": "old-name-box"}, headers=headers)).json()
+
+    resp = await client.patch(f"/v1/machines/{minted['id']}", json={"name": "new-name-box"}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "new-name-box"
+
+    # persists -- reflected on GET /v1/machines
+    listed = (await client.get("/v1/machines", headers=headers)).json()
+    entry = next(m for m in listed if m["id"] == minted["id"])
+    assert entry["name"] == "new-name-box"
+
+
+async def test_patch_machine_rename_alongside_role_and_default_project(client, db_session):
+    headers = await _owner_headers(db_session)
+    minted = (await client.post("/v1/machines", json={"name": "combo-box"}, headers=headers)).json()
+
+    resp = await client.patch(
+        f"/v1/machines/{minted['id']}",
+        json={"name": "combo-box-renamed", "role": "builder", "default_project": "combo-project"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "combo-box-renamed"
+    assert body["role"] == "builder"
+    assert body["default_project"] == "combo-project"
+
+
+async def test_patch_machine_rejects_blank_name(client, db_session):
+    headers = await _owner_headers(db_session)
+    minted = (await client.post("/v1/machines", json={"name": "blank-name-box"}, headers=headers)).json()
+    resp = await client.patch(f"/v1/machines/{minted['id']}", json={"name": ""}, headers=headers)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_name"
+
+
+async def test_patch_machine_rejects_whitespace_only_name(client, db_session):
+    headers = await _owner_headers(db_session)
+    minted = (await client.post("/v1/machines", json={"name": "whitespace-name-box"}, headers=headers)).json()
+    resp = await client.patch(f"/v1/machines/{minted['id']}", json={"name": "   "}, headers=headers)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_name"
+
+
+async def test_patch_machine_rejects_overlong_name(client, db_session):
+    headers = await _owner_headers(db_session)
+    minted = (await client.post("/v1/machines", json={"name": "long-name-box"}, headers=headers)).json()
+    resp = await client.patch(f"/v1/machines/{minted['id']}", json={"name": "x" * 256}, headers=headers)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_name"
+
+
+async def test_patch_machine_rename_requires_owner_token(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    minted = (await client.post("/v1/machines", json={"name": "rename-owner-only-box"}, headers=owner_headers)).json()
+    machine_headers = {"Authorization": f"Bearer {minted['token']}"}
+
+    resp = await client.patch(f"/v1/machines/{minted['id']}", json={"name": "should-fail"}, headers=machine_headers)
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "owner_token_required"
 
 
 async def test_patch_unknown_machine_returns_404(client, db_session):

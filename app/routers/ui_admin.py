@@ -135,6 +135,7 @@ async def admin_machines_revoke(
 @router.post("/machines/{machine_id}/update")
 async def admin_machines_update(
     machine_id: str,
+    name: str = Form(...),
     role: str = Form(DEFAULT_ROLE),
     default_project: str = Form(""),
     session: dict = Depends(require_ui_session),
@@ -143,7 +144,9 @@ async def admin_machines_update(
 ):
     project_hint = default_project.strip() or None
     try:
-        machine = await update_machine_op(db, machine_id, {"role": role, "default_project": project_hint})
+        machine = await update_machine_op(
+            db, machine_id, {"role": role, "default_project": project_hint, "name": name}
+        )
     except ApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     if machine is None:

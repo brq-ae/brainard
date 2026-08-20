@@ -17,7 +17,7 @@ from app.models import Machine
 from app.roles import DEFAULT_ROLE, validate_role
 from app.security import generate_machine_token, hash_token
 
-_ALLOWED_MACHINE_UPDATE_KEYS = frozenset({"role", "default_project"})
+_ALLOWED_MACHINE_UPDATE_KEYS = frozenset({"role", "default_project", "name"})
 
 
 async def list_machines(db: AsyncSession) -> list[Machine]:
@@ -67,7 +67,7 @@ def validate_machine_update(data: Any) -> None:
         raise ApiError(
             422,
             "invalid_machine_update",
-            "The machine update must be an object with optional `role`/`default_project` fields. "
+            "The machine update must be an object with optional `role`/`default_project`/`name` fields. "
             "Recovery: fix the field(s) and resend.",
         )
 
@@ -85,6 +85,31 @@ def validate_machine_update(data: Any) -> None:
         if not isinstance(data["role"], str):
             raise ApiError(422, "invalid_role", "`role` must be a string. Recovery: fix the field and resend.")
         validate_role(data["role"])
+
+    if "name" in data:
+        if not isinstance(data["name"], str):
+            raise ApiError(
+                422,
+                "invalid_machine_update",
+                "`name` must be a string. Recovery: fix the field and resend.",
+            )
+        # Blank/whitespace-only is rejected on the *trimmed* value -- a lone
+        # space would pass a plain min_length=1 check but isn't a real name.
+        # Max length mirrors MachineCreateRequest.name's max_length=255
+        # (app/schemas.py) -- PATCH must not accept what POST would reject.
+        if not data["name"].strip():
+            raise ApiError(
+                422,
+                "invalid_name",
+                "`name` must not be blank (or whitespace-only). Recovery: fix the field and resend.",
+            )
+        if len(data["name"]) > 255:
+            raise ApiError(
+                422,
+                "invalid_name",
+                f"`name` must be at most 255 characters, got {len(data['name'])} characters. "
+                "Recovery: fix the field and resend.",
+            )
 
     if "default_project" in data and data["default_project"] is not None:
         if not isinstance(data["default_project"], str):
@@ -105,13 +130,15 @@ def validate_machine_update(data: Any) -> None:
 
 
 def apply_machine_update(machine: Machine, data: dict[str, Any]) -> None:
-    """Applies an already-validated `{role?, default_project?}` object.
+    """Applies an already-validated `{role?, default_project?, name?}` object.
     Absent keys leave the current value untouched (partial update).
     """
     if "role" in data:
         machine.role = data["role"]
     if "default_project" in data:
         machine.default_project = data["default_project"]
+    if "name" in data:
+        machine.name = data["name"]
 
 
 async def update_machine(db: AsyncSession, machine_id: str, data: dict[str, Any]) -> Machine | None:

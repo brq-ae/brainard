@@ -62,9 +62,13 @@
         {% endif %}
       </div>
       <details class="machine-details">
-        <summary>Role / default project / onboarding prompt</summary>
+        <summary>Rename / role / default project / onboarding prompt</summary>
         <form method="post" action="/ui/admin/machines/{{ m.id }}/update">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="field">
+            <label for="name-{{ m.id }}">Name</label>
+            <input type="text" id="name-{{ m.id }}" name="name" value="{{ m.name }}" required>
+          </div>
           <div class="field">
             <label for="role-{{ m.id }}">Role</label>
             <select id="role-{{ m.id }}" name="role">
