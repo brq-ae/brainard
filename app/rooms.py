@@ -15,7 +15,7 @@ import base64
 import time
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import delete, func, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
@@ -38,6 +38,10 @@ REQUIRED_MEMBER_COUNT = 2
 # bound on how long an unattended room may run for.
 MIN_DURATION_SECONDS = 1
 MAX_DURATION_SECONDS = 30 * 24 * 3600
+
+# ADR-0008: free-form room group label. Owner-supplied free text, sane upper
+# bound just to keep it a short label, not a paragraph.
+MAX_GROUP_LENGTH = 100
 
 _RECOVERY_ROOM_MEMBERS = "resend `members` as exactly two distinct non-empty agent-name strings"
 
@@ -92,6 +96,31 @@ def _validate_topic(mode: str, topic: str | None) -> str | None:
             "non-empty `topic`.",
         )
     return cleaned or None
+
+
+def _validate_group(group: str | None) -> str | None:
+    """ADR-0008: a room's optional free-form group label. Trims whitespace;
+    blank/empty (after trim) means "no group", same as `_validate_topic`'s
+    empty-becomes-None convention. Enforces a sane max length -- this is a
+    short label, not a paragraph. Used both at room creation and by the
+    bulk `assign_group_to_rooms` below, so the two never drift on what
+    counts as a valid group value.
+    """
+    if group is None:
+        return None
+    if not isinstance(group, str):
+        raise ApiError(422, "invalid_room_group", f"`group` must be a string or null, got {group!r}.")
+    cleaned = group.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_GROUP_LENGTH:
+        raise ApiError(
+            422,
+            "invalid_room_group",
+            f"`group` is {len(cleaned)} characters, exceeding the {MAX_GROUP_LENGTH}-character cap. "
+            "Recovery: shorten it, resend.",
+        )
+    return cleaned
 
 
 def _validate_sides(mode: str, members: list[str], sides: dict[str, str] | None) -> dict[str, str | None]:
@@ -178,6 +207,7 @@ async def create_room(
     sides: dict[str, str] | None = None,
     duration_seconds: int | None = None,
     expires_at: datetime | None = None,
+    group: str | None = None,
 ) -> Room:
     """ADR-0007 extends room creation with an optional mode+topic (shapes
     the join prompt's injected role text, app/onboarding.py) and an
@@ -186,6 +216,11 @@ async def create_room(
     self-explaining ApiErrors, same posture as the phase A validators
     above; mode/topic/sides are cross-validated together since which
     `sides` shape is valid depends on the mode.
+
+    ADR-0008 further extends it with an optional free-form `group` label
+    (stored as `Room.group_name` -- 'group' is a SQL reserved word),
+    validated by the same `_validate_group` the bulk `assign_group_to_rooms`
+    below uses.
     """
     if not name or not name.strip():
         raise ApiError(422, "invalid_room_name", "`name` must be non-empty. Recovery: resend with a non-empty name.")
@@ -194,6 +229,7 @@ async def create_room(
     validate_mode(mode)
     cleaned_topic = _validate_topic(mode, topic)
     member_sides = _validate_sides(mode, cleaned_members, sides)
+    cleaned_group = _validate_group(group)
 
     now = datetime.now(UTC)
     resolved_expires_at = _validate_deadline(now, duration_seconds, expires_at)
@@ -209,6 +245,7 @@ async def create_room(
         mode=mode,
         topic=cleaned_topic,
         expires_at=resolved_expires_at,
+        group_name=cleaned_group,
     )
     db.add(room)
     await db.flush()  # room.id must exist before the member rows FK to it
@@ -326,8 +363,18 @@ def _decode_room_cursor(cursor: str) -> tuple[datetime, str]:
         raise ApiError(422, "invalid_cursor", "The `cursor` parameter is not valid for this listing.") from exc
 
 
-async def list_rooms(db: AsyncSession, *, cursor: str | None = None, limit: int = 20) -> tuple[list[Room], str | None]:
+async def list_rooms(
+    db: AsyncSession, *, cursor: str | None = None, limit: int = 20, group: str | None = None
+) -> tuple[list[Room], str | None]:
+    """ADR-0008: `group`, when given, exact-matches `Room.group_name` --
+    e.g. so an observer AI can be pointed at just one group's rooms
+    (GET /v1/rooms?group=X). `None` (the default) means "no filter", not
+    "rooms with no group"; there is no way to query for ungrouped rooms
+    specifically via this parameter, matching the ADR's stated shape.
+    """
     stmt = select(Room).order_by(Room.created_at.desc(), Room.id.desc())
+    if group is not None:
+        stmt = stmt.where(Room.group_name == group)
     if cursor is not None:
         cursor_ts, cursor_id = _decode_room_cursor(cursor)
         stmt = stmt.where(tuple_(Room.created_at, Room.id) < tuple_(cursor_ts, cursor_id))
@@ -343,6 +390,19 @@ async def list_rooms(db: AsyncSession, *, cursor: str | None = None, limit: int 
         next_cursor = _encode_room_cursor(last.created_at, last.id)
 
     return page_rows, next_cursor
+
+
+async def list_room_groups(db: AsyncSession) -> list[str]:
+    """Distinct, non-null group labels currently in use, sorted -- backs the
+    UI's group filter dropdown/datalist (app/routers/ui_rooms.py) so the
+    owner can pick from existing groups rather than retyping one by hand.
+    """
+    rows = (
+        await db.scalars(
+            select(Room.group_name).where(Room.group_name.is_not(None)).distinct().order_by(Room.group_name)
+        )
+    ).all()
+    return list(rows)
 
 
 # --- POST /v1/rooms/{id}/messages ---
@@ -691,3 +751,145 @@ async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list
         if messages or room.status != "open" or time.monotonic() >= deadline:
             return room, messages
         await asyncio.sleep(POLL_INTERVAL_SECS)
+
+
+# --- DELETE /v1/rooms/{id} (ADR-0008: owner-only hard delete) ---
+
+
+async def delete_room(db: AsyncSession, room_id: str) -> tuple[int, int]:
+    """Hard-deletes a room and everything under it: its messages, then its
+    members, then the room row itself, all in one transaction (one commit).
+    Returns (messages_deleted, members_deleted).
+
+    EXPLICIT application-level cascade, not FK ondelete=CASCADE: `RoomMember.
+    room_id` and `RoomMessage.room_id` (app/models.py) are plain
+    `ForeignKey("rooms.id")` with no `ondelete` set, so Postgres's default FK
+    action (NO ACTION/RESTRICT) would otherwise reject deleting a room that
+    still has member/message rows. Deleting children first, then the room,
+    in this one function/transaction is ADR-0008's own suggested alternative
+    to an ondelete=CASCADE migration -- chosen here so the "a room's rows are
+    gone" invariant is enforced in the one place (this function) that every
+    delete path (API, UI) goes through, same as every other multi-row
+    guardrail in this module, rather than relying on schema-level cascade
+    semantics a reader would have to go find in the migration.
+
+    Rooms are transient chat, not curated knowledge (ADR-0008 decision 2):
+    this is a genuine hard delete, not a status flip -- there is no
+    "undelete". Works on an open OR closed room; deleting is always the
+    owner's call regardless of room status.
+
+    404s (rather than silently no-op'ing) for an unknown/already-deleted id
+    -- "delete this specific room" on a room that isn't there is a rejection,
+    not a no-op, same posture as `close_room`'s and `post_message`'s own
+    404s for a nonexistent room_id.
+
+    Takes the room's row lock -- same `SELECT ... FOR UPDATE` +
+    `populate_existing` pattern `post_message`/`close_room`/
+    `post_closing_nudge` use -- before deleting anything. Without it, a
+    concurrent `post_message`/`post_closing_nudge` racing this delete could
+    insert a new `room_messages` row (or member row) in the window after
+    this function's child-deletes ran but before the room row itself was
+    deleted, which would either violate the room row's referencing FK on
+    delete or, worse, leave an orphaned message pointing at a room that's
+    about to vanish. Holding the lock across the unlocked existence
+    pre-check's re-fetch and every delete in this function serializes
+    delete_room against every other writer of this room's row (or its
+    children): a concurrent inserter either lands and commits before this
+    lock is acquired (its message/member row is simply deleted here right
+    afterward, same as any pre-existing row), or blocks on the room's lock
+    until this transaction commits, at which point its own room_id lookup
+    (`post_message`'s/`post_closing_nudge`'s own `db.get`/lock re-check)
+    finds the room gone and reports its own clean 404/no-op -- never a raw
+    IntegrityError, and never a message/member row left behind.
+    """
+    # Unlocked pre-check: existence never needs the row lock to be correct
+    # (mirrors post_message's/close_room's own "unlocked pre-checks"
+    # reasoning) -- a 404 for a genuinely nonexistent room doesn't need
+    # serializing on anything.
+    room = await db.get(Room, room_id)
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Serialization point: acquire the room's row lock, same pattern as
+    # post_message/close_room/post_closing_nudge. `populate_existing` is
+    # required for the identical reason those functions document: `room`
+    # may already be in this Session's identity map from the unlocked
+    # `db.get` above, and without it SQLAlchemy would leave that
+    # already-loaded object's attributes untouched even though the FOR
+    # UPDATE SQL below legitimately re-fetches newer committed data.
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None:
+        # Another concurrent delete_room won the race and already committed
+        # between the unlocked pre-check and acquiring this lock.
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    messages_deleted = (await db.execute(delete(RoomMessage).where(RoomMessage.room_id == room_id))).rowcount
+    members_deleted = (await db.execute(delete(RoomMember).where(RoomMember.room_id == room_id))).rowcount
+    await db.delete(room)
+    await db.commit()
+    return messages_deleted, members_deleted
+
+
+# --- POST /v1/rooms/assign-group (ADR-0008: bulk group assignment) ---
+
+MAX_BULK_ASSIGN_ROOMS = 500
+
+
+async def assign_group_to_rooms(db: AsyncSession, room_ids: list[str], group: str | None) -> tuple[int, str | None]:
+    """Bulk-sets (or clears, if `group` is null/blank) `group_name` on every
+    room in `room_ids`, in one transaction. Returns (updated_count,
+    resolved_group) -- `resolved_group` is the actual value applied (after
+    `_validate_group`'s trim/blank-to-None), so callers building a response
+    never have to re-derive it themselves.
+
+    Validates every id exists BEFORE writing anything: a partial bulk-assign
+    (some rooms updated, others silently skipped because the id was a typo)
+    would be a confusing, hard-to-notice failure mode for an owner selecting
+    rooms in the UI, so this rejects the whole call with a self-explaining
+    404 listing exactly which ids were not found -- same "reject clearly
+    rather than partially apply" posture as e.g. deposits.py's per-item
+    validation. Uses a single UPDATE ... WHERE id IN (...) for the write
+    itself, not a per-room loop, since every included id is already known
+    (checked above) to exist.
+    """
+    if not isinstance(room_ids, list) or not room_ids:
+        raise ApiError(
+            422,
+            "invalid_room_ids",
+            f"`room_ids` must be a non-empty list of room id strings, got {room_ids!r}. "
+            "Recovery: resend with at least one room id.",
+        )
+    if len(room_ids) > MAX_BULK_ASSIGN_ROOMS:
+        raise ApiError(
+            422,
+            "invalid_room_ids",
+            f"`room_ids` has {len(room_ids)} entries, exceeding the {MAX_BULK_ASSIGN_ROOMS}-room cap per call. "
+            "Recovery: split into smaller batches.",
+        )
+    cleaned_ids = [r.strip() if isinstance(r, str) else r for r in room_ids]
+    if any(not isinstance(r, str) or not r for r in cleaned_ids):
+        raise ApiError(
+            422,
+            "invalid_room_ids",
+            f"`room_ids` must contain only non-empty room id strings, got {room_ids!r}.",
+        )
+    unique_ids = sorted(set(cleaned_ids))
+
+    cleaned_group = _validate_group(group)
+
+    existing_ids = set((await db.scalars(select(Room.id).where(Room.id.in_(unique_ids)))).all())
+    missing_ids = [id_ for id_ in unique_ids if id_ not in existing_ids]
+    if missing_ids:
+        raise ApiError(
+            404,
+            "unknown_room_ids",
+            f"{len(missing_ids)} of {len(unique_ids)} `room_ids` do not exist: {missing_ids}. "
+            "Recovery: remove the unknown ids, or resend with only existing room ids.",
+            extra={"unknown_ids": missing_ids},
+        )
+
+    await db.execute(update(Room).where(Room.id.in_(unique_ids)).values(group_name=cleaned_group))
+    await db.commit()
+    return len(unique_ids), cleaned_group

@@ -44,6 +44,11 @@
       <input type="text" id="max_messages" name="max_messages" class="mono" value="{{ form.max_messages or '' }}" placeholder="100">
     </div>
     <div class="field">
+      <label for="group">Group (optional)</label>
+      <input type="text" id="group" name="group" list="existing-groups" value="{{ form.group or '' }}" placeholder="e.g. schema-debates" maxlength="100">
+      <p class="meta">Free-form label (ADR-0008) -- point an observer AI at just this group's rooms via <code>GET /v1/rooms?group=...</code>.</p>
+    </div>
+    <div class="field">
       <label for="duration_preset">Time limit</label>
       <select id="duration_preset" name="duration_preset">
         <option value="" {% if not form.duration_preset %}selected{% endif %}>No limit</option>
@@ -88,12 +93,56 @@
 <script type="application/json" id="room-modes-data">{{ room_modes_json }}</script>
 <script src="/static/room_form.js"></script>
 
+<!-- Shared by both the "New room" form's group field above and the filter
+     field below -- existing group labels currently in use (ADR-0008), so
+     the owner can pick one instead of retyping it. Plain <option> text,
+     autoescaped by Jinja2 like everything else on this page. -->
+<datalist id="existing-groups">
+  {% for g in groups %}
+  <option value="{{ g }}">
+  {% endfor %}
+</datalist>
+
+<div class="panel">
+  <h2>Filter by group</h2>
+  <form method="get" action="/ui/rooms" class="grid cols-2">
+    <div class="field">
+      <label for="group-filter">Group</label>
+      <input type="text" id="group-filter" name="group" list="existing-groups" value="{{ group_filter or '' }}" placeholder="Leave blank for all rooms">
+    </div>
+    <div class="field">
+      <label>&nbsp;</label>
+      <button type="submit" class="btn">Filter</button>
+      {% if group_filter %}<a class="btn" href="/ui/rooms">Clear filter</a>{% endif %}
+    </div>
+  </form>
+  {% if group_filter %}<p class="meta">Showing only group "{{ group_filter }}".</p>{% endif %}
+</div>
+
+<!-- The bulk "assign to group" form (ADR-0008). Its actual form fields
+     (group name + submit) are rendered as its own small panel below; each
+     room row's checkbox is NOT nested inside this <form> (HTML forbids
+     nested forms -- each row already has its own separate Delete <form>) --
+     instead every checkbox uses form="rooms-bulk-form" to associate with
+     this form from outside it. See app/routers/ui_rooms.py's module
+     docstring for the fuller explanation. -->
+<form id="rooms-bulk-form" method="post" action="/ui/rooms/assign-group">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+</form>
+
 <div class="panel">
   <h2>Rooms</h2>
   {% if rooms %}
+  <div class="field">
+    <label for="bulk-group">Assign checked rooms to group</label>
+    <input type="text" id="bulk-group" name="group" list="existing-groups" form="rooms-bulk-form" placeholder="Leave blank to clear the group" maxlength="100">
+    <button type="submit" form="rooms-bulk-form" class="btn">Assign selected to group</button>
+    <p class="meta">Check rooms below, then assign them all to a group in one step -- or leave the group name blank to clear it from the checked rooms.</p>
+  </div>
   <ul class="list">
     {% for r in rooms %}
     <li class="row">
+      <input type="checkbox" name="room_ids" value="{{ r.id }}" form="rooms-bulk-form" aria-label="Select {{ r.name }} for bulk group assignment">
       <span class="row-main">
         <a href="/ui/rooms/{{ r.id }}">{{ r.name }}</a>
         <div class="meta">{{ (members_by_room.get(r.id) or [])|join(' ↔ ') }}</div>
@@ -103,7 +152,14 @@
         {{ r.message_count }}/{{ r.max_messages }}
         {% if r.close_reason %}<span class="sep">·</span>{{ r.close_reason }}{% endif %}
       </span>
+      <span class="meta">
+        {% if r.group_name %}Group: {{ r.group_name }}{% else %}No group{% endif %}
+      </span>
       <span class="meta">{{ r.created_at|human_ts }}</span>
+      <form method="post" action="/ui/rooms/{{ r.id }}/delete" data-confirm="Delete this room and its {{ r.message_count }} messages permanently?" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn danger">Delete</button>
+      </form>
     </li>
     {% endfor %}
   </ul>
@@ -112,7 +168,7 @@
   {% endif %}
   <div class="pagination">
     {% if next_cursor %}
-    <a class="btn" href="/ui/rooms?cursor={{ next_cursor }}">Next page →</a>
+    <a class="btn" href="/ui/rooms?cursor={{ next_cursor }}{% if group_filter %}&group={{ group_filter|urlencode }}{% endif %}">Next page →</a>
     {% endif %}
   </div>
 </div>

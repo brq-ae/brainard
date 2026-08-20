@@ -473,6 +473,14 @@ class Room(Base):
     topic: Mapped[str | None] = mapped_column(Text, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closing_warned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ADR-0008: free-form room grouping label, set at creation or bulk-
+    # assigned to selected rooms via the UI/API (app/rooms.py's
+    # assign_group_to_rooms). Named `group_name` because 'group' is a SQL
+    # reserved word; exposed as `group` in the API/UI (RoomCreateRequest.group,
+    # etc.). NULL means ungrouped. Free-form text, not tied to Brain
+    # projects (ADR-0008 decision 3) -- owner-supplied, so untrusted content
+    # wherever it renders in the UI (must be autoescaped, never |safe).
+    group_name: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
 
     __table_args__ = (
         CheckConstraint("status IN ('open', 'closed')", name="ck_rooms_status"),

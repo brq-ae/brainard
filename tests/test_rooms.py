@@ -7,10 +7,16 @@ import asyncio
 import time
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import select
 from ulid import ULID
 
 import app.notify as notify_module
-from app.models import Machine, OwnerToken
+from app.db import AsyncSessionLocal
+from app.errors import ApiError
+from app.models import Machine, OwnerToken, Room, RoomMember, RoomMessage
+from app.rooms import delete_room as delete_room_op
+from app.rooms import post_closing_nudge as post_closing_nudge_op
+from app.rooms import post_message as post_message_op
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
 
@@ -41,6 +47,7 @@ async def _create_room(
     sides=None,
     duration_seconds=None,
     expires_at=None,
+    group=None,
     expect_status=201,
 ) -> dict:
     body: dict = {"name": name, "members": members if members is not None else ["agent-a", "agent-b"]}
@@ -56,6 +63,8 @@ async def _create_room(
         body["duration_seconds"] = duration_seconds
     if expires_at is not None:
         body["expires_at"] = expires_at
+    if group is not None:
+        body["group"] = group
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == expect_status, resp.json()
     return resp.json()
@@ -906,3 +915,542 @@ async def test_long_poll_requires_auth(client, db_session):
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
     resp = await client.get(f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0})
     assert resp.status_code == 401
+
+
+# --- ADR-0008: room delete + free-form groups ---
+
+
+# --- create: group ---
+
+
+async def test_create_room_with_group_sets_group(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], group="schema-debates")
+    assert room["group"] == "schema-debates"
+
+
+async def test_create_room_without_group_defaults_to_none(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    assert room["group"] is None
+
+
+async def test_create_room_blank_group_is_none(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], group="   ")
+    assert room["group"] is None
+
+
+async def test_create_room_group_is_trimmed(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], group="  padded  ")
+    assert room["group"] == "padded"
+
+
+async def test_create_room_group_too_long_rejected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={"name": "r", "members": ["agent-a", "agent-b"], "group": "x" * 101},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_group"
+
+
+# --- list: group filter ---
+
+
+async def test_list_rooms_includes_group_field(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], group="alpha-group")
+
+    resp = await client.get("/v1/rooms", headers=machine_headers)
+    assert resp.status_code == 200
+    by_id = {r["id"]: r for r in resp.json()["results"]}
+    assert by_id[room["id"]]["group"] == "alpha-group"
+
+
+async def test_list_rooms_group_filter_returns_only_matching(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room_a = await _create_room(client, owner_headers, name="a", members=["a1", "a2"], group="group-a")
+    room_b = await _create_room(client, owner_headers, name="b", members=["b1", "b2"], group="group-b")
+    room_c = await _create_room(client, owner_headers, name="c", members=["c1", "c2"])  # ungrouped
+
+    resp = await client.get("/v1/rooms", params={"group": "group-a"}, headers=machine_headers)
+    assert resp.status_code == 200
+    ids = [r["id"] for r in resp.json()["results"]]
+    assert ids == [room_a["id"]]
+    assert room_b["id"] not in ids
+    assert room_c["id"] not in ids
+
+
+async def test_list_rooms_no_group_filter_returns_all(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _create_room(client, owner_headers, name="a", members=["a1", "a2"], group="group-a")
+    await _create_room(client, owner_headers, name="b", members=["b1", "b2"])
+
+    resp = await client.get("/v1/rooms", headers=machine_headers)
+    assert resp.status_code == 200
+    assert len(resp.json()["results"]) == 2
+
+
+async def test_get_room_detail_includes_group(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], group="detail-group")
+
+    resp = await client.get(f"/v1/rooms/{room['id']}", headers=machine_headers)
+    assert resp.status_code == 200
+    assert resp.json()["group"] == "detail-group"
+
+
+# --- bulk group assignment ---
+
+
+async def test_assign_group_sets_group_on_multiple_rooms(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room1 = await _create_room(client, owner_headers, name="r1", members=["a1", "a2"])
+    room2 = await _create_room(client, owner_headers, name="r2", members=["b1", "b2"])
+
+    resp = await client.post(
+        "/v1/rooms/assign-group",
+        json={"room_ids": [room1["id"], room2["id"]], "group": "batch-group"},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["updated"] == 2
+    assert data["group"] == "batch-group"
+
+    detail1 = await client.get(f"/v1/rooms/{room1['id']}", headers=owner_headers)
+    detail2 = await client.get(f"/v1/rooms/{room2['id']}", headers=owner_headers)
+    assert detail1.json()["group"] == "batch-group"
+    assert detail2.json()["group"] == "batch-group"
+
+
+async def test_assign_group_null_clears_group(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], group="had-a-group")
+
+    resp = await client.post(
+        "/v1/rooms/assign-group",
+        json={"room_ids": [room["id"]], "group": None},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["group"] is None
+
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["group"] is None
+
+
+async def test_assign_group_blank_clears_group(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], group="had-a-group")
+
+    resp = await client.post(
+        "/v1/rooms/assign-group",
+        json={"room_ids": [room["id"]], "group": "   "},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["group"] is None
+
+
+async def test_assign_group_requires_owner_token(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        "/v1/rooms/assign-group",
+        json={"room_ids": [room["id"]], "group": "nope"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "owner_token_required"
+
+
+async def test_assign_group_requires_auth(client, db_session):
+    resp = await client.post("/v1/rooms/assign-group", json={"room_ids": ["whatever"], "group": "nope"})
+    assert resp.status_code == 401
+
+
+async def test_assign_group_rejects_unknown_room_id(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        "/v1/rooms/assign-group",
+        json={"room_ids": [room["id"], "not-a-real-room"], "group": "some-group"},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["error"]["code"] == "unknown_room_ids"
+    assert "not-a-real-room" in body["error"]["unknown_ids"]
+
+    # All-or-nothing: the known room's group must be untouched by the
+    # rejected call.
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["group"] is None
+
+
+async def test_assign_group_rejects_empty_room_ids(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms/assign-group", json={"room_ids": [], "group": "some-group"}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_ids"
+
+
+async def test_assign_group_rejects_group_too_long(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        "/v1/rooms/assign-group",
+        json={"room_ids": [room["id"]], "group": "x" * 101},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_group"
+
+
+# --- delete ---
+
+
+async def test_delete_room_owner_hard_deletes_room_and_cascades(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-b", "text": "hey"}, headers=machine_headers
+    )
+
+    resp = await client.delete(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == room["id"]
+    assert data["deleted"] is True
+    assert data["deleted_messages"] == 2
+    assert data["deleted_members"] == 2
+
+    # Gone via the API too.
+    get_resp = await client.get(f"/v1/rooms/{room['id']}", headers=machine_headers)
+    assert get_resp.status_code == 404
+
+    # And genuinely gone from the database -- not a soft-delete/status flip.
+    assert await db_session.get(Room, room["id"]) is None
+    remaining_members = (
+        await db_session.execute(select(RoomMember).where(RoomMember.room_id == room["id"]))
+    ).all()
+    remaining_messages = (
+        await db_session.execute(select(RoomMessage).where(RoomMessage.room_id == room["id"]))
+    ).all()
+    assert remaining_members == []
+    assert remaining_messages == []
+
+
+async def test_delete_room_works_on_closed_room(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    close_resp = await client.post(f"/v1/rooms/{room['id']}/close", json={}, headers=owner_headers)
+    assert close_resp.status_code == 200
+
+    resp = await client.delete(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert resp.status_code == 200
+    assert await db_session.get(Room, room["id"]) is None
+
+
+async def test_delete_room_requires_owner_token(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.delete(f"/v1/rooms/{room['id']}", headers=machine_headers)
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "owner_token_required"
+
+    # Untouched by the rejected attempt.
+    assert await db_session.get(Room, room["id"]) is not None
+
+
+async def test_delete_room_requires_auth(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.delete(f"/v1/rooms/{room['id']}")
+    assert resp.status_code == 401
+
+
+async def test_delete_room_404_for_unknown_room(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.delete("/v1/rooms/not-a-real-room", headers=owner_headers)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "room_not_found"
+
+
+async def test_delete_room_404_when_already_deleted(client, db_session):
+    """Deleting the same room id twice is a clear 404 the second time, not
+    a silent success -- ADR-0008 hard delete has no "already gone" no-op.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    first = await client.delete(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert first.status_code == 200
+    second = await client.delete(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert second.status_code == 404
+    assert second.json()["error"]["code"] == "room_not_found"
+
+
+async def test_delete_room_does_not_affect_other_rooms(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room1 = await _create_room(client, owner_headers, name="keep-me", members=["a1", "a2"])
+    room2 = await _create_room(client, owner_headers, name="delete-me", members=["b1", "b2"])
+    await client.post(
+        f"/v1/rooms/{room1['id']}/messages", json={"sender": "a1", "text": "still here"}, headers=machine_headers
+    )
+
+    resp = await client.delete(f"/v1/rooms/{room2['id']}", headers=owner_headers)
+    assert resp.status_code == 200
+
+    still_there = await client.get(f"/v1/rooms/{room1['id']}", headers=machine_headers)
+    assert still_there.status_code == 200
+    assert still_there.json()["message_count"] == 1
+
+
+# --- delete_room row-lock race safety (fix-first review finding) ---
+#
+# delete_room now takes the room's row lock (SELECT ... FOR UPDATE, same
+# pattern close_room/post_message/post_closing_nudge already use) before
+# deleting anything. These tests force GENUINE Postgres-level lock
+# contention -- not just decoupled timing luck -- by delaying one side's
+# COMMIT while it holds the lock, so the other side's own FOR UPDATE
+# provably blocks at the database level until the winner commits (asserted
+# via elapsed time). Both interleavings (delete_room wins the lock first /
+# loses it) are exercised against both post_message(kind='done') and
+# post_closing_nudge -- the two other writers that touch a room's row and
+# its children. The invariant under test either way: no raw
+# IntegrityError/500, no orphaned row, and the loser observes a clean
+# 404/None once the winner's commit lands.
+
+COMMIT_DELAY = 0.4
+HEAD_START = 0.05
+RACE_TRIALS = 3
+
+
+def _delayed_commit_session(delay: float):
+    """A real AsyncSessionLocal() session whose .commit() sleeps `delay`
+    seconds before actually committing -- used to hold a just-acquired
+    FOR UPDATE row lock open long enough that a genuinely concurrent
+    caller's own lock acquisition provably blocks on it.
+    """
+    session = AsyncSessionLocal()
+    original_commit = session.commit
+
+    async def slow_commit():
+        await asyncio.sleep(delay)
+        await original_commit()
+
+    session.commit = slow_commit
+    return session
+
+
+async def test_delete_room_race_delete_wins_against_post_message_done(client, db_session):
+    """Interleaving A: delete_room acquires the lock first and holds it
+    (via the delayed commit) while a concurrent post_message('done') tries
+    to post -- the poster must genuinely block, then see a clean 404 once
+    delete has committed. Never a 500/IntegrityError, never an orphaned
+    message.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_delete():
+            async with winner_session:
+                return await delete_room_op(winner_session, room_id)
+
+        async def run_post():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                try:
+                    return await post_message_op(loser_session, room_id, "agent-a", "goodbye", "done")
+                except ApiError as exc:
+                    return exc
+
+        start = time.monotonic()
+        delete_result, post_result = await asyncio.gather(run_delete(), run_post())
+        elapsed = time.monotonic() - start
+
+        # Genuine blocking, not decoupled timing luck: the loser could not
+        # have finished before the winner released the lock.
+        assert elapsed >= COMMIT_DELAY
+
+        messages_deleted, members_deleted = delete_result
+        assert messages_deleted == 0
+        assert members_deleted == 2
+        assert isinstance(post_result, ApiError)
+        assert post_result.code == "room_not_found"
+
+        # Genuinely gone; no orphaned rows from the raced post.
+        assert await db_session.get(Room, room_id) is None
+        remaining = (
+            await db_session.execute(
+                RoomMessage.__table__.select().where(RoomMessage.__table__.c.room_id == room_id)
+            )
+        ).all()
+        assert remaining == []
+
+
+async def test_delete_room_race_post_message_done_wins_against_delete(client, db_session):
+    """Interleaving B: post_message('done') acquires the lock first and
+    holds it while delete_room tries to delete -- delete_room must
+    genuinely block, then (once the message is committed) proceed to
+    delete the room INCLUDING that just-inserted message, with no FK
+    violation.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_post():
+            async with winner_session:
+                return await post_message_op(winner_session, room_id, "agent-a", "goodbye", "done")
+
+        async def run_delete():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await delete_room_op(loser_session, room_id)
+
+        start = time.monotonic()
+        post_result, delete_result = await asyncio.gather(run_post(), run_delete())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        # post_message really landed (message inserted, room closed by the
+        # done-signal) before delete swept it up.
+        message, room_after_post = post_result
+        assert message.seq == 1
+        assert room_after_post.status == "closed"
+
+        messages_deleted, members_deleted = delete_result
+        assert messages_deleted == 1  # the raced-in 'done' message, cleanly swept up -- no FK violation
+        assert members_deleted == 2
+
+        assert await db_session.get(Room, room_id) is None
+
+
+async def test_delete_room_race_delete_wins_against_post_closing_nudge(client, db_session):
+    """Same interleaving A, against post_closing_nudge instead of
+    post_message: the nudge's own lock acquisition finds the room already
+    gone -> a clean None, never an exception.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_delete():
+            async with winner_session:
+                return await delete_room_op(winner_session, room_id)
+
+        async def run_nudge():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await post_closing_nudge_op(loser_session, room_id, "closing soon")
+
+        start = time.monotonic()
+        delete_result, nudge_result = await asyncio.gather(run_delete(), run_nudge())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+        messages_deleted, members_deleted = delete_result
+        assert messages_deleted == 0
+        assert members_deleted == 2
+        assert nudge_result is None  # clean no-op: room gone by the time the lock was acquired
+
+        assert await db_session.get(Room, room_id) is None
+
+
+async def test_delete_room_race_post_closing_nudge_wins_against_delete(client, db_session):
+    """Same interleaving B, against post_closing_nudge instead of
+    post_message: the nudge's system message really lands first, then
+    delete sweeps it up with no FK violation.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_nudge():
+            async with winner_session:
+                return await post_closing_nudge_op(winner_session, room_id, "closing soon")
+
+        async def run_delete():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await delete_room_op(loser_session, room_id)
+
+        start = time.monotonic()
+        nudge_result, delete_result = await asyncio.gather(run_nudge(), run_delete())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+        assert nudge_result is not None  # the nudge really landed before delete ran
+
+        messages_deleted, members_deleted = delete_result
+        assert messages_deleted == 1  # the raced-in nudge message, cleanly swept up -- no FK violation
+        assert members_deleted == 2
+
+        assert await db_session.get(Room, room_id) is None
+
+
+async def test_delete_room_race_delete_already_gone_is_clean_404(client, db_session):
+    """Baseline (not itself a race, but the reviewer's other requested
+    check): deleting a room that's already been deleted -- via the same
+    locked path -- is a clean 404, never a 500.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    async with AsyncSessionLocal() as session1:
+        await delete_room_op(session1, room["id"])
+
+    async with AsyncSessionLocal() as session2:
+        try:
+            await delete_room_op(session2, room["id"])
+            assert False, "expected ApiError"
+        except ApiError as exc:
+            assert exc.code == "room_not_found"
+            assert exc.status_code == 404

@@ -253,3 +253,71 @@ async def test_sweep_once_expires_a_room_it_just_warned_on_a_later_cycle(client,
     detail = await _get_room(client, machine_headers, room["id"])
     assert detail["status"] == "closed"
     assert detail["close_reason"] == "time"
+
+
+# --- per-room isolation (fix-first review: cheap hardening) ---
+
+
+async def test_sweep_once_isolates_a_failing_room_close_and_continues(client, db_session, monkeypatch):
+    """One room's close_room raising must not abort the batch -- the other
+    expired room in the same cycle must still be closed.
+    """
+    import app.room_sweeper as sweeper_module
+
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    bad_room = await _create_room(client, owner_headers, name="bad-room")
+    good_room = await _create_room(client, owner_headers, name="good-room")
+    await _backdate_expires_at(db_session, bad_room["id"], datetime.now(UTC) - timedelta(seconds=5))
+    await _backdate_expires_at(db_session, good_room["id"], datetime.now(UTC) - timedelta(seconds=5))
+
+    original_close_room = sweeper_module.close_room
+
+    async def flaky_close_room(session, room_id, reason):
+        if room_id == bad_room["id"]:
+            raise RuntimeError("simulated close failure")
+        return await original_close_room(session, room_id, reason)
+
+    monkeypatch.setattr(sweeper_module, "close_room", flaky_close_room)
+
+    result = await sweep_once()  # must not raise -- the bad room's failure is caught and logged
+    assert result["closed"] == [good_room["id"]]
+
+    good_detail = await _get_room(client, machine_headers, good_room["id"])
+    assert good_detail["status"] == "closed"
+    assert good_detail["close_reason"] == "time"
+
+    bad_detail = await _get_room(client, machine_headers, bad_room["id"])
+    assert bad_detail["status"] == "open"  # its close raised, was caught, and was skipped this cycle
+
+
+async def test_sweep_once_isolates_a_failing_nudge_and_continues(client, db_session, monkeypatch):
+    """Same isolation, for the closing-soon nudge loop."""
+    import app.room_sweeper as sweeper_module
+
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    bad_room = await _create_room(client, owner_headers, name="bad-nudge-room")
+    good_room = await _create_room(client, owner_headers, name="good-nudge-room")
+    await _backdate_expires_at(db_session, bad_room["id"], datetime.now(UTC) + timedelta(seconds=WARN_SECONDS - 10))
+    await _backdate_expires_at(db_session, good_room["id"], datetime.now(UTC) + timedelta(seconds=WARN_SECONDS - 10))
+
+    original_post_closing_nudge = sweeper_module.post_closing_nudge
+
+    async def flaky_nudge(session, room_id, text):
+        if room_id == bad_room["id"]:
+            raise RuntimeError("simulated nudge failure")
+        return await original_post_closing_nudge(session, room_id, text)
+
+    monkeypatch.setattr(sweeper_module, "post_closing_nudge", flaky_nudge)
+
+    result = await sweep_once()  # must not raise
+    assert result["warned"] == [good_room["id"]]
+
+    good_detail = await _get_room(client, machine_headers, good_room["id"])
+    good_system_messages = [m for m in good_detail["messages"] if m["kind"] == "system"]
+    assert len(good_system_messages) == 1
+
+    bad_detail = await _get_room(client, machine_headers, bad_room["id"])
+    bad_system_messages = [m for m in bad_detail["messages"] if m["kind"] == "system"]
+    assert bad_system_messages == []  # its nudge raised, was caught, and was skipped this cycle

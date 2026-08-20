@@ -71,14 +71,23 @@ async def _close_expired_rooms(session_factory: async_sessionmaker[AsyncSession]
 
     closed: list[str] = []
     for room_id in room_ids:
-        async with session_factory() as session:
-            room = await close_room(session, room_id, "time")
-            # close_room is idempotent -- if a concurrent request (owner
-            # close, or the cap) closed it first for a different reason
-            # between the scan above and this call, close_reason won't be
-            # 'time'; only report rooms THIS call actually time-closed.
-            if room.close_reason == "time":
-                closed.append(room_id)
+        try:
+            async with session_factory() as session:
+                room = await close_room(session, room_id, "time")
+                # close_room is idempotent -- if a concurrent request (owner
+                # close, or the cap) closed it first for a different reason
+                # between the scan above and this call, close_reason won't be
+                # 'time'; only report rooms THIS call actually time-closed.
+                if room.close_reason == "time":
+                    closed.append(room_id)
+        except Exception:
+            # Isolate this room's failure from the rest of the batch -- one
+            # bad room (e.g. a transient DB error on its close) must not
+            # abort the loop and skip every other expired room until the
+            # next cycle. `run_sweeper`'s outer try/except remains the
+            # backstop for anything outside this per-room loop; this is the
+            # finer-grained isolation *within* one cycle.
+            logger.exception("room sweeper: closing expired room %s failed -- skipping it this cycle", room_id)
     return closed
 
 
@@ -112,10 +121,16 @@ async def _warn_closing_rooms(session_factory: async_sessionmaker[AsyncSession])
 
     warned: list[str] = []
     for room_id in room_ids:
-        async with session_factory() as session:
-            message = await post_closing_nudge(session, room_id, _CLOSING_NUDGE_TEXT)
-            if message is not None:
-                warned.append(room_id)
+        try:
+            async with session_factory() as session:
+                message = await post_closing_nudge(session, room_id, _CLOSING_NUDGE_TEXT)
+                if message is not None:
+                    warned.append(room_id)
+        except Exception:
+            # Same per-room isolation as _close_expired_rooms above -- one
+            # room's failed nudge must not abort the loop and skip the
+            # remaining rooms' nudges until the next cycle.
+            logger.exception("room sweeper: closing-soon nudge for room %s failed -- skipping it this cycle", room_id)
     return warned
 
 

@@ -488,6 +488,12 @@ class RoomCreateRequest(BaseModel):
     # it null: no deadline).
     duration_seconds: int | None = None
     expires_at: datetime | None = None
+    # ADR-0008: optional free-form group label (-> Room.group_name; 'group'
+    # is a SQL reserved word, hence the different storage name). Trimmed,
+    # blank/empty treated as "no group", validated in app/rooms.py's
+    # `_validate_group` -- same self-explaining-ApiError reasoning as `mode`
+    # above, not a pydantic length constraint here.
+    group: str | None = None
 
 
 class RoomCreateResponse(BaseModel):
@@ -501,6 +507,7 @@ class RoomCreateResponse(BaseModel):
     expires_at: datetime | None
     # {agent_name: side} -- side is null for symmetric/freeform members.
     sides: dict[str, str | None]
+    group: str | None
 
 
 class RoomListItem(BaseModel):
@@ -516,6 +523,7 @@ class RoomListItem(BaseModel):
     topic: str | None
     expires_at: datetime | None
     sides: dict[str, str | None]
+    group: str | None
 
 
 class RoomListResponse(BaseModel):
@@ -549,6 +557,7 @@ class RoomDetailResponse(BaseModel):
     topic: str | None
     expires_at: datetime | None
     sides: dict[str, str | None]
+    group: str | None
     # Most recent N messages, oldest first (chat reading order).
     messages: list[RoomMessageOut]
 
@@ -583,3 +592,27 @@ class RoomCloseResponse(BaseModel):
 class RoomMessagesPollResponse(BaseModel):
     room_status: str
     messages: list[RoomMessageOut]
+
+
+# --- Room delete + free-form groups (ADR-0008) ---
+
+
+class RoomDeleteResponse(BaseModel):
+    id: str
+    deleted: bool = True
+    deleted_messages: int
+    deleted_members: int
+
+
+class RoomGroupAssignRequest(BaseModel):
+    room_ids: list[str] = Field(default_factory=list)
+    # null/blank clears the group on the selected rooms; validated in
+    # app/rooms.py's `_validate_group` (same rules as RoomCreateRequest.group).
+    group: str | None = None
+
+
+class RoomGroupAssignResponse(BaseModel):
+    updated: int
+    # The group actually applied, after trim/blank-to-None -- echoes what
+    # `_validate_group` resolved `group` to, not necessarily the raw input.
+    group: str | None

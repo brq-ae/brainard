@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 from ulid import ULID
 
-from app.models import Machine, OwnerToken, Room, RoomMessage
+from app.models import Machine, OwnerToken, Room, RoomMember, RoomMessage
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
 XSS_SCRIPT = "<script>alert(1)</script>"
@@ -79,6 +79,7 @@ async def _create_room_via_api(
     topic=None,
     sides=None,
     duration_seconds=None,
+    group=None,
 ) -> dict:
     """Room setup via the phase-A /v1/rooms API -- used by UI tests that need
     a room already in a particular mode/topic/sides/deadline state to then
@@ -97,6 +98,8 @@ async def _create_room_via_api(
         body["sides"] = sides
     if duration_seconds is not None:
         body["duration_seconds"] = duration_seconds
+    if group is not None:
+        body["group"] = group
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == 201, resp.json()
     return resp.json()
@@ -926,3 +929,269 @@ def test_rooms_js_renders_via_textcontent_not_innerhtml():
     assert "textContent" in source
     assert "createTextNode" in source
     assert "createElement" in source
+
+
+# --- ADR-0008: room delete + free-form groups (UI) ---
+
+
+# --- create form: group field ---
+
+
+async def test_create_room_form_with_group_sets_group(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={"name": "grouped-room", "agent_a": "a1", "agent_b": "a2", "group": "schema-debates", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+    room = await db_session.get(Room, room_id)
+    assert room.group_name == "schema-debates"
+
+
+async def test_create_room_form_blank_group_leaves_it_null(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={"name": "ungrouped-room", "agent_a": "a1", "agent_b": "a2", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+    room = await db_session.get(Room, room_id)
+    assert room.group_name is None
+
+
+# --- rooms list: group column + filter ---
+
+
+async def test_rooms_list_shows_group_column(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    await _create_room_via_api(client, owner_headers, name="grouped", members=["agent-a", "agent-b"], group="alpha")
+
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    assert "alpha" in resp.text
+
+
+async def test_rooms_list_group_filter_shows_only_matching_group(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    await _create_room_via_api(client, owner_headers, name="in-group-a", members=["a1", "a2"], group="group-a")
+    await _create_room_via_api(client, owner_headers, name="in-group-b", members=["b1", "b2"], group="group-b")
+    await _create_room_via_api(client, owner_headers, name="ungrouped-room", members=["c1", "c2"])
+
+    resp = await client.get("/ui/rooms", params={"group": "group-a"})
+    assert resp.status_code == 200
+    assert "in-group-a" in resp.text
+    assert "in-group-b" not in resp.text
+    assert "ungrouped-room" not in resp.text
+
+
+async def test_rooms_list_no_filter_shows_all_groups(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    await _create_room_via_api(client, owner_headers, name="in-group-a", members=["a1", "a2"], group="group-a")
+    await _create_room_via_api(client, owner_headers, name="ungrouped-room", members=["c1", "c2"])
+
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    assert "in-group-a" in resp.text
+    assert "ungrouped-room" in resp.text
+
+
+# --- rooms list: group XSS ---
+
+
+async def test_rooms_list_group_xss_escaped(client, db_session):
+    from markupsafe import escape as markupsafe_escape
+
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    await _create_room_via_api(
+        client, owner_headers, name="xss-group-room", members=["agent-a", "agent-b"], group=XSS_SCRIPT
+    )
+
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    assert XSS_SCRIPT not in resp.text
+    assert str(markupsafe_escape(XSS_SCRIPT)) in resp.text
+
+
+# --- bulk group assignment ---
+
+
+async def test_bulk_assign_group_sets_group_on_multiple_rooms(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room1 = await _create_room_via_api(client, owner_headers, name="r1", members=["a1", "a2"])
+    room2 = await _create_room_via_api(client, owner_headers, name="r2", members=["b1", "b2"])
+
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms/assign-group",
+        data={"room_ids": [room1["id"], room2["id"]], "group": "bulk-group", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/rooms"
+
+    db_room1 = await db_session.get(Room, room1["id"])
+    db_room2 = await db_session.get(Room, room2["id"])
+    assert db_room1.group_name == "bulk-group"
+    assert db_room2.group_name == "bulk-group"
+
+
+async def test_bulk_assign_group_blank_clears_group(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(
+        client, owner_headers, name="r1", members=["a1", "a2"], group="had-a-group"
+    )
+
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms/assign-group",
+        data={"room_ids": [room["id"]], "group": "", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.group_name is None
+
+
+async def test_bulk_assign_group_without_csrf_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post("/ui/rooms/assign-group", data={"room_ids": [room["id"]], "group": "nope"})
+    assert resp.status_code == 403
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.group_name is None
+
+
+async def test_bulk_assign_group_unknown_id_shows_clean_error(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms/assign-group",
+        data={"room_ids": ["not-a-real-room"], "group": "some-group", "csrf_token": csrf},
+    )
+    assert resp.status_code == 404
+    assert "not-a-real-room" in resp.text
+
+
+async def test_bulk_assign_group_machine_token_cannot_reach_ui(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    machine_token = await _machine_headers(db_session)
+
+    resp = await client.post(
+        "/ui/rooms/assign-group",
+        data={"room_ids": [room["id"]], "group": "nope"},
+        headers=machine_token,
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.group_name is None
+
+
+# --- delete ---
+
+
+async def test_ui_delete_room_removes_room_and_cascades(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="hello")
+
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/delete",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/rooms"
+
+    assert await db_session.get(Room, room["id"]) is None
+    remaining_messages = (
+        await db_session.execute(RoomMessage.__table__.select().where(RoomMessage.__table__.c.room_id == room["id"]))
+    ).all()
+    remaining_members = (
+        await db_session.execute(RoomMember.__table__.select().where(RoomMember.__table__.c.room_id == room["id"]))
+    ).all()
+    assert remaining_messages == []
+    assert remaining_members == []
+
+
+async def test_ui_delete_room_button_present_with_confirm(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="delete-candidate", members=["agent-a", "agent-b"])
+    await _post_message_via_api(client, await _machine_headers(db_session), room["id"], sender="agent-a", text="one")
+
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    assert f"/ui/rooms/{room['id']}/delete" in resp.text
+    assert "data-confirm=" in resp.text
+    assert "permanently" in resp.text.lower()
+
+
+async def test_ui_delete_room_without_csrf_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(f"/ui/rooms/{room['id']}/delete", data={})
+    assert resp.status_code == 403
+    assert await db_session.get(Room, room["id"]) is not None
+
+
+async def test_ui_delete_room_unknown_id_404s(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post("/ui/rooms/not-a-real-room/delete", data={"csrf_token": csrf})
+    assert resp.status_code == 404
+
+
+async def test_ui_delete_room_works_on_closed_room(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    close_resp = await client.post(f"/v1/rooms/{room['id']}/close", json={"reason": "owner"}, headers=owner_headers)
+    assert close_resp.status_code == 200
+
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+    resp = await client.post(f"/ui/rooms/{room['id']}/delete", data={"csrf_token": csrf}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert await db_session.get(Room, room["id"]) is None
+
+
+async def test_ui_delete_room_machine_token_cannot_reach_ui(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    machine_token = await _machine_headers(db_session)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/delete", data={}, headers=machine_token, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+    assert await db_session.get(Room, room["id"]) is not None

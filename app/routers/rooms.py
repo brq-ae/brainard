@@ -23,7 +23,9 @@ from app.rooms import (
     get_recent_messages,
     get_room,
 )
+from app.rooms import assign_group_to_rooms as assign_group_to_rooms_op
 from app.rooms import close_room as close_room_op
+from app.rooms import delete_room as delete_room_op
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_message as post_message_op
@@ -32,7 +34,10 @@ from app.schemas import (
     RoomCloseResponse,
     RoomCreateRequest,
     RoomCreateResponse,
+    RoomDeleteResponse,
     RoomDetailResponse,
+    RoomGroupAssignRequest,
+    RoomGroupAssignResponse,
     RoomListItem,
     RoomListResponse,
     RoomMessageOut,
@@ -60,6 +65,7 @@ async def create_room_endpoint(
         sides=body.sides,
         duration_seconds=body.duration_seconds,
         expires_at=body.expires_at,
+        group=body.group,
     )
     members = await get_members(db, room.id)
     sides = await get_member_sides(db, room.id)
@@ -73,6 +79,7 @@ async def create_room_endpoint(
         topic=room.topic,
         expires_at=room.expires_at,
         sides=sides,
+        group=room.group_name,
     )
 
 
@@ -80,10 +87,13 @@ async def create_room_endpoint(
 async def list_rooms_endpoint(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
+    # ADR-0008: optional exact-match group filter -- omitted means "all
+    # groups", not "ungrouped only" (see app/rooms.py's list_rooms docstring).
+    group: str | None = None,
     _principal: Principal = Depends(require_machine_or_owner),
     db: AsyncSession = Depends(get_db),
 ) -> RoomListResponse:
-    rows, next_cursor = await list_rooms_op(db, cursor=cursor, limit=limit)
+    rows, next_cursor = await list_rooms_op(db, cursor=cursor, limit=limit, group=group)
     room_ids = [r.id for r in rows]
     members_by_room = await get_members_for_rooms(db, room_ids)
     sides_by_room = await get_member_sides_for_rooms(db, room_ids)
@@ -102,11 +112,32 @@ async def list_rooms_endpoint(
                 topic=r.topic,
                 expires_at=r.expires_at,
                 sides=sides_by_room.get(r.id, {}),
+                group=r.group_name,
             )
             for r in rows
         ],
         next_cursor=next_cursor,
     )
+
+
+@router.post("/assign-group", response_model=RoomGroupAssignResponse)
+async def assign_room_group_endpoint(
+    body: RoomGroupAssignRequest,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> RoomGroupAssignResponse:
+    """ADR-0008: bulk-assigns (or clears, group=null/blank) a group label
+    across multiple rooms in one call -- see app/rooms.py's
+    `assign_group_to_rooms` for the all-or-nothing validation (unknown ids
+    404 before anything is written).
+
+    Registered before `GET /{room_id}` in this file so this static path
+    reads clearly next to the other collection-level routes; there is no
+    actual routing ambiguity either way since no other route here is a bare
+    `POST /{room_id}` that "assign-group" could be mistaken for.
+    """
+    updated, resolved_group = await assign_group_to_rooms_op(db, body.room_ids, body.group)
+    return RoomGroupAssignResponse(updated=updated, group=resolved_group)
 
 
 @router.get("/{room_id}", response_model=RoomDetailResponse)
@@ -136,6 +167,7 @@ async def get_room_endpoint(
         topic=room.topic,
         expires_at=room.expires_at,
         sides=sides,
+        group=room.group_name,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
     )
 
@@ -161,6 +193,21 @@ async def close_room_endpoint(
     reason = body.reason if body is not None else None
     room = await close_room_op(db, room_id, reason)
     return RoomCloseResponse(id=room.id, status=room.status, close_reason=room.close_reason, closed_at=room.closed_at)
+
+
+@router.delete("/{room_id}", response_model=RoomDeleteResponse)
+async def delete_room_endpoint(
+    room_id: str,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> RoomDeleteResponse:
+    """ADR-0008: owner-only hard delete -- works on an open OR closed room
+    (delete is independent of a room's open/closed status). 404s for an
+    unknown/already-deleted id (app/rooms.py's `delete_room`), so a repeat
+    call is self-explaining rather than a silent success.
+    """
+    deleted_messages, deleted_members = await delete_room_op(db, room_id)
+    return RoomDeleteResponse(id=room_id, deleted_messages=deleted_messages, deleted_members=deleted_members)
 
 
 # The long-poll. Deliberately takes NO `db: AsyncSession = Depends(get_db)`

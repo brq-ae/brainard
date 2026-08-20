@@ -87,6 +87,22 @@ mode/topic/side/deadline through to `generate_room_join_prompt` (previously
 dead/defaulted params flagged by a prior review) so a debate/critique room's
 join prompts carry the real stance + topic + deadline text, not just the
 generic freeform framing.
+
+ADR-0008 (DELETE + FREE-FORM GROUPS): rooms_list.html gains a per-room
+Delete button (POST /ui/rooms/{id}/delete, owner cookie + CSRF, confirmed
+client-side via the existing generic `data-confirm` handler in
+app/static/main.js -- no new JS file needed), a Group column, a `?group=`
+filter (server-side, via app.rooms.list_rooms's own `group` param), and a
+bulk "assign selected rooms to a group" form (POST /ui/rooms/assign-group).
+The bulk form's room checkboxes live inline in each room row but are NOT
+nested inside the bulk `<form>` (HTML forbids nested forms) -- they use the
+HTML5 `form="rooms-bulk-form"` attribute to associate with the bulk form
+that wraps just the group-name field and submit button, same technique
+needed because each row's own Delete button is *also* its own separate,
+sibling `<form>`. `group` is owner-supplied free text and, like message
+text/sender/topic/member-name above, is untrusted content the moment it
+renders anywhere: rendered here only through ordinary Jinja2 autoescape
+(never `|safe`), same discipline as everywhere else on this page.
 """
 
 import json
@@ -102,9 +118,12 @@ from app.errors import ApiError
 from app.models import Room
 from app.onboarding import TOKEN_PLACEHOLDER, generate_room_join_prompt, resolve_base_url
 from app.room_modes import DEFAULT_MODE, ROOM_MODES
+from app.rooms import assign_group_to_rooms as assign_group_to_rooms_op
 from app.rooms import close_room as close_room_op
 from app.rooms import create_room as create_room_op
+from app.rooms import delete_room as delete_room_op
 from app.rooms import get_member_sides, get_members, get_members_for_rooms, get_recent_messages, get_room
+from app.rooms import list_room_groups as list_room_groups_op
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_message as post_message_op
@@ -268,11 +287,16 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
 async def rooms_list(
     request: Request,
     cursor: str | None = Query(default=None),
+    # ADR-0008: optional exact-match group filter, server-side via
+    # app.rooms.list_rooms's own `group` param -- None/absent means "all
+    # groups" (see that function's docstring).
+    group: str | None = Query(default=None),
     session: dict = Depends(require_ui_session),
     db: AsyncSession = Depends(get_db),
 ):
-    rows, next_cursor = await list_rooms_op(db, cursor=cursor, limit=ROOM_LIST_LIMIT)
+    rows, next_cursor = await list_rooms_op(db, cursor=cursor, limit=ROOM_LIST_LIMIT, group=group)
     members_by_room = await get_members_for_rooms(db, [r.id for r in rows])
+    groups = await list_room_groups_op(db)
     return templates.TemplateResponse(
         request,
         "rooms_list.html",
@@ -285,6 +309,8 @@ async def rooms_list(
             "form": {},
             "room_modes": ROOM_MODES,
             "room_modes_json": ROOM_MODES_JSON,
+            "groups": groups,
+            "group_filter": group,
         },
     )
 
@@ -324,6 +350,11 @@ async def rooms_create(
     duration_preset: str = Form(default=""),
     custom_duration_value: str = Form(default=""),
     custom_duration_unit: str = Form(default="minutes"),
+    # ADR-0008: optional free-form group label, same "trim, blank -> None"
+    # pre-pass as `topic` above -- app.rooms.create_room's own
+    # `_validate_group` re-validates it either way (length cap), same
+    # reasoning as the topic field's own duplicated trim.
+    group: str = Form(default=""),
     session: dict = Depends(require_ui_session),
     _csrf: None = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
@@ -340,6 +371,7 @@ async def rooms_create(
             parsed_max = 0
 
     cleaned_topic = topic.strip() or None
+    cleaned_group = group.strip() or None
     sides = _sides_for_mode(mode, agent_a, agent_b)
     duration_seconds = _parse_duration_seconds(duration_preset, custom_duration_value, custom_duration_unit)
 
@@ -353,10 +385,12 @@ async def rooms_create(
             topic=cleaned_topic,
             sides=sides,
             duration_seconds=duration_seconds,
+            group=cleaned_group,
         )
     except ApiError as exc:
         rows, next_cursor = await list_rooms_op(db, limit=ROOM_LIST_LIMIT)
         members_by_room = await get_members_for_rooms(db, [r.id for r in rows])
+        groups = await list_room_groups_op(db)
         return templates.TemplateResponse(
             request,
             "rooms_list.html",
@@ -376,9 +410,12 @@ async def rooms_create(
                     "duration_preset": duration_preset,
                     "custom_duration_value": custom_duration_value,
                     "custom_duration_unit": custom_duration_unit,
+                    "group": group,
                 },
                 "room_modes": ROOM_MODES,
                 "room_modes_json": ROOM_MODES_JSON,
+                "groups": groups,
+                "group_filter": None,
             },
             status_code=exc.status_code,
         )
@@ -479,3 +516,72 @@ async def room_close(
     except ApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
+
+
+# --- ADR-0008: delete + bulk group assignment ---
+
+
+@router.post("/{room_id}/delete")
+async def room_delete(
+    room_id: str,
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner-only hard delete from the rooms list -- confirmed client-side
+    by rooms_list.html's per-row `data-confirm` (handled by the existing
+    generic listener in app/static/main.js, no new JS needed). Works on an
+    open or closed room; a 404 (unknown/already-deleted id) just becomes an
+    ordinary 404 page, same as `room_view`'s own 404 for a missing room.
+    """
+    try:
+        await delete_room_op(db, room_id)
+    except ApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return RedirectResponse(url="/ui/rooms", status_code=303)
+
+
+@router.post("/assign-group")
+async def rooms_assign_group(
+    request: Request,
+    # Repeated `<input type="checkbox" name="room_ids" ...>` fields --
+    # FastAPI/Starlette collects same-named form fields into a list here.
+    # An owner submitting with nothing checked lands on the domain's own
+    # "non-empty list" ApiError below rather than a silent no-op.
+    room_ids: list[str] = Form(default_factory=list),
+    group: str = Form(default=""),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-assigns (or, given a blank group field, clears) a group label
+    across every checked room -- see app.rooms.assign_group_to_rooms for the
+    all-or-nothing unknown-id validation. Re-renders the rooms list with the
+    domain's self-explaining error on failure, same pattern `rooms_create`
+    above uses, rather than a bare error page.
+    """
+    cleaned_group = group.strip() or None
+    try:
+        await assign_group_to_rooms_op(db, room_ids, cleaned_group)
+    except ApiError as exc:
+        rows, next_cursor = await list_rooms_op(db, limit=ROOM_LIST_LIMIT)
+        members_by_room = await get_members_for_rooms(db, [r.id for r in rows])
+        groups = await list_room_groups_op(db)
+        return templates.TemplateResponse(
+            request,
+            "rooms_list.html",
+            {
+                "csrf_token": session["csrf"],
+                "rooms": rows,
+                "members_by_room": members_by_room,
+                "next_cursor": next_cursor,
+                "error": exc.detail,
+                "form": {},
+                "room_modes": ROOM_MODES,
+                "room_modes_json": ROOM_MODES_JSON,
+                "groups": groups,
+                "group_filter": None,
+            },
+            status_code=exc.status_code,
+        )
+    return RedirectResponse(url="/ui/rooms", status_code=303)
