@@ -167,7 +167,11 @@ def test_room_join_prompt_verbatim_structure():
         '"kind": "done" field to close the room. Also stop if the room status becomes \'closed\' (I may '
         "stop it) or if I tell you to. There is a message cap; if it's reached the room closes "
         "automatically.\n\n"
-        "Keep me informed per G9 (notify me when you're blocked or when the room work is done)."
+        "Keep me informed per G9 (notify me when you're blocked or when the room work is done).\n\n"
+        "The owner may switch this room's mode mid-session. Watch for a system message announcing a new "
+        "mode and your new stance, and adopt it when you see it. If you think a different mode would serve "
+        "the goal better (e.g. moving from critique to a debate), suggest it in the room for the owner to "
+        "decide -- do not switch it yourself."
     )
 
 
@@ -222,10 +226,14 @@ def test_room_join_prompt_safety_framing_present():
 
 def test_room_join_prompt_freeform_default_has_no_session_block():
     # mode defaults to 'freeform' -- output is byte-identical to the
-    # pre-ADR-0007 verbatim structure test above.
+    # pre-ADR-0007 verbatim structure test above (now with ADR-0009's
+    # mode-switch priming paragraph appended, which legitimately mentions
+    # "mid-session" -- so this checks for the ADR-0007 "session block"
+    # marker specifically, not the bare substring "session").
     text = _join_prompt()
-    assert "session" not in text.lower()
     assert "This is a" not in text
+    assert "session.\n\n" not in text
+    assert "The owner may switch this room's mode mid-session." in text  # ADR-0009 priming is always present
 
 
 def test_room_join_prompt_debate_for_side_verbatim():
@@ -301,6 +309,35 @@ def test_room_join_prompt_freeform_ignores_topic_and_deadline():
     text = _join_prompt(mode="freeform", topic="irrelevant", deadline=datetime(2026, 9, 1, tzinfo=UTC))
     assert "This is a" not in text
     assert "the room closes at" not in text
+
+
+# --- ADR-0009: mid-session mode-switch priming paragraph ---
+
+_MODE_SWITCH_PRIMING_TEXT = (
+    "The owner may switch this room's mode mid-session. Watch for a system message announcing a new mode "
+    "and your new stance, and adopt it when you see it. If you think a different mode would serve the goal "
+    "better (e.g. moving from critique to a debate), suggest it in the room for the owner to decide -- do "
+    "not switch it yourself."
+)
+
+
+def test_room_join_prompt_contains_mode_switch_priming_freeform():
+    # Present even for the freeform default -- any room, including one
+    # created freeform, may be switched to something else later.
+    text = _join_prompt()
+    assert _MODE_SWITCH_PRIMING_TEXT in text
+
+
+def test_room_join_prompt_contains_mode_switch_priming_non_freeform():
+    text = _join_prompt(mode="debate", topic="tabs vs spaces", side="for")
+    assert _MODE_SWITCH_PRIMING_TEXT in text
+
+
+def test_room_join_prompt_mode_switch_priming_is_the_last_paragraph():
+    # Appended after the existing "Keep me informed" line -- everything
+    # before it in the prompt is unchanged from the pre-ADR-0009 text.
+    text = _join_prompt()
+    assert text.endswith(_MODE_SWITCH_PRIMING_TEXT)
 
 
 # --- generate_room_join_prompt DNS failsafe (HUB_FALLBACK_URL) ---

@@ -22,6 +22,13 @@ side/deadline: when the room isn't 'freeform', a clearly-marked "session"
 block is inserted between the intro and the poll/reply mechanics, built
 entirely from app/room_modes.py (ROOM_MODES's single-sourced role text and
 closing instruction) -- never duplicated here.
+
+ADR-0009 further extends `generate_room_join_prompt` with a short, mode-
+independent priming paragraph (`_MODE_SWITCH_PRIMING`, appended
+unconditionally, after the poll/reply mechanics): the owner may switch a
+room's mode mid-session (app/rooms.py's `switch_room_mode`), and a joining
+agent needs to know to watch for the resulting system announcement, adopt
+the new stance, and suggest -- never perform -- a switch itself.
 """
 
 from datetime import UTC, datetime
@@ -34,6 +41,18 @@ from app.room_modes import ROOM_MODES, closing_instruction_for, role_text_for
 
 TOKEN_PLACEHOLDER = "<token>"
 PROJECT_PLACEHOLDER = "<PROJECT>"
+
+# ADR-0009: mid-session mode switching. Single-sourced here (not duplicated
+# per-mode in app/room_modes.py) since the priming is identical regardless
+# of the room's mode at join time -- even a freeform room may be switched to
+# something else later. Appended, unconditionally, to every generated
+# room-join prompt below.
+_MODE_SWITCH_PRIMING = (
+    "The owner may switch this room's mode mid-session. Watch for a system message announcing a new mode "
+    "and your new stance, and adopt it when you see it. If you think a different mode would serve the goal "
+    "better (e.g. moving from critique to a debate), suggest it in the room for the owner to decide -- do "
+    "not switch it yourself."
+)
 
 
 def resolve_base_url(request: Request) -> str:
@@ -254,7 +273,7 @@ def generate_room_join_prompt(
     paragraphs = [intro]
     if session_block is not None:
         paragraphs.append(session_block)
-    paragraphs.extend([how_to, keep_me_informed])
+    paragraphs.extend([how_to, keep_me_informed, _MODE_SWITCH_PRIMING])
 
     text = "\n\n".join(paragraphs)
     fallback_url = resolve_fallback_url()

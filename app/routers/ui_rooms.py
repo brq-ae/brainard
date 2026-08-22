@@ -103,6 +103,17 @@ sibling `<form>`. `group` is owner-supplied free text and, like message
 text/sender/topic/member-name above, is untrusted content the moment it
 renders anywhere: rendered here only through ordinary Jinja2 autoescape
 (never `|safe`), same discipline as everywhere else on this page.
+
+ADR-0009 (MID-SESSION MODE SWITCH): room_view.html gains an owner-only
+"Switch mode" form (POST /ui/rooms/{id}/switch-mode, owner cookie + CSRF,
+hidden once the room is closed) -- a mode dropdown and a topic field, same
+ROOM_MODES/ROOM_MODES_JSON/`room_form.js` reuse as the create-room form's
+own mode dropdown (see `_room_context`). Sides for an asymmetric target are
+derived server-side from the room's fixed member order (`_sides_for_mode`,
+reused unchanged), never taken from the form. All mode/topic/sides
+validation, the row lock, and the system announcement live entirely in
+app.rooms.switch_room_mode -- this route only resolves the form into that
+function's parameters, same posture as `rooms_create` above.
 """
 
 import json
@@ -127,6 +138,7 @@ from app.rooms import list_room_groups as list_room_groups_op
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_message as post_message_op
+from app.rooms import switch_room_mode as switch_room_mode_op
 from app.templates_env import templates
 from app.ui_auth import require_csrf, require_ui_session
 
@@ -277,6 +289,11 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
         "messages": messages,
         "last_seq": last_seq,
         "join_prompts": _join_prompts_by_member(request, room, members, sides),
+        # ADR-0009: the switch-mode form's mode dropdown, sourced from the
+        # same ROOM_MODES/ROOM_MODES_JSON the create-room form uses (never a
+        # second, divergent mode list) -- see this module's docstring.
+        "room_modes": ROOM_MODES,
+        "room_modes_json": ROOM_MODES_JSON,
     }
 
 
@@ -515,6 +532,52 @@ async def room_close(
         await close_room_op(db, room_id, "owner")
     except ApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
+
+
+# --- ADR-0009: mid-session mode switch ---
+
+
+@router.post("/{room_id}/switch-mode")
+async def room_switch_mode(
+    room_id: str,
+    request: Request,
+    mode: str = Form(...),
+    topic: str = Form(default=""),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner-only mid-session mode switch from the live room view -- mirrors
+    `rooms_create`'s own posture: resolve the form's shape into
+    app.rooms.switch_room_mode's plain parameters and let its ApiErrors
+    render as a clean re-render of this same page, never a bare error page.
+    All actual mode/topic/sides validation and the row-locked update +
+    announcement post live in that one domain function (app/rooms.py) --
+    nothing about validity is re-checked here.
+
+    `sides` is NOT read from this form: like `_sides_for_mode` for the
+    create-room form, an asymmetric target mode's two sides are derived
+    server-side from the room's own two existing members, in their existing
+    (fixed since create) order -- non-spoofable, since there is no hidden
+    field a crafted request could use to swap which agent gets which side.
+    """
+    cleaned_topic = topic.strip() or None
+    members = await get_members(db, room_id)
+    sides = _sides_for_mode(mode, members[0], members[1]) if len(members) == 2 else None
+
+    try:
+        await switch_room_mode_op(db, room_id, mode, cleaned_topic, sides)
+    except ApiError as exc:
+        ctx = await _room_context(db, request, room_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.") from exc
+        return templates.TemplateResponse(
+            request,
+            "room_view.html",
+            {"csrf_token": session["csrf"], "error": exc.detail, **ctx},
+            status_code=exc.status_code,
+        )
     return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
 
 

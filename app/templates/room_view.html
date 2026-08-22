@@ -68,6 +68,36 @@
   </form>
 </div>
 
+<div class="panel" id="room-switch-mode-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>
+  <details class="machine-details">
+    <summary>Switch mode</summary>
+    <p class="meta">
+      Changes the room's mode/topic (and, for an asymmetric mode, each member's side) mid-session, and posts
+      a system announcement so both agents see their new stance.
+    </p>
+    <form method="post" action="/ui/rooms/{{ room.id }}/switch-mode">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="field">
+        <label for="mode">Mode</label>
+        <select id="mode" name="mode">
+          {% for key, m in room_modes.items() %}
+          <option value="{{ key }}" {% if room.mode == key %}selected{% endif %}>{{ m.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="topic" id="topic-label">Topic</label>
+        <input type="text" id="topic" name="topic" value="{{ room.topic or '' }}" placeholder="Required for non-freeform modes">
+      </div>
+      <p class="meta">
+        For an asymmetric mode, {{ members[0] }} gets the mode's first side and {{ members[1] }} gets the
+        second (assigned server-side, in the room's existing member order).
+      </p>
+      <button type="submit" class="btn primary">Switch mode</button>
+    </form>
+  </details>
+</div>
+
 <div class="panel">
   <details class="machine-details">
     <summary>Join prompts</summary>
@@ -79,5 +109,11 @@
   </details>
 </div>
 
+<!-- Data for app/static/room_form.js's mode->topic-required handler, reused
+     unchanged from the create-room form (rooms_list.html) -- same
+     server-trusted, static ROOM_MODES payload, sourced from
+     app/routers/ui_rooms.py's `_room_context`. -->
+<script type="application/json" id="room-modes-data">{{ room_modes_json }}</script>
+<script src="/static/room_form.js"></script>
 <script src="/static/rooms.js"></script>
 {% endblock %}

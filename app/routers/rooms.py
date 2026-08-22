@@ -29,6 +29,7 @@ from app.rooms import delete_room as delete_room_op
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_message as post_message_op
+from app.rooms import switch_room_mode as switch_room_mode_op
 from app.schemas import (
     RoomCloseRequest,
     RoomCloseResponse,
@@ -42,6 +43,8 @@ from app.schemas import (
     RoomListResponse,
     RoomMessageOut,
     RoomMessagesPollResponse,
+    RoomModeSwitchRequest,
+    RoomModeSwitchResponse,
     RoomPostMessageRequest,
     RoomPostMessageResponse,
 )
@@ -193,6 +196,24 @@ async def close_room_endpoint(
     reason = body.reason if body is not None else None
     room = await close_room_op(db, room_id, reason)
     return RoomCloseResponse(id=room.id, status=room.status, close_reason=room.close_reason, closed_at=room.closed_at)
+
+
+@router.post("/{room_id}/mode", response_model=RoomModeSwitchResponse)
+async def switch_room_mode_endpoint(
+    room_id: str,
+    body: RoomModeSwitchRequest,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> RoomModeSwitchResponse:
+    """ADR-0009: owner-only mid-session mode switch -- see app/rooms.py's
+    `switch_room_mode` for the validation/locking/announcement logic; this
+    route only wires the request/response shapes to it.
+    """
+    room, announcement = await switch_room_mode_op(db, room_id, body.mode, body.topic, body.sides)
+    sides = await get_member_sides(db, room.id)
+    return RoomModeSwitchResponse(
+        id=room.id, mode=room.mode, topic=room.topic, sides=sides, announcement=announcement
+    )
 
 
 @router.delete("/{room_id}", response_model=RoomDeleteResponse)

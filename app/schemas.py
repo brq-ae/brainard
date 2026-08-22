@@ -594,6 +594,36 @@ class RoomMessagesPollResponse(BaseModel):
     messages: list[RoomMessageOut]
 
 
+# --- Mid-session mode switch (ADR-0009) ---
+
+
+class RoomModeSwitchRequest(BaseModel):
+    # Plain str (not a pydantic Literal), validated in app/rooms.py's
+    # switch_room_mode via app/room_modes.py's validate_mode -- same
+    # self-explaining-ApiError reasoning as RoomCreateRequest.mode above.
+    mode: str
+    # Required (non-empty) whenever mode != 'freeform'; ignored for
+    # freeform -- enforced in app/rooms.py's switch_room_mode, same rule as
+    # RoomCreateRequest.topic.
+    topic: str | None = None
+    # Required for an asymmetric target mode (debate, critique): {agent_name:
+    # side}, covering both of the room's members with both of the mode's
+    # distinct side values. Ignored for a symmetric target (freeform,
+    # collaborate, brainstorm) -- same rule as RoomCreateRequest.sides.
+    sides: dict[str, str] | None = None
+
+
+class RoomModeSwitchResponse(BaseModel):
+    id: str
+    mode: str
+    topic: str | None
+    # {agent_name: side} -- side is null for symmetric/freeform members.
+    sides: dict[str, str | None]
+    # The kind='system' announcement text posted into the room's transcript
+    # by this switch.
+    announcement: str
+
+
 # --- Room delete + free-form groups (ADR-0008) ---
 
 

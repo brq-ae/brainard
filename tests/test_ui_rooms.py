@@ -1195,3 +1195,180 @@ async def test_ui_delete_room_machine_token_cannot_reach_ui(client, db_session):
     assert resp.headers["location"] == "/ui/login"
 
     assert await db_session.get(Room, room["id"]) is not None
+
+
+# --- ADR-0009: mid-session mode switch (UI) ---
+
+
+async def test_room_view_shows_switch_mode_control_when_open(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Switch mode" in resp.text
+    assert f'action="/ui/rooms/{room["id"]}/switch-mode"' in resp.text
+
+
+async def test_room_view_hides_switch_mode_control_when_closed(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await client.post(f"/v1/rooms/{room['id']}/close", json={}, headers=owner_headers)
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert 'id="room-switch-mode-panel" style="display:none"' in resp.text
+
+
+async def test_ui_switch_mode_updates_room_and_header_reflects_it(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/switch-mode",
+        data={"mode": "debate", "topic": "cats vs dogs", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == f"/ui/rooms/{room['id']}"
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.mode == "debate"
+    assert db_room.topic == "cats vs dogs"
+
+    # agent-a is the first member (create order) -> the mode's first side
+    # ('for'); agent-b -> the second ('against') -- server-derived, not
+    # taken from the form (see _sides_for_mode).
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["sides"] == {"agent-a": "for", "agent-b": "against"}
+
+    # The header (re-rendered fresh on the redirect-followed GET) reflects
+    # the new mode/topic/sides.
+    view = await client.get(f"/ui/rooms/{room['id']}")
+    assert "Debate" in view.text
+    assert "cats vs dogs" in view.text
+    assert "(For)" in view.text
+    assert "(Against)" in view.text
+
+    # The system announcement appears in the transcript too.
+    assert "Mode switched to Debate." in view.text
+
+
+async def test_ui_switch_mode_without_csrf_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(f"/ui/rooms/{room['id']}/switch-mode", data={"mode": "debate", "topic": "x"})
+    assert resp.status_code == 403
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.mode == "freeform"
+
+
+async def test_ui_switch_mode_non_freeform_without_topic_shows_clean_error(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/switch-mode",
+        data={"mode": "debate", "topic": "", "csrf_token": csrf},
+    )
+    assert resp.status_code == 422
+    assert "topic" in resp.text.lower()
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.mode == "freeform"  # untouched by the rejected switch
+
+
+async def test_ui_switch_mode_closed_room_shows_clean_error(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await client.post(f"/v1/rooms/{room['id']}/close", json={}, headers=owner_headers)
+
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/switch-mode",
+        data={"mode": "debate", "topic": "cats vs dogs", "csrf_token": csrf},
+    )
+    assert resp.status_code == 409
+    assert "closed" in resp.text.lower()
+
+
+async def test_ui_switch_mode_machine_token_cannot_reach_ui(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    machine_token = await _machine_headers(db_session)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/switch-mode",
+        data={"mode": "debate", "topic": "x"},
+        headers=machine_token,
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.mode == "freeform"
+
+
+async def test_ui_switch_mode_topic_xss_escaped_in_header_and_announcement(client, db_session):
+    """A room topic set via a mode switch is owner-supplied but still
+    untrusted content, same as at create time (ADR-0007) -- it now also
+    renders inside the switch's own system announcement (ADR-0009). Both
+    the header and the transcript (which shows the announcement like any
+    other message) must render it escaped, never raw. Covers the same
+    4-payload matrix as test_room_join_prompt_xss_member_name_escaped: a
+    <script> tag, an <img onerror> tag, and two attribute/quote-breakout
+    payloads (a bare '"><img ...' close-and-inject, and a mixed-quote
+    'onmouseover=' payload).
+    """
+    from markupsafe import escape as markupsafe_escape
+
+    owner_headers = await _owner_headers_and_login(client, db_session)
+
+    for i, payload in enumerate((XSS_SCRIPT, XSS_IMG, XSS_ATTR_BREAKOUT, XSS_QUOTE_BREAKOUT)):
+        room = await _create_room_via_api(
+            client, owner_headers, name=f"switch-xss-room-{i}", members=["agent-a", "agent-b"]
+        )
+
+        page = await client.get(f"/ui/rooms/{room['id']}")
+        csrf = _extract_csrf(page.text)
+
+        resp = await client.post(
+            f"/ui/rooms/{room['id']}/switch-mode",
+            data={"mode": "debate", "topic": payload, "csrf_token": csrf},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+
+        view = await client.get(f"/ui/rooms/{room['id']}")
+        assert view.status_code == 200
+        assert payload not in view.text
+
+        escaped = str(markupsafe_escape(payload))
+        assert escaped in view.text
+
+        # Split at "Transcript" so the header portion (room.topic, rendered
+        # plain via Jinja2 autoescape) and the transcript portion (the
+        # announcement message, rendered exactly like any other message row)
+        # are each checked independently -- both must carry the escaped
+        # form, neither the raw one.
+        marker = "Transcript"
+        assert marker in view.text
+        header_part, transcript_part = view.text.split(marker, 1)
+
+        assert payload not in header_part
+        assert escaped in header_part  # topic shown in the header, escaped
+
+        assert payload not in transcript_part
+        assert escaped in transcript_part  # topic shown inside the announcement message, escaped
+        assert "Mode switched to Debate." in transcript_part

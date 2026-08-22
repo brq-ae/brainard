@@ -14,9 +14,11 @@ import app.notify as notify_module
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
 from app.models import Machine, OwnerToken, Room, RoomMember, RoomMessage
+from app.rooms import close_room as close_room_op
 from app.rooms import delete_room as delete_room_op
 from app.rooms import post_closing_nudge as post_closing_nudge_op
 from app.rooms import post_message as post_message_op
+from app.rooms import switch_room_mode as switch_room_mode_op
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
 
@@ -1454,3 +1456,595 @@ async def test_delete_room_race_delete_already_gone_is_clean_404(client, db_sess
         except ApiError as exc:
             assert exc.code == "room_not_found"
             assert exc.status_code == 404
+
+
+# --- ADR-0009: mid-session mode switch ---
+
+
+async def _get_latest_message(client, headers, room_id) -> dict:
+    detail = await client.get(f"/v1/rooms/{room_id}", headers=headers)
+    assert detail.status_code == 200
+    messages = detail.json()["messages"]
+    assert messages
+    return messages[-1]
+
+
+async def test_switch_mode_freeform_to_debate_sets_sides_and_posts_announcement(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={
+            "mode": "debate",
+            "topic": "cats vs dogs",
+            "sides": {"agent-a": "for", "agent-b": "against"},
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    assert data["mode"] == "debate"
+    assert data["topic"] == "cats vs dogs"
+    assert data["sides"] == {"agent-a": "for", "agent-b": "against"}
+    assert "Mode switched to Debate." in data["announcement"]
+    assert "Topic: cats vs dogs." in data["announcement"]
+    assert "agent-a (For): You argue FOR the proposition: cats vs dogs." in data["announcement"]
+    assert "agent-b (Against): You argue AGAINST the proposition: cats vs dogs." in data["announcement"]
+
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.status_code == 200
+    detail_data = detail.json()
+    assert detail_data["status"] == "open"  # a switch never itself closes the room
+    assert detail_data["mode"] == "debate"
+    assert detail_data["sides"] == {"agent-a": "for", "agent-b": "against"}
+
+    latest = await _get_latest_message(client, owner_headers, room["id"])
+    assert latest["kind"] == "system"
+    assert latest["sender"] == "system"
+    assert latest["text"] == data["announcement"]
+
+
+async def test_switch_mode_debate_to_critique_reassigns_sides(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client,
+        owner_headers,
+        members=["agent-a", "agent-b"],
+        mode="debate",
+        topic="cats vs dogs",
+        sides={"agent-a": "for", "agent-b": "against"},
+    )
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={
+            "mode": "critique",
+            "topic": "the new schema",
+            "sides": {"agent-a": "critic", "agent-b": "proposer"},
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    assert data["mode"] == "critique"
+    assert data["sides"] == {"agent-a": "critic", "agent-b": "proposer"}
+    assert "agent-a (Critic):" in data["announcement"]
+    assert "agent-b (Proposer):" in data["announcement"]
+
+
+async def test_switch_mode_to_symmetric_non_freeform_posts_shared_stance(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client,
+        owner_headers,
+        members=["agent-a", "agent-b"],
+        mode="debate",
+        topic="cats vs dogs",
+        sides={"agent-a": "for", "agent-b": "against"},
+    )
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "collaborate", "topic": "ship the v2 API"},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    assert data["mode"] == "collaborate"
+    assert data["sides"] == {"agent-a": None, "agent-b": None}  # sides cleared
+    assert "Both agents:" in data["announcement"]
+    assert "Collaborate with the other agent to ship the v2 API." in data["announcement"]
+
+
+async def test_switch_mode_to_freeform_clears_topic_and_sides(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client,
+        owner_headers,
+        members=["agent-a", "agent-b"],
+        mode="debate",
+        topic="cats vs dogs",
+        sides={"agent-a": "for", "agent-b": "against"},
+    )
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/mode", json={"mode": "freeform"}, headers=owner_headers)
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    assert data["mode"] == "freeform"
+    assert data["topic"] is None
+    assert data["sides"] == {"agent-a": None, "agent-b": None}
+    assert data["announcement"] == "Mode switched to Freeform."
+
+
+async def test_switch_mode_non_freeform_without_topic_rejected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "debate", "sides": {"agent-a": "for", "agent-b": "against"}},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "missing_room_topic"
+
+    # Untouched by the rejected switch.
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["mode"] == "freeform"
+
+
+async def test_switch_mode_asymmetric_without_proper_sides_rejected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "debate", "topic": "cats vs dogs"},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_sides"
+
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["mode"] == "freeform"
+
+
+async def test_switch_mode_rejects_bad_mode(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode", json={"mode": "nonsense"}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_room_mode"
+
+
+async def test_switch_mode_closed_room_rejected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await client.post(f"/v1/rooms/{room['id']}/close", json={}, headers=owner_headers)
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "debate", "topic": "cats vs dogs", "sides": {"agent-a": "for", "agent-b": "against"}},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "room_closed"
+
+
+async def test_switch_mode_unknown_room_404(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms/not-a-real-room/mode", json={"mode": "freeform"}, headers=owner_headers
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "room_not_found"
+
+
+async def test_switch_mode_requires_owner_token(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/mode", json={"mode": "freeform"}, headers=machine_headers)
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "owner_token_required"
+
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["mode"] == "freeform"  # unaffected by the rejected attempt
+
+
+async def test_switch_mode_requires_auth(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/mode", json={"mode": "freeform"})
+    assert resp.status_code == 401
+
+
+async def test_switch_mode_announcement_counts_toward_cap_but_never_trips_it(client, db_session):
+    """ADR-0009 decision 3: the announcement counts as a message toward the
+    cap, but the switch itself must never trip the cap-auto-close -- same
+    posture as post_closing_nudge's own sweeper message.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], max_messages=1)
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "debate", "topic": "cats vs dogs", "sides": {"agent-a": "for", "agent-b": "against"}},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200, resp.json()
+
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    data = detail.json()
+    assert data["message_count"] == 1  # reached the cap...
+    assert data["status"] == "open"  # ...but the room was NOT auto-closed
+    assert data["close_reason"] is None
+
+
+# --- switch_room_mode row-lock race safety (same forced-interleaving
+# technique as delete_room's own race tests above) ---
+
+
+async def test_switch_mode_race_switch_wins_against_post_message(client, db_session):
+    """Interleaving A: switch_room_mode acquires the lock first and holds it
+    (via the delayed commit) while a concurrent post_message tries to post
+    -- the poster must genuinely block, then see the switch's already-
+    updated mode/sides once it proceeds. Never a 500/IntegrityError, never a
+    lost update.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_switch():
+            async with winner_session:
+                return await switch_room_mode_op(
+                    winner_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                )
+
+        async def run_post():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await post_message_op(loser_session, room_id, "agent-a", "hello", "message")
+
+        start = time.monotonic()
+        switch_result, post_result = await asyncio.gather(run_switch(), run_post())
+        elapsed = time.monotonic() - start
+
+        # Genuine blocking, not decoupled timing luck.
+        assert elapsed >= COMMIT_DELAY
+
+        room_after_switch, announcement = switch_result
+        assert room_after_switch.mode == "debate"
+        message, room_after_post = post_result
+        assert room_after_post.status == "open"
+        # The post landed strictly after the switch's announcement (seq 1),
+        # so it must be seq 2 -- proving the lock serialized the two writes
+        # rather than letting them interleave.
+        assert message.seq == 2
+
+        async with AsyncSessionLocal() as check_session:
+            final_room = await check_session.get(Room, room_id)
+            assert final_room.mode == "debate"
+            assert final_room.message_count == 2
+
+
+async def test_switch_mode_race_post_message_wins_against_switch(client, db_session):
+    """Interleaving B: post_message acquires the lock first and holds it
+    while switch_room_mode tries to switch -- switch must genuinely block,
+    then proceed once the post has committed, seeing the up-to-date
+    message_count/seq (no lost update).
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_post():
+            async with winner_session:
+                return await post_message_op(winner_session, room_id, "agent-a", "hello", "message")
+
+        async def run_switch():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await switch_room_mode_op(
+                    loser_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                )
+
+        start = time.monotonic()
+        post_result, switch_result = await asyncio.gather(run_post(), run_switch())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        message, room_after_post = post_result
+        assert message.seq == 1
+        room_after_switch, announcement = switch_result
+        assert room_after_switch.mode == "debate"
+
+        async with AsyncSessionLocal() as check_session:
+            final_room = await check_session.get(Room, room_id)
+            assert final_room.mode == "debate"
+            assert final_room.message_count == 2  # the post + the switch's announcement, no lost update
+
+
+async def test_switch_mode_race_switch_wins_against_close(client, db_session):
+    """Interleaving A against close_room: switch_room_mode holds the lock
+    first, so a concurrent owner close must genuinely block, then close the
+    room in its now-switched state.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_switch():
+            async with winner_session:
+                return await switch_room_mode_op(
+                    winner_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                )
+
+        async def run_close():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await close_room_op(loser_session, room_id, "owner")
+
+        start = time.monotonic()
+        switch_result, close_result = await asyncio.gather(run_switch(), run_close())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        room_after_switch, _announcement = switch_result
+        assert room_after_switch.mode == "debate"
+        assert close_result.status == "closed"
+        assert close_result.close_reason == "owner"
+
+
+async def test_switch_mode_race_close_wins_against_switch(client, db_session):
+    """Interleaving B against close_room: an owner close holds the lock
+    first -- the concurrent switch must genuinely block, then see the
+    room already closed and reject cleanly (409 room_closed), never a
+    500 and never a mode change applied to a closed room.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_close():
+            async with winner_session:
+                return await close_room_op(winner_session, room_id, "owner")
+
+        async def run_switch():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                try:
+                    return await switch_room_mode_op(
+                        loser_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                    )
+                except ApiError as exc:
+                    return exc
+
+        start = time.monotonic()
+        close_result, switch_result = await asyncio.gather(run_close(), run_switch())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        assert close_result.status == "closed"
+        assert isinstance(switch_result, ApiError)
+        assert switch_result.code == "room_closed"
+
+        async with AsyncSessionLocal() as check_session:
+            final_room = await check_session.get(Room, room_id)
+            assert final_room.mode == "freeform"  # the rejected switch never applied
+
+
+async def test_switch_mode_race_switch_wins_against_post_closing_nudge(client, db_session):
+    """Interleaving A against post_closing_nudge: switch_room_mode holds the
+    lock first (posting its announcement, seq 1) -- the sweeper's nudge must
+    genuinely block, then post its own message (seq 2) once the switch has
+    committed. Neither writer's `message_count` increment is lost.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_switch():
+            async with winner_session:
+                return await switch_room_mode_op(
+                    winner_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                )
+
+        async def run_nudge():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await post_closing_nudge_op(loser_session, room_id, "closing soon")
+
+        start = time.monotonic()
+        switch_result, nudge_result = await asyncio.gather(run_switch(), run_nudge())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        room_after_switch, _announcement = switch_result
+        assert room_after_switch.mode == "debate"
+        assert nudge_result is not None  # room was still open when the nudge's lock was acquired
+        assert nudge_result.seq == 2  # strictly after the switch's own announcement (seq 1)
+
+        async with AsyncSessionLocal() as check_session:
+            final_room = await check_session.get(Room, room_id)
+            assert final_room.mode == "debate"
+            assert final_room.message_count == 2  # both writers' increments landed, no lost update
+            assert final_room.closing_warned_at is not None
+
+
+async def test_switch_mode_race_post_closing_nudge_wins_against_switch(client, db_session):
+    """Interleaving B against post_closing_nudge: the sweeper's nudge holds
+    the lock first (posting its own message, seq 1) -- switch_room_mode
+    must genuinely block, then proceed once the nudge has committed, seeing
+    the up-to-date message_count/seq for its own announcement (seq 2). No
+    lost update either way.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_nudge():
+            async with winner_session:
+                return await post_closing_nudge_op(winner_session, room_id, "closing soon")
+
+        async def run_switch():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await switch_room_mode_op(
+                    loser_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                )
+
+        start = time.monotonic()
+        nudge_result, switch_result = await asyncio.gather(run_nudge(), run_switch())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        assert nudge_result is not None
+        assert nudge_result.seq == 1
+        room_after_switch, _announcement = switch_result
+        assert room_after_switch.mode == "debate"
+
+        async with AsyncSessionLocal() as check_session:
+            final_room = await check_session.get(Room, room_id)
+            assert final_room.mode == "debate"
+            assert final_room.message_count == 2  # the nudge + the switch's announcement, no lost update
+
+
+async def test_switch_mode_race_switch_wins_against_delete_room(client, db_session):
+    """Interleaving A against delete_room: switch_room_mode holds the lock
+    first (posting its announcement, seq 1) -- the concurrent delete must
+    genuinely block, then delete the room's now fully-switched state
+    INCLUDING the announcement message, with no orphaned rows and no FK
+    violation.
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_switch():
+            async with winner_session:
+                return await switch_room_mode_op(
+                    winner_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                )
+
+        async def run_delete():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await delete_room_op(loser_session, room_id)
+
+        start = time.monotonic()
+        switch_result, delete_result = await asyncio.gather(run_switch(), run_delete())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        room_after_switch, _announcement = switch_result
+        assert room_after_switch.mode == "debate"
+
+        messages_deleted, members_deleted = delete_result
+        assert messages_deleted == 1  # the switch's own announcement, cleanly swept up -- no FK violation
+        assert members_deleted == 2
+
+        assert await db_session.get(Room, room_id) is None
+        remaining = (
+            await db_session.execute(
+                RoomMessage.__table__.select().where(RoomMessage.__table__.c.room_id == room_id)
+            )
+        ).all()
+        assert remaining == []
+
+
+async def test_switch_mode_race_delete_room_wins_against_switch(client, db_session):
+    """Interleaving B against delete_room: delete_room holds the lock first
+    and fully removes the room -- the concurrent switch must genuinely
+    block, then see the room gone and report a clean 404 room_not_found
+    (never a spurious invalid_room_sides -- the room-existence check inside
+    switch_room_mode must win over the sides-validation check that would
+    otherwise fire against an empty, post-delete membership list -- and
+    never a 500).
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+        room_id = room["id"]
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_delete():
+            async with winner_session:
+                return await delete_room_op(winner_session, room_id)
+
+        async def run_switch():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                try:
+                    return await switch_room_mode_op(
+                        loser_session, room_id, "debate", "cats vs dogs", {"agent-a": "for", "agent-b": "against"}
+                    )
+                except ApiError as exc:
+                    return exc
+
+        start = time.monotonic()
+        delete_result, switch_result = await asyncio.gather(run_delete(), run_switch())
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= COMMIT_DELAY
+
+        messages_deleted, members_deleted = delete_result
+        assert messages_deleted == 0
+        assert members_deleted == 2
+
+        assert isinstance(switch_result, ApiError)
+        assert switch_result.code == "room_not_found"
+        assert switch_result.status_code == 404
+
+        assert await db_session.get(Room, room_id) is None

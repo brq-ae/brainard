@@ -24,7 +24,7 @@ from app.db import AsyncSessionLocal
 from app.errors import ApiError
 from app.models import Room, RoomMember, RoomMessage
 from app.notify import notify_room_closed
-from app.room_modes import DEFAULT_MODE, ROOM_MODES, validate_mode
+from app.room_modes import DEFAULT_MODE, ROOM_MODES, role_text_for, validate_mode
 
 # --- room creation ---
 
@@ -699,6 +699,175 @@ async def post_closing_nudge(db: AsyncSession, room_id: str, text: str) -> RoomM
     room.closing_warned_at = now
     await db.commit()
     return message
+
+
+# --- POST /v1/rooms/{id}/mode (ADR-0009: mid-session, owner-only mode switch) ---
+
+
+def _mode_switch_announcement(
+    mode: str, topic: str | None, members: list[str], member_sides: dict[str, str | None]
+) -> str:
+    """The kind='system' announcement text `switch_room_mode` posts (ADR-0009
+    decision 2): "Mode switched to <label>.[ Topic: <topic>.][ <per-agent or
+    shared stance line(s)>]". Every word of stance text is drawn from
+    app/room_modes.py's single-sourced `role_text_for` -- never duplicated
+    here -- same discipline app/onboarding.py's `_room_session_block` uses
+    for the join prompt's own stance paragraph.
+
+    Asymmetric target (debate/critique): one line per member, in `members`
+    order, "<agent> (<side label>): <that member's real per-side role text,
+    with the *other* member as the real partner name>" -- identical stance
+    text to what that agent's own join prompt would show for this mode and
+    side.
+
+    Symmetric non-freeform target (collaborate/brainstorm): a single "Both
+    agents: <shared role text>" line. `role_text_for` is written from one
+    agent's perspective and needs a partner name to fill into its template
+    (e.g. "Collaborate with {partner} to ..."); since this one line
+    addresses both members at once, "the other agent" stands in for a real
+    name here -- the only member-name substitution in this whole
+    announcement that isn't a real agent name, and deliberately so: there is
+    no single "the partner" for a line describing both members together.
+
+    Freeform target: `role_text_for` returns None (no stance text, same as
+    the join prompt) -- the announcement is just the mode (plus topic, if
+    one happens to be stored for it).
+    """
+    mode_def = ROOM_MODES[mode]
+    parts = [f"Mode switched to {mode_def.label}."]
+    if topic:
+        parts.append(f"Topic: {topic}.")
+
+    if mode_def.role_text is None:
+        pass  # freeform: no special stance text, same as the join prompt
+    elif not mode_def.symmetric:
+        agent_a, agent_b = members[0], members[1]
+        side_a, side_b = member_sides[agent_a], member_sides[agent_b]
+        stance_a = role_text_for(mode, side_a, topic or "", agent_b)
+        stance_b = role_text_for(mode, side_b, topic or "", agent_a)
+        parts.append(f"{agent_a} ({mode_def.side_labels[side_a]}): {stance_a}")
+        parts.append(f"{agent_b} ({mode_def.side_labels[side_b]}): {stance_b}")
+    else:
+        shared_stance = role_text_for(mode, None, topic or "", "the other agent")
+        parts.append(f"Both agents: {shared_stance}")
+
+    return " ".join(parts)
+
+
+async def switch_room_mode(
+    db: AsyncSession, room_id: str, mode: str, topic: str | None, sides: dict[str, str] | None
+) -> tuple[Room, str]:
+    """ADR-0009: mid-session, owner-only mode switch (app/routers/rooms.py's
+    POST /v1/rooms/{id}/mode, and its UI mirror, app/routers/ui_rooms.py's
+    POST /ui/rooms/{id}/switch-mode). Reuses `validate_mode`/`_validate_topic`/
+    `_validate_sides` -- the exact same validators `create_room` uses -- so a
+    switch can never land a room in a mode/topic/sides combination
+    `create_room` itself would have rejected.
+
+    Takes the room's row lock -- same `SELECT ... FOR UPDATE` +
+    `populate_existing` pattern `post_message`/`close_room`/
+    `post_closing_nudge`/`delete_room` all use in this file -- across the
+    mode/topic/side update AND the system announcement post, in one commit:
+    two concurrent switches (or a switch racing a post/close/delete) always
+    serialize on this lock, so no writer ever observes a half-applied switch
+    (mode changed but sides not yet updated) or clobbers another writer's
+    concurrent change. Room membership (the two `RoomMember` rows) is
+    re-read and `_validate_sides`-checked only *after* the lock is acquired
+    -- deliberately later than this file's other mutators re-validate their
+    own preconditions, because unlike a sender-membership check (immutable
+    after create), this function is itself what mutates member rows: reading
+    `members` before the lock would risk observing a concurrent
+    `delete_room`'s already-committed, mid-flight-emptied membership and
+    misreporting a spurious "bad sides" 422 instead of the correct 404. By
+    the time this call holds the lock, `delete_room`'s own lock acquisition
+    has either already fully committed (room gone -> the 404 just below
+    fires) or is still blocked behind this call -- `members` read under the
+    lock is therefore always either "the room's real, still-existing two
+    members" or unreachable, never a torn in-between read.
+
+    Only an open room may switch (self-explaining 'room_closed', re-checked
+    under the lock for the same race reason `close_room`'s own status
+    re-check documents). The announcement is posted the same way
+    `post_closing_nudge` posts the sweeper's nudge: it takes the next `seq`
+    and increments `message_count` (so it counts toward the room's cap, per
+    ADR-0009 decision 3) but deliberately bypasses `post_message`'s done/cap
+    guardrail check -- a mode switch must never itself trip the cap and
+    silently close the room it just changed.
+
+    Returns (room, announcement_text) -- the announcement is returned
+    directly (not just left to be read back off the room) so callers (the
+    API response, the UI route, tests) don't have to re-fetch the
+    just-posted message.
+    """
+    validate_mode(mode)
+    cleaned_topic = _validate_topic(mode, topic)
+
+    # Unlocked pre-check: existence never needs the row lock to be correct
+    # (mirrors close_room's/delete_room's own "unlocked pre-checks"
+    # reasoning) -- a 404 for a genuinely nonexistent room doesn't need
+    # serializing on anything.
+    room = await db.get(Room, room_id)
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Serialization point: acquire the room's row lock, same pattern as
+    # every other mutator in this file. `populate_existing` is required for
+    # the identical reason those functions document: `room` may already be
+    # in this Session's identity map from the unlocked `db.get` above, and
+    # without it SQLAlchemy would leave that already-loaded object's
+    # attributes untouched even though the FOR UPDATE SQL below legitimately
+    # re-fetches newer committed data.
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None:
+        # A concurrent delete_room won the race and already committed
+        # between the unlocked pre-check and acquiring this lock.
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+    # Re-check status under the lock: another concurrent close (owner Stop,
+    # the sweeper's time-close, or post_message's own done/cap guardrail
+    # close) may have closed the room in the window between the unlocked
+    # check above and acquiring this lock -- this is the check that
+    # actually has to be race-free, and it now is.
+    if room.status != "open":
+        raise ApiError(
+            409,
+            "room_closed",
+            f"Room '{room.name}' is closed (reason: {room.close_reason}); its mode can no longer be "
+            "switched. Recovery: start a new room.",
+        )
+
+    # Members are read (and `sides` validated) only now, under the lock --
+    # see this function's docstring for why that ordering matters.
+    members = await get_members(db, room_id)
+    member_sides = _validate_sides(mode, members, sides)
+
+    member_rows = (await db.scalars(select(RoomMember).where(RoomMember.room_id == room_id))).all()
+    for member_row in member_rows:
+        member_row.side = member_sides.get(member_row.agent_name)
+
+    room.mode = mode
+    room.topic = cleaned_topic
+
+    announcement_text = _mode_switch_announcement(mode, cleaned_topic, members, member_sides)
+    now = datetime.now(UTC)
+    seq = await _next_seq(db, room.id)
+    db.add(
+        RoomMessage(
+            id=str(ULID()),
+            room_id=room.id,
+            seq=seq,
+            sender="system",
+            text=announcement_text,
+            kind="system",
+            created_at=now,
+        )
+    )
+    room.message_count += 1
+    # Deliberately no done/cap guardrail check here -- see docstring.
+
+    await db.commit()
+    return room, announcement_text
 
 
 # --- GET /v1/rooms/{id}/messages -- the long-poll ---
