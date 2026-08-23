@@ -37,17 +37,26 @@
 
 set -euo pipefail
 
+# Repo-internal paths are always derived from this script's own location,
+# never hardcoded, so the script works no matter what the repo directory
+# itself is named or where it's checked out.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROMPT_FILE="$SCRIPT_DIR/librarian-prompt.md"
 
-LOG_DIR="/var/log/brain-librarian"
+# Paths outside this repo -- fixed, root-owned locations on this deployment's
+# host, not derived from SCRIPT_DIR. Each is overridable via an env var of
+# the same name for a different deployment; the default is this host's
+# current value, unchanged.
+LOG_DIR="${LOG_DIR:-/var/log/brain-librarian}"
+LIBRARIAN_WRAPPER="${LIBRARIAN_WRAPPER:-/root/brain-librarian.sh}"
+LIBRARIAN_TOKEN_FILE="${LIBRARIAN_TOKEN_FILE:-/root/.brain-librarian-token}"
+# Must match OUTBOX_DIR in $LIBRARIAN_WRAPPER and the --allowedTools
+# Edit(...) scope below -- all three have to agree on one path.
+OUTBOX_DIR="${OUTBOX_DIR:-/var/lib/brain-librarian/outbox}"
+
 KEEP=30
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="$LOG_DIR/librarian-${TIMESTAMP}.log"
-
-# Must match OUTBOX_DIR in /root/brain-librarian.sh and the --allowedTools
-# Edit(...) scope below -- all three have to agree on one path.
-OUTBOX_DIR="/var/lib/brain-librarian/outbox"
 
 mkdir -p -m 700 "$LOG_DIR"
 mkdir -p -m 700 "$OUTBOX_DIR"
@@ -76,8 +85,8 @@ run_status=0
     exit 1
   fi
 
-  if [ ! -f "/root/.brain-librarian-token" ]; then
-    echo "[librarian] error: /root/.brain-librarian-token does not exist -- the librarian machine has not" \
+  if [ ! -f "$LIBRARIAN_TOKEN_FILE" ]; then
+    echo "[librarian] error: $LIBRARIAN_TOKEN_FILE does not exist -- the librarian machine has not" \
          "been minted yet. See docs/ops.md 'Librarian' section. Nothing was run."
     exit 1
   fi
@@ -87,7 +96,7 @@ run_status=0
     exit 1
   fi
 
-  echo "[librarian] invoking claude (model: sonnet, tools: Bash(/root/brain-librarian.sh:*) + Edit(//${OUTBOX_DIR#/}/**) only)"
+  echo "[librarian] invoking claude (model: sonnet, tools: Bash(${LIBRARIAN_WRAPPER}:*) + Edit(//${OUTBOX_DIR#/}/**) only)"
 
   # The librarian's sandbox has no clock of its own -- without this, it has
   # been observed inventing a stylized/wrong timestamp (e.g. "22:00:00Z")
@@ -119,7 +128,7 @@ Current UTC time: ${NOW_UTC} -- use this for all ts and client_ts values."
   # the full flag verification.
   claude -p "$PROMPT_WITH_TIME" \
     --model sonnet \
-    --allowedTools "Bash(/root/brain-librarian.sh:*) Edit(//${OUTBOX_DIR#/}/**)" \
+    --allowedTools "Bash(${LIBRARIAN_WRAPPER}:*) Edit(//${OUTBOX_DIR#/}/**)" \
     --max-budget-usd 5 \
     --output-format text
 
@@ -131,7 +140,7 @@ Current UTC time: ${NOW_UTC} -- use this for all ts and client_ts values."
 # which has no notify-me/hooks wiring of its own inside its sandboxed
 # --allowedTools grant.
 if [ "$run_status" -ne 0 ]; then
-    notify-me error "librarian" "Nightly run failed (exit $run_status) -- see /var/log/brain-librarian/"
+    notify-me error "librarian" "Nightly run failed (exit $run_status) -- see $LOG_DIR/"
 else
     notify-me done "librarian" "Nightly curation run complete."
 fi
