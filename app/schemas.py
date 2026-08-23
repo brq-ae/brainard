@@ -414,6 +414,60 @@ class NotificationConfigGetResponse(BaseModel):
     history: list[NotificationConfigResponse] = Field(default_factory=list)
 
 
+# --- LLM provider config (ADR-0010 phase 1: pluggable librarian runtimes) ---
+
+
+class LlmConfigCreateRequest(BaseModel):
+    base_url: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    # Optional -- Ollama and other local OpenAI-compatible endpoints need
+    # no key. Validated (non-blank if present, no control/newline chars --
+    # header-injection guard) in app/llm_config.py's `validate_api_key`.
+    api_key: str | None = None
+    note: str | None = None
+
+
+class LlmConfigResponse(BaseModel):
+    """One version, api_key ALWAYS masked -- `api_key_set`/`api_key_hint`
+    only, never the raw value (app/llm_config.py's `mask_api_key`)."""
+
+    version: int
+    base_url: str
+    model: str
+    api_key_set: bool
+    api_key_hint: str | None
+    note: str | None
+    created_at: datetime
+
+
+class LlmEffectiveConfig(BaseModel):
+    """The config the built-in librarian would actually use right now --
+    either the env override or the current stored DB version, never both
+    (app/llm_config.py's `resolve_llm_config`). `source` is None when
+    nothing is configured either way.
+    """
+
+    base_url: str | None
+    model: str | None
+    source: Literal["env", "db"] | None
+    api_key_set: bool
+    api_key_hint: str | None
+    version: int | None = None
+    note: str | None = None
+
+
+class LlmConfigGetResponse(BaseModel):
+    effective: LlmEffectiveConfig
+    history: list[LlmConfigResponse] = Field(default_factory=list)
+
+
+class LlmConfigTestResponse(BaseModel):
+    ok: bool
+    detail: str
+    latency_ms: int | None = None
+    model_echo: str | None = None
+
+
 # --- Flags (contracts-v1.md §3, ADR-0004 librarian inbox) ---
 
 

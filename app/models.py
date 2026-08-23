@@ -432,6 +432,44 @@ class NotificationConfig(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+# --- LLM provider config (ADR-0010 phase 1: pluggable librarian runtimes,
+# built-in LLM client) ---
+
+
+class LlmConfig(Base):
+    """One immutable version of the owner's LLM provider config -- base
+    URL, model, and an optional API key for the built-in librarian runtime
+    (ADR-0010). Supersede-never-erase applies (Principles): every change is
+    a new version, never an edit. The CURRENT (highest-version) row is what
+    app/llm_config.py's `resolve_llm_config` falls back to when the
+    `LLM_BASE_URL`/`LLM_MODEL` env vars are unset (ADR-0010 decision 3:
+    "an environment variable takes precedence over the stored value").
+
+    `api_key` is stored in plaintext, deliberately not encrypted at rest
+    (ADR-0010 decision 3: an encryption key living in the same env file on
+    the same host is security theatre) -- masked in every API/UI response
+    (never served back in full; see app/llm_config.py's masking helpers)
+    and never logged. Database backups will contain it.
+    """
+
+    __tablename__ = "llm_configs"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    # Sequential from 1, single global scope -- same reasoning as
+    # NotificationConfig.version (see that model's docstring); computed in
+    # app/llm_config.py's `next_version`, not a DB sequence.
+    version: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    # NULL is a legitimate, common value: Ollama and other local
+    # OpenAI-compatible endpoints need no key at all.
+    api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Owner's free-form comment on this version, e.g. "switched to local
+    # Ollama". Never served to sessions -- owner-facing only.
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 # --- Agent chat rooms (ADR-0006, phase A: core rooms/messages/long-poll/
 # guardrails/notify) ---
 

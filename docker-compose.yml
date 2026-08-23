@@ -25,6 +25,9 @@ services:
       UI_COOKIE_SECURE: ${UI_COOKIE_SECURE:-false}
       HUB_PUBLIC_URL: ${HUB_PUBLIC_URL:-}
       HUB_FALLBACK_URL: ${HUB_FALLBACK_URL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
     ports:
       - "${API_PORT:-8300}:8000"
     depends_on:

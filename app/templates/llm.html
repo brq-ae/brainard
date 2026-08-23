@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}LLM Provider — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>LLM Provider</h1></div>
+<p class="subtitle">The LLM provider the built-in librarian runtime uses for judgment calls (ADR-0010). Immutable history -- every change is a new version.</p>
+
+{% if error %}
+<div class="notice danger">{{ error }}</div>
+{% endif %}
+
+{% if test_result %}
+<div class="notice {{ 'ok' if test_result.ok else 'danger' }}">
+  <strong>{{ 'Connected' if test_result.ok else 'Test failed' }}:</strong> {{ test_result.detail }}
+  {% if test_result.latency_ms is not none %}<span class="meta"><span class="sep">·</span>{{ test_result.latency_ms }}ms</span>{% endif %}
+  {% if test_result.model_echo %}<span class="meta"><span class="sep">·</span>model echoed: <span class="mono">{{ test_result.model_echo }}</span></span>{% endif %}
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>Effective config</h2>
+  {% if effective.source %}
+  <p><strong>base_url</strong>: <span class="mono">{{ effective.base_url }}</span></p>
+  <p><strong>model</strong>: <span class="mono">{{ effective.model }}</span></p>
+  <p><strong>api_key</strong>:
+    {% if eff_api_key_set %}<span class="mono">set (…{{ eff_api_key_hint }})</span>{% else %}<span class="empty">not set</span>{% endif %}
+  </p>
+  {% if effective.note %}<p><strong>note</strong>: {{ effective.note }}</p>{% endif %}
+  <p class="meta">
+    source: <strong>{{ effective.source }}</strong>
+    {% if effective.version %}<span class="sep">·</span>v{{ effective.version }}{% endif %}
+  </p>
+  {% if effective.source == 'env' %}
+  <div class="notice warn">
+    LLM_BASE_URL / LLM_MODEL are set in the environment -- they take precedence over anything stored below.
+    The form still accepts and stores new versions, but they will have <strong>no effect</strong> on the
+    effective config while the environment override is set.
+  </div>
+  {% endif %}
+  {% else %}
+  <p class="empty">No LLM provider configured yet (neither environment nor database).</p>
+  {% endif %}
+
+  <form method="post" action="/ui/llm/test">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn">Test connection</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Update provider</h2>
+  <p class="subtitle">Posting here creates the next version -- the previous one stays in history, never overwritten.</p>
+  <p class="meta">
+    Examples: Ollama (<span class="mono">http://ollama:11434/v1</span>, model e.g. <span class="mono">llama3.1</span>, no key)
+    <span class="sep">·</span> OpenAI (<span class="mono">https://api.openai.com/v1</span>)
+    <span class="sep">·</span> OpenRouter (<span class="mono">https://openrouter.ai/api/v1</span>)
+    <span class="sep">·</span> LM Studio (<span class="mono">http://localhost:1234/v1</span>)
+    <span class="sep">·</span> vLLM (<span class="mono">http://localhost:8000/v1</span>)
+  </p>
+  <form method="post" action="/ui/llm">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="base_url">Base URL</label>
+      <input type="text" id="base_url" name="base_url" class="mono" placeholder="http://ollama:11434/v1" required>
+    </div>
+    <div class="field">
+      <label for="model">Model</label>
+      <input type="text" id="model" name="model" class="mono" placeholder="llama3.1" required>
+    </div>
+    <div class="field">
+      <label for="api_key">API key (optional)</label>
+      <input type="password" id="api_key" name="api_key" class="mono" placeholder="leave blank for Ollama and other local endpoints" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="note">Note (optional)</label>
+      <input type="text" id="note" name="note" placeholder="e.g. switched to local Ollama">
+    </div>
+    <button type="submit" class="btn primary">Save new version</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>History</h2>
+  {% if history %}
+  <ul class="list">
+    {% for h in history %}
+    <li class="row">
+      <span class="row-main">
+        v{{ h.version }} — <span class="mono">{{ h.base_url }}</span> / <span class="mono">{{ h.model }}</span>
+        <span class="meta"><span class="sep">·</span>api_key: {% if h.api_key_set %}set (…{{ h.api_key_hint }}){% else %}not set{% endif %}</span>
+        {% if h.note %}<div class="meta">{{ h.note }}</div>{% endif %}
+      </span>
+      <span class="meta">{{ h.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No history yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

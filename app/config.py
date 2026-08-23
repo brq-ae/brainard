@@ -41,6 +41,20 @@ class Settings(BaseSettings):
     # before this setting existed.
     hub_fallback_url: str | None = None
 
+    # --- LLM provider config (ADR-0010 phase 1: pluggable librarian
+    # runtimes, built-in LLM client) ---
+    # Env override for the LLM provider config normally stored in the
+    # `llm_configs` table (app/llm_config.py). When BOTH `llm_base_url` and
+    # `llm_model` are set, they take precedence over whatever is stored in
+    # the database and NOTHING is written there -- see
+    # app/llm_config.py's `resolve_llm_config` and ADR-0010 decision 3.
+    # Leaving both unset (the default) falls back to the current DB
+    # version, if any. `llm_api_key` is optional either way -- Ollama and
+    # other local endpoints need none.
+    llm_base_url: str | None = None
+    llm_model: str | None = None
+    llm_api_key: str | None = None
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

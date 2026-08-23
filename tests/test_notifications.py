@@ -281,6 +281,69 @@ async def test_create_notifications_config_topic_regex_already_excludes_separato
         assert resp.json()["error"]["code"] == "invalid_topic"
 
 
+# --- CVE-2023-24329-adjacent regression: urllib.parse.urlparse raises
+# ValueError (not returns a mis-parsed result) when the netloc contains a
+# character that NFKC-normalizes into a URL-structural character. These
+# characters are category Po -- NOT Cc/Cf/Zl/Zp -- and are pure non-ASCII,
+# so they pass every check above validate_ntfy_url's urlparse call
+# undetected and used to reach it raw, causing an unhandled 500. Confirmed
+# empirically (before the fix): POST /v1/notifications-config 500'd on
+# these exact payloads (app/llm_config.py's validate_base_url, which
+# mirrors this function, had the identical bug -- see
+# tests/test_llm_config.py's equivalent cases). Must now be a clean 422
+# invalid_ntfy_url, same as any other malformed URL, and nothing stored.
+
+
+async def test_create_notifications_config_ntfy_url_rejects_nfkc_fullwidth_solidus(client, db_session):
+    """U+FF0F FULLWIDTH SOLIDUS normalizes to \'/\' -- the exact character
+    that triggers urllib.parse\'s post-CVE-2023-24329 netloc guard."""
+    headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/notifications-config", json=_body(ntfy_url="https://ntfy.example.org\uff0fevil.example"), headers=headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_ntfy_url"
+    rows = (await db_session.execute(NotificationConfig.__table__.select())).all()
+    assert len(rows) == 0
+
+
+async def test_create_notifications_config_ntfy_url_rejects_nfkc_fullwidth_at(client, db_session):
+    """U+FF20 FULLWIDTH COMMERCIAL AT normalizes to \'@\'."""
+    headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/notifications-config", json=_body(ntfy_url="https://ntfy.example.org\uff20evil.example"), headers=headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_ntfy_url"
+    rows = (await db_session.execute(NotificationConfig.__table__.select())).all()
+    assert len(rows) == 0
+
+
+async def test_create_notifications_config_ntfy_url_rejects_nfkc_fullwidth_colon(client, db_session):
+    """U+FF1A FULLWIDTH COLON normalizes to \':\' -- another NFKC-divergent
+    punctuation case distinct from the solidus/at-sign pair above."""
+    headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/notifications-config", json=_body(ntfy_url="https://ntfy.example.org\uff1a8443"), headers=headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_ntfy_url"
+    rows = (await db_session.execute(NotificationConfig.__table__.select())).all()
+    assert len(rows) == 0
+
+
+async def test_create_notifications_config_ntfy_url_rejects_nfkc_fullwidth_question_mark(client, db_session):
+    """U+FF1F FULLWIDTH QUESTION MARK normalizes to \'?\'."""
+    headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/notifications-config", json=_body(ntfy_url="https://ntfy.example.org\uff1fevil.example"), headers=headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_ntfy_url"
+    rows = (await db_session.execute(NotificationConfig.__table__.select())).all()
+    assert len(rows) == 0
+
+
 async def test_create_notifications_config_ntfy_url_max_length_enforced(client, db_session):
     headers = await _owner_headers(db_session)
     long_url = "https://" + ("a" * notifications_module.NTFY_URL_MAX_LENGTH) + ".example.com"

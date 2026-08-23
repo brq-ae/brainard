@@ -122,7 +122,24 @@ def validate_ntfy_url(ntfy_url: str) -> None:
             "and into fleet-wide bootstrap markdown). Recovery: remove them, resend.",
         )
 
-    parsed = urlparse(ntfy_url)
+    try:
+        parsed = urlparse(ntfy_url)
+    except ValueError:
+        # Post-CVE-2023-24329 guard in urllib.parse: it raises ValueError
+        # (rather than silently mis-parsing) when the netloc contains a
+        # character that NFKC-normalizes into a URL-structural character --
+        # e.g. U+FF0F (fullwidth solidus) or U+FF20 (fullwidth commercial-at).
+        # Those characters are category Po (not Cc/Cf/Zl/Zp) and aren't in
+        # the ASCII forbidden-chars set above, so they reach this point
+        # undetected; caught here and turned into the same clean 422 as any
+        # other malformed URL, never a raw 500.
+        raise ApiError(
+            422,
+            "invalid_ntfy_url",
+            f"'{ntfy_url}' is not a valid http(s) URL. Recovery: fix the URL (must start with http:// or "
+            "https:// and include a host, using only ordinary ASCII URL characters), resend.",
+        ) from None
+
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ApiError(
             422,

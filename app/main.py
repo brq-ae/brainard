@@ -22,6 +22,7 @@ from app.routers import (
     flags,
     health,
     library,
+    llm_config,
     machines,
     notifications,
     projects,
@@ -33,6 +34,7 @@ from app.routers import (
     ui_doctrine,
     ui_journal,
     ui_library,
+    ui_llm,
     ui_login,
     ui_notifications,
     ui_projects,
@@ -94,6 +96,7 @@ app.include_router(projects.router)
 app.include_router(bootstrap.router)
 app.include_router(export.router)
 app.include_router(notifications.router)
+app.include_router(llm_config.router)
 app.include_router(rooms.router)
 
 # --- UI (owner cookie session; see app/ui_auth.py) ---
@@ -105,6 +108,7 @@ app.include_router(ui_projects.router)
 app.include_router(ui_journal.router)
 app.include_router(ui_doctrine.router)
 app.include_router(ui_notifications.router)
+app.include_router(ui_llm.router)
 app.include_router(ui_rooms.router)
 app.include_router(ui_admin.router)
 
