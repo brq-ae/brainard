@@ -122,17 +122,25 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from markupsafe import Markup
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from app.db import get_db
 from app.errors import ApiError
+from app.llm_config import resolve_llm_config
 from app.models import Room
 from app.onboarding import TOKEN_PLACEHOLDER, generate_room_join_prompt, resolve_base_url
+from app.projects import list_project_names
+from app.room_ai import ACTIONS as ROOM_AI_ACTIONS
+from app.room_ai import VALID_DEPOSIT_NAMESPACES as ROOM_AI_NAMESPACES
+from app.room_ai import deposit_result as deposit_room_ai_result
+from app.room_ai import run_action as run_room_ai_action
+from app.room_export import render_transcript_json, render_transcript_markdown, transcript_filename
 from app.room_modes import DEFAULT_MODE, ROOM_MODES
 from app.rooms import assign_group_to_rooms as assign_group_to_rooms_op
 from app.rooms import close_room as close_room_op
 from app.rooms import create_room as create_room_op
 from app.rooms import delete_room as delete_room_op
+from app.rooms import get_all_messages
 from app.rooms import get_member_sides, get_members, get_members_for_rooms, get_recent_messages, get_room
 from app.rooms import list_room_groups as list_room_groups_op
 from app.rooms import list_rooms as list_rooms_op
@@ -280,6 +288,17 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
     messages = await get_recent_messages(db, room_id, limit=INITIAL_MESSAGE_LIMIT)
     last_seq = messages[-1].seq if messages else 0
     mode_def = ROOM_MODES[room.mode]
+
+    # ADR-0011: the full transcript, oldest-first, rendered as markdown once
+    # here so the "Copy transcript" button (app/static/main.js's existing
+    # data-copy-target pattern) has something to read from -- distinct from
+    # `messages` above, which is only the live view's bounded recent window.
+    all_messages = await get_all_messages(db, room_id)
+    transcript_md = render_transcript_markdown(room, members, sides, all_messages)
+
+    effective = await resolve_llm_config(db)
+    llm_configured = bool(effective.base_url and effective.model)
+
     return {
         "room": room,
         "members": members,
@@ -294,6 +313,12 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
         # second, divergent mode list) -- see this module's docstring.
         "room_modes": ROOM_MODES,
         "room_modes_json": ROOM_MODES_JSON,
+        # ADR-0011: export + AI actions panel context.
+        "transcript_md": transcript_md,
+        "llm_configured": llm_configured,
+        "room_ai_actions": sorted(ROOM_AI_ACTIONS),
+        "room_ai_namespaces": sorted(ROOM_AI_NAMESPACES),
+        "project_names": await list_project_names(db),
     }
 
 
@@ -446,6 +471,10 @@ async def rooms_create(
 async def room_view(
     room_id: str,
     request: Request,
+    # ADR-0011: set by the post-deposit redirect below so the page can show
+    # a one-time "Deposited to the library." confirmation banner -- purely
+    # a display flag, never trusted for anything else.
+    deposited: str | None = Query(default=None),
     session: dict = Depends(require_ui_session),
     db: AsyncSession = Depends(get_db),
 ):
@@ -455,7 +484,7 @@ async def room_view(
     return templates.TemplateResponse(
         request,
         "room_view.html",
-        {"csrf_token": session["csrf"], "error": None, **ctx},
+        {"csrf_token": session["csrf"], "error": None, "deposited": bool(deposited), **ctx},
     )
 
 
@@ -648,3 +677,124 @@ async def rooms_assign_group(
             status_code=exc.status_code,
         )
     return RedirectResponse(url="/ui/rooms", status_code=303)
+
+
+# --- ADR-0011: transcript export (no model involved -- app/room_export.py) ---
+
+
+@router.get("/{room_id}/transcript.md")
+async def room_transcript_markdown(
+    room_id: str,
+    _session: dict = Depends(require_ui_session),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    room = await get_room(db, room_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.")
+    members = await get_members(db, room_id)
+    sides = await get_member_sides(db, room_id)
+    messages = await get_all_messages(db, room_id)
+    body = render_transcript_markdown(room, members, sides, messages)
+    filename = transcript_filename(room, "md")
+    return Response(
+        content=body,
+        media_type="text/markdown; charset=utf-8",
+        # `filename` is already sanitized (app/room_export.py's
+        # safe_filename_component: no quotes, no CR/LF, no control chars) --
+        # safe to interpolate straight into the quoted header value.
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{room_id}/transcript.json")
+async def room_transcript_json(
+    room_id: str,
+    _session: dict = Depends(require_ui_session),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    room = await get_room(db, room_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.")
+    members = await get_members(db, room_id)
+    sides = await get_member_sides(db, room_id)
+    messages = await get_all_messages(db, room_id)
+    payload = render_transcript_json(room, members, sides, messages)
+    filename = transcript_filename(room, "json")
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# --- ADR-0011: AI actions (owner-only -- the entire /ui/rooms surface
+# already requires the owner cookie session, so no separate check is
+# needed here) ---
+#
+# The static "/ai/deposit" route is registered BEFORE the dynamic
+# "/ai/{action}" route below, deliberately: Starlette matches routes in
+# registration order, and "/ai/{action}" would otherwise happily match
+# "/ai/deposit" too (action="deposit"), silently routing every deposit
+# submission into `room_ai_action` instead of `room_ai_deposit`.
+
+
+@router.post("/{room_id}/ai/deposit")
+async def room_ai_deposit(
+    room_id: str,
+    request: Request,
+    title: str = Form(...),
+    body: str = Form(...),
+    namespace: str = Form(...),
+    # Blank/omitted means universal (no project) -- see app.room_ai.deposit_result.
+    project: str = Form(default=""),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    """An ordinary form POST (not JS-fetched, unlike `room_ai_action` below)
+    -- the owner reviews the AI action's result, the page's JS
+    (app/static/room_ai.js) fills this form's fields, and submitting it is
+    a normal navigation, so an ApiError re-renders the room view with the
+    error inline, same pattern as `room_post`/`room_switch_mode` above,
+    rather than a bare JSON error page.
+    """
+    cleaned_project = project.strip() or None
+    try:
+        await deposit_room_ai_result(db, room_id, title=title, body=body, namespace=namespace, project=cleaned_project)
+    except ApiError as exc:
+        ctx = await _room_context(db, request, room_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.") from exc
+        return templates.TemplateResponse(
+            request,
+            "room_view.html",
+            {"csrf_token": session["csrf"], "error": exc.detail, "deposited": False, **ctx},
+            status_code=exc.status_code,
+        )
+    return RedirectResponse(url=f"/ui/rooms/{room_id}?deposited=1", status_code=303)
+
+
+@router.post("/{room_id}/ai/{action}")
+async def room_ai_action(
+    room_id: str,
+    action: str,
+    _session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """JS-fetched (app/static/room_ai.js), never a browser navigation --
+    returns the structured result as JSON. Any ApiError (unknown action,
+    unknown room, no provider configured, an unusable model response) is
+    deliberately left to propagate to the app-level handler
+    (app/errors.py's `api_error_handler`), which turns it into the same
+    `{"error": {"code", "detail", ...}}` envelope the v1 API uses -- the JS
+    reads `error.code`/`error.detail` from that same shape either way.
+    """
+    result = await run_room_ai_action(db, room_id, action)
+    return JSONResponse(
+        {
+            "action": result.action,
+            "result": result.result,
+            "truncated": result.truncated,
+            "truncated_notice": result.truncated_notice,
+        }
+    )

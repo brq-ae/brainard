@@ -50,10 +50,10 @@
       <div class="row">
         <span class="row-main">
           {{ m.name }}
-          {% if m.id == librarian_machine_id %}<span class="badge system">system</span>{% endif %}
+          {% if m.id in system_machine_descriptions %}<span class="badge system">system</span>{% endif %}
           <div class="meta">created {{ m.created_at|human_ts }} <span class="sep">·</span> last seen {{ m.last_seen|human_ts if m.last_seen else "never" }}{% if m.default_project %} <span class="sep">·</span> default project: {{ m.default_project }}{% endif %}</div>
-          {% if m.id == librarian_machine_id %}
-          <div class="meta">Built-in librarian identity (ADR-0010) -- every deposit/flag-resolution the built-in librarian makes is attributed to this row. It has no usable bearer token and never authenticates over the API. <strong>Revoking it disables the built-in librarian</strong>: every scheduled or "Run now" run will skip cleanly (no LLM call, no deposit) until it's reactivated.</div>
+          {% if m.id in system_machine_descriptions %}
+          <div class="meta">{{ system_machine_descriptions[m.id] }}</div>
           {% endif %}
         </span>
         <span class="badge">{{ m.role }}</span>
@@ -70,7 +70,7 @@
         </form>
         {% endif %}
       </div>
-      {% if m.id == librarian_machine_id %}
+      {% if m.id in system_machine_descriptions %}
       <p class="meta">No rename/role/default-project or onboarding-prompt controls for this row -- it isn't a session-facing machine identity, so those affordances don't apply.</p>
       {% else %}
       <details class="machine-details">

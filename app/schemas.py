@@ -717,3 +717,18 @@ class RoomGroupAssignResponse(BaseModel):
     # The group actually applied, after trim/blank-to-None -- echoes what
     # `_validate_group` resolved `group` to, not necessarily the raw input.
     group: str | None
+
+
+# --- Room AI actions (ADR-0011) ---
+
+
+class RoomAiActionResponse(BaseModel):
+    room_id: str
+    action: str
+    # Shape varies per action (app/room_ai.py's per-action parsers) -- kept
+    # as an untyped dict rather than one schema per action, same reasoning
+    # DepositRequest.knowledge above gives for its own untyped dicts: the
+    # real, self-explaining validation already lives in the domain layer.
+    result: dict[str, Any]
+    truncated: bool
+    truncated_notice: str | None = None

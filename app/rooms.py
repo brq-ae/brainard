@@ -346,6 +346,20 @@ async def get_recent_messages(db: AsyncSession, room_id: str, limit: int = 50) -
     return list(reversed(rows))  # oldest-first, chat reading order
 
 
+async def get_all_messages(db: AsyncSession, room_id: str) -> list[RoomMessage]:
+    """Every message in the room, oldest-first (chat reading order) -- used
+    by the transcript export (app/room_export.py) and the AI actions
+    (app/room_ai.py, ADR-0011), unlike `get_recent_messages` above (bounded
+    to the most recent N, used by the live view's initial render). Never
+    truly unbounded: a room's message count is capped at MAX_MESSAGES_MAX
+    (10000) by `_validate_max_messages` at create time.
+    """
+    rows = (
+        await db.scalars(select(RoomMessage).where(RoomMessage.room_id == room_id).order_by(RoomMessage.seq))
+    ).all()
+    return list(rows)
+
+
 # --- GET /v1/rooms (list, cursor-paginated, newest first) ---
 
 

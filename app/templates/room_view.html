@@ -21,6 +21,10 @@
 <div class="notice danger">{{ error }}</div>
 {% endif %}
 
+{% if deposited %}
+<div class="notice ok">Deposited to the library.</div>
+{% endif %}
+
 <div class="notice danger" id="room-closed-banner" {% if room.status != 'closed' %}style="display:none"{% endif %}>
   Room closed{% if room.close_reason %} (reason: <span id="room-close-reason">{{ room.close_reason }}</span>){% endif %}. No further messages are accepted.
 </div>
@@ -32,7 +36,7 @@
      special escaping beyond Jinja2's normal autoescape, and none of them are
      ever user-supplied text (unlike the topic/message content elsewhere on
      this page). -->
-<div id="room-config" data-room-id="{{ room.id }}" data-last-seq="{{ last_seq }}" data-status="{{ room.status }}" data-expires-at="{{ room.expires_at.isoformat() if room.expires_at else '' }}"></div>
+<div id="room-config" data-room-id="{{ room.id }}" data-last-seq="{{ last_seq }}" data-status="{{ room.status }}" data-expires-at="{{ room.expires_at.isoformat() if room.expires_at else '' }}" data-csrf="{{ csrf_token }}"></div>
 
 <div class="panel">
   <h2>Transcript</h2>
@@ -45,6 +49,77 @@
     {% endfor %}
   </ul>
   <p class="empty" id="room-messages-empty" {% if messages %}style="display:none"{% endif %}>No messages yet.</p>
+</div>
+
+<div class="panel">
+  <h2>Export</h2>
+  <p class="meta">The full transcript ({{ room.message_count }} messages), no model involved.</p>
+  <!-- Same pattern as the join-prompt boxes below and admin_machines.html's
+       token-reveal: the markdown is rendered server-side through ordinary
+       Jinja2 autoescape (never |safe) into a hidden element, and the
+       existing generic copy-to-clipboard handler (app/static/main.js) reads
+       it back via .textContent -- which the browser decodes to the exact
+       original text -- and writes it to the clipboard. No innerHTML
+       anywhere in that path. -->
+  <div class="token-reveal" id="transcript-markdown" style="display:none">{{ transcript_md }}</div>
+  <button type="button" class="btn" data-copy-target="transcript-markdown">Copy transcript (Markdown)</button>
+  <a class="btn" href="/ui/rooms/{{ room.id }}/transcript.md">Download .md</a>
+  <a class="btn" href="/ui/rooms/{{ room.id }}/transcript.json">Download .json</a>
+</div>
+
+<div class="panel" id="room-ai-panel">
+  <h2>AI actions</h2>
+  {% if not llm_configured %}
+  <div class="notice">No LLM provider configured. <a href="/ui/llm">Configure one</a> to use AI actions.</div>
+  {% endif %}
+  <p class="meta">
+    Single-shot analysis of this room's transcript using the configured provider (ADR-0011). Nothing is stored
+    until you explicitly deposit a result below.
+  </p>
+  <div id="room-ai-actions" data-room-name="{{ room.name }}">
+    <button type="button" class="btn" data-room-ai-action="summarize" {% if not llm_configured %}disabled{% endif %}>Summarize</button>
+    <button type="button" class="btn" data-room-ai-action="verdict" {% if not llm_configured %}disabled{% endif %}>Verdict</button>
+    <button type="button" class="btn" data-room-ai-action="decisions" {% if not llm_configured %}disabled{% endif %}>Decisions &amp; action items</button>
+    <button type="button" class="btn" data-room-ai-action="lessons" {% if not llm_configured %}disabled{% endif %}>Extract lessons</button>
+  </div>
+  <div id="room-ai-error" class="notice danger" style="display:none"></div>
+  <div id="room-ai-result"></div>
+
+  <h3>Deposit to Brain</h3>
+  <p class="meta">
+    Review a result above, click "Use this result" (or "Use this lesson") to fill this form, optionally edit
+    the title, then deposit it as a library entry -- via the normal deposit path, same guardrails as any other
+    machine deposit.
+  </p>
+  <form method="post" action="/ui/rooms/{{ room.id }}/ai/deposit" id="room-ai-deposit-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="room-ai-deposit-title">Title</label>
+      <input type="text" id="room-ai-deposit-title" name="title" required>
+    </div>
+    <div class="field">
+      <label for="room-ai-deposit-body">Body</label>
+      <textarea id="room-ai-deposit-body" name="body" rows="8" required></textarea>
+    </div>
+    <div class="field">
+      <label for="room-ai-deposit-namespace">Namespace</label>
+      <select id="room-ai-deposit-namespace" name="namespace">
+        {% for ns in room_ai_namespaces %}
+        <option value="{{ ns }}">{{ ns }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label for="room-ai-deposit-project">Project</label>
+      <select id="room-ai-deposit-project" name="project">
+        <option value="">— universal (no project) —</option>
+        {% for p in project_names %}
+        <option value="{{ p }}">{{ p }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="btn primary">Deposit to Brain</button>
+  </form>
 </div>
 
 <div class="panel" id="room-post-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>
@@ -116,4 +191,5 @@
 <script type="application/json" id="room-modes-data">{{ room_modes_json }}</script>
 <script src="/static/room_form.js"></script>
 <script src="/static/rooms.js"></script>
+<script src="/static/room_ai.js"></script>
 {% endblock %}

@@ -84,14 +84,11 @@ import asyncio
 import base64
 import json
 import logging
-import re
-import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import select, tuple_
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ulid import ULID
 
@@ -103,12 +100,16 @@ from app.flags import list_flags, resolve_flag
 from app.journal import list_events
 from app.llm_client import LlmCallError, chat_completion_json
 from app.llm_config import EffectiveLlmConfig, resolve_llm_config
+from app.llm_prompt_safety import extract_json_object as _extract_json_object
+from app.llm_prompt_safety import new_prompt_nonce as _new_prompt_nonce
+from app.llm_prompt_safety import strip_boundary_token as _strip_boundary_token
+from app.llm_prompt_safety import truncate as _truncate
 from app.models import Event, Flag, KnowledgeEntry, LibrarianRun, Machine
 from app.projects import stale_active_project_names
+from app.reserved_machines import ensure_reserved_machine
 from app.routers.deposits import create_deposit as apply_deposit
 from app.schemas import DepositRequest, EventIn
 from app.search import run_search
-from app.security import hash_token
 
 logger = logging.getLogger(__name__)
 
@@ -234,43 +235,11 @@ def _new_counts() -> dict[str, Any]:
 # own structure). ---
 
 
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n...[truncated]"
-
-
-def _new_prompt_nonce() -> str:
-    """A short, unpredictable-per-call token (16 hex chars, 64 bits) used to
-    build THIS call's delimiter tag names (e.g. `<entry_a_body-{nonce}>`).
-
-    Why a nonce and not a fixed tag name: entry bodies and event
-    summaries/payloads are written by ordinary sessions, not owner-reviewed,
-    and are placed verbatim into the prompt. A fixed tag name (e.g. the
-    prior `<entry_a_body>`) can simply be typed by whoever wrote that
-    content -- an embedded literal `</entry_a_body>` forges a fake close and
-    lets attacker text escape the intended boundary and imitate the rest of
-    the prompt's structure (demonstrated in review against the real prompt
-    builder). A nonce generated fresh, AT CALL TIME, defeats this: the
-    content was written before this nonce ever existed, so it cannot
-    contain a matching closing tag except by an astronomically unlikely
-    guess (2^64 possibilities). `_strip_boundary_token` below is the
-    belt-and-braces second layer for that residual case.
-    """
-    return secrets.token_hex(8)
-
-
-def _strip_boundary_token(text: str, nonce: str) -> str:
-    """Defense in depth (belt and braces): removes any literal occurrence
-    of THIS call's nonce from content before it is interpolated into the
-    prompt. The nonce is generated after the content already exists, so a
-    real collision is cryptographically implausible -- this only guards the
-    residual case (a coincidental match, or a future change that makes the
-    nonce more guessable) without weakening the primary defense above.
-    """
-    if not text:
-        return text
-    return text.replace(nonce, "[boundary-token-removed]")
+# _truncate/_new_prompt_nonce/_strip_boundary_token are now imported from
+# app.llm_prompt_safety (see the import block above) -- ADR-0011 extracted
+# them into a shared module so app/room_ai.py's own prompt-hardening reuses
+# exactly this implementation rather than a second, drifted copy. Behavior,
+# names, and call signatures are unchanged; only the location moved.
 
 
 def _build_merge_system_prompt(nonce: str) -> str:
@@ -373,31 +342,10 @@ def _build_lesson_user_prompt(event: Event, nonce: str) -> str:
 
 
 # --- Defensive JSON parsing (never raises; a bad response is an ordinary,
-# conservative "no" -- see module docstring) ---
-
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _extract_json_object(content: str) -> dict | None:
-    """Strips a common ```json fence wrapper, then greedily grabs the
-    outermost {...} block -- small local models routinely wrap or
-    precede/follow strict JSON with commentary despite being asked not to.
-    Returns None (never raises) on anything that doesn't parse as a JSON
-    object.
-    """
-    text = content.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text[:4].lower() == "json":
-            text = text[4:]
-    match = _JSON_OBJECT_RE.search(text)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+# conservative "no" -- see module docstring). `_extract_json_object` is now
+# imported from app.llm_prompt_safety (see the import block above) -- same
+# ADR-0011 extraction as the nonce/truncate helpers above; behavior and
+# signature unchanged, only the location moved. ---
 
 
 def _parse_merge_response(content: str) -> dict | None:
@@ -457,34 +405,14 @@ async def _ensure_librarian_machine(session_factory: async_sessionmaker[AsyncSes
     built-in librarian -- revoking this one reserved row makes every
     subsequent run (scheduled or "Run now") skip cleanly with no LLM call
     and no deposit, until it's active again.
+
+    The actual get-or-create/race-safety logic now lives in
+    app.reserved_machines.ensure_reserved_machine (ADR-0011 extracted it so
+    app/room_ai.py's own reserved identity shares the same implementation)
+    -- this is a thin, name-preserving wrapper so every existing call site
+    in this module is unchanged.
     """
-    async with session_factory() as session:
-        existing = await session.get(Machine, LIBRARIAN_MACHINE_ID)
-        if existing is not None:
-            return existing
-
-    async with session_factory() as session:
-        machine = Machine(
-            id=LIBRARIAN_MACHINE_ID,
-            name=LIBRARIAN_MACHINE_NAME,
-            token_hash=hash_token(secrets.token_urlsafe(32)),
-            status="active",
-            role="solo",
-        )
-        session.add(machine)
-        try:
-            await session.commit()
-            return machine
-        except IntegrityError:
-            # Lost a race to another concurrent call (the scheduled loop and
-            # an owner-triggered "run now" landing at the same moment) --
-            # the row exists either way; fetch what the winner created.
-            await session.rollback()
-
-    async with session_factory() as session:
-        winner = await session.get(Machine, LIBRARIAN_MACHINE_ID)
-    assert winner is not None, "the reserved librarian machine must exist by now (created here or by the race winner)"
-    return winner
+    return await ensure_reserved_machine(session_factory, LIBRARIAN_MACHINE_ID, LIBRARIAN_MACHINE_NAME)
 
 
 def _principal_for(machine_id: str) -> Principal:

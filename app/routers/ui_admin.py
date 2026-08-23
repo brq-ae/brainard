@@ -27,6 +27,7 @@ from app.models import Machine
 from app.onboarding import PROJECT_PLACEHOLDER, TOKEN_PLACEHOLDER, generate_onboarding_prompt, resolve_base_url
 from app.proposals import decide, list_proposals
 from app.roles import DEFAULT_ROLE
+from app.room_ai import ROOM_AI_MACHINE_ID
 from app.templates_env import templates
 from app.ui_auth import require_csrf, require_ui_session
 
@@ -34,6 +35,29 @@ router = APIRouter(prefix="/ui/admin", tags=["ui"])
 
 
 # --- machines ---
+
+# Reserved, tokenless machine identities (app.reserved_machines) whose rows
+# exist only to give an in-app, non-session write path (never over HTTP,
+# never require_machine) something legible to attribute to -- the built-in
+# librarian (ADR-0010) and room AI action deposits (ADR-0011). Neither has a
+# usable bearer token, a rename/role/onboarding-prompt affordance, or (for
+# the room-AI one) anything to actually authenticate with. Both get a
+# "system" badge and a short explanation instead (admin_machines.html);
+# Revoke/Reactivate stays a real, independent kill switch for each.
+_SYSTEM_MACHINE_DESCRIPTIONS: dict[str, str] = {
+    LIBRARIAN_MACHINE_ID: (
+        "Built-in librarian identity (ADR-0010) -- every deposit/flag-resolution the built-in librarian "
+        "makes is attributed to this row. It has no usable bearer token and never authenticates over the "
+        "API. Revoking it disables the built-in librarian: every scheduled or \"Run now\" run will skip "
+        "cleanly (no LLM call, no deposit) until it's reactivated."
+    ),
+    ROOM_AI_MACHINE_ID: (
+        "Room AI actions identity (ADR-0011) -- every deposit made from a room's AI-action result "
+        "(summarize/verdict/decisions/lessons) is attributed to this row. It has no usable bearer token and "
+        "never authenticates over the API. Revoking it disables deposits from room AI actions until it's "
+        "reactivated (running an action is unaffected -- only depositing its result)."
+    ),
+}
 
 
 def _prompts_by_machine_id(request: Request, machines: list[Machine]) -> dict[str, str]:
@@ -44,10 +68,11 @@ def _prompts_by_machine_id(request: Request, machines: list[Machine]) -> dict[st
     fills the project slot; otherwise the literal `<PROJECT>` placeholder,
     same as the mint-time prompt when no project was given.
 
-    Skips the reserved built-in-librarian row (ADR-0010 phase 2) entirely --
-    it has no usable bearer token and never authenticates over the API, so
-    an onboarding prompt for it would be nonsensical; the template never
-    offers this affordance for that row (see admin_machines.html).
+    Skips every reserved system row (see `_SYSTEM_MACHINE_DESCRIPTIONS`
+    above) entirely -- none of them has a usable bearer token or
+    authenticates over the API, so an onboarding prompt would be
+    nonsensical; the template never offers this affordance for those rows
+    (see admin_machines.html).
     """
     base_url = resolve_base_url(request)
     return {
@@ -59,7 +84,7 @@ def _prompts_by_machine_id(request: Request, machines: list[Machine]) -> dict[st
             role=m.role,
         )
         for m in machines
-        if m.id != LIBRARIAN_MACHINE_ID
+        if m.id not in _SYSTEM_MACHINE_DESCRIPTIONS
     }
 
 
@@ -78,6 +103,7 @@ async def admin_machines(
             "machines": machines,
             "prompts": _prompts_by_machine_id(request, machines),
             "librarian_machine_id": LIBRARIAN_MACHINE_ID,
+            "system_machine_descriptions": _SYSTEM_MACHINE_DESCRIPTIONS,
         },
     )
 
@@ -119,6 +145,7 @@ async def admin_machines_create(
             "machines": machines,
             "prompts": _prompts_by_machine_id(request, machines),
             "librarian_machine_id": LIBRARIAN_MACHINE_ID,
+            "system_machine_descriptions": _SYSTEM_MACHINE_DESCRIPTIONS,
             "newly_minted": {
                 "id": machine.id,
                 "name": machine.name,
