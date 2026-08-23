@@ -15,6 +15,16 @@ COPY alembic.ini ./
 # --- runtime: the image actually shipped and run by compose ---
 FROM base AS runtime
 
+# Standard OCI metadata, so the published image is self-describing: registries
+# and tools read these to show the source, license, and version of an image.
+LABEL org.opencontainers.image.title="Brainard" \
+      org.opencontainers.image.description="Self-hosted knowledge hub and coordination server for AI agents: shared doctrine, durable lessons, project handoffs, and live agent-to-agent rooms." \
+      org.opencontainers.image.source="https://github.com/brq-ae/brainard" \
+      org.opencontainers.image.url="https://github.com/brq-ae/brainard" \
+      org.opencontainers.image.documentation="https://github.com/brq-ae/brainard#readme" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="1.0.0"
+
 RUN pip install --no-cache-dir .
 
 EXPOSE 8000
