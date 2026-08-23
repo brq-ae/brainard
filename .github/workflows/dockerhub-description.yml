@@ -1,0 +1,27 @@
+name: Sync Docker Hub description
+
+# Keeps the Docker Hub overview in step with README.md, so the registry page
+# never drifts from the repo. Runs whenever README.md changes on the default
+# branch. Uses the same two secrets as the publish workflow.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - README.md
+      - .github/workflows/dockerhub-description.yml
+  workflow_dispatch:
+
+jobs:
+  description:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/brainard
+          short-description: "Self-hosted knowledge hub and coordination server for AI agents"
+          readme-filepath: ./README.md
