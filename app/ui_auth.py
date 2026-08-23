@@ -33,7 +33,12 @@ from app.errors import ApiError
 logger = logging.getLogger(__name__)
 
 SESSION_COOKIE_NAME = "brain_ui_session"
-SESSION_MAX_AGE_SECONDS = 24 * 60 * 60  # ~24h
+# 30 days: the owner token is long and random by design (it is a bearer
+# credential on every API call), so re-pasting it daily is friction without
+# a security payoff. The cookie is HttpOnly, signed, and scoped to one
+# browser; a longer window trades a slightly longer-lived session for not
+# tempting the owner into a weaker root credential.
+SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60  # ~30 days
 _SALT = "brain-ui-session-v1"
 
 settings = get_settings()
