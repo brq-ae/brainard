@@ -1,0 +1,37 @@
+# Build context exclusions for `docker build` (docker-compose.yml's `api`
+# and `test` services both build from context `.`; see Dockerfile). Keep
+# this in sync with the Dockerfile's COPY lines -- it needs pyproject.toml,
+# app/, alembic/, alembic.ini (all stages) and tests/ (test stage only), so
+# none of those are excluded here.
+
+# Version control
+.git
+.gitignore
+
+# Secrets / local env (never .env.example -- the Dockerfile doesn't copy it
+# either way, but keep it out of the build context explicitly for clarity)
+.env
+.env.*
+!.env.example
+
+# Local backups / DB dumps -- never belong in an image
+backups/
+*.dump
+
+# Python bytecode / caches
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache
+
+# Docs and dev-only scripts -- not needed inside the image
+docs/
+scripts/
+*.md
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

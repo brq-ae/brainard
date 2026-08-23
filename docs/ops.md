@@ -6,6 +6,13 @@ developer/test workflow (running the test suite, tearing down for
 development) see `docs/dev.md`; for what to paste into a new AI session see
 `docs/onboarding.md`.
 
+> **A note on the paths below.** The librarian and backup sections below
+> reference absolute paths like `/root/brainard`, `/root/brain-hub.sh`, and
+> `/root/.brain-librarian-token` — these reflect the author's own single-host,
+> root-owned LAN deployment. Nothing about the Brain requires running as
+> root or living under `/root`; adapt every such path to wherever you deploy
+> it and whichever user runs the stack on your host.
+
 ## Fresh deploy
 
 The stack is two services (`db`, `api`) plus a named volume (`db_data`)
