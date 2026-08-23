@@ -22,6 +22,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ secrets.DOCKERHUB_USERNAME }}/brainard
+          repository: brqae/brainard
           short-description: "Self-hosted knowledge hub and coordination server for AI agents"
           readme-filepath: ./README.md
