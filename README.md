@@ -210,6 +210,18 @@ line the agent can use instead, no DNS or reverse proxy involved. See
 `docs/onboarding.md` for the full mechanics, including the hard-scoped
 wrapper-script pattern recommended for agents with raw shell access.
 
+## Librarian
+
+The autonomous curation role (dedup/merge flags, harvest lesson
+candidates, summarize) runs in one of two ways: **built-in** — configure
+an LLM provider at `/ui/llm` (any OpenAI-compatible endpoint, including a
+local model), no CLI or cron required — or as an **external agent**
+(Claude Code or another tool-using CLI) driven by a machine token, the
+shipped `scripts/brain-wrapper.sh` wrapper, and `scripts/librarian-run.sh`
+on cron. See [`docs/librarian.md`](docs/librarian.md) for what the
+librarian does, how to run each path, when to pick which, and the raw API
+contract for implementing the role in any language.
+
 ## Docs
 
 - [`docs/vision.md`](docs/vision.md) — what the Brain is and the operating
@@ -224,6 +236,9 @@ wrapper-script pattern recommended for agents with raw shell access.
 - [`docs/onboarding.md`](docs/onboarding.md) — what the onboarding
   paste-line means, per-tool notes, and the recommended permission setup
   for agents with shell access.
+- [`docs/librarian.md`](docs/librarian.md) — the librarian curation role:
+  built-in vs. external-agent runtimes, when to pick which, and the raw
+  API contract for implementing it yourself.
 - [`docs/dev.md`](docs/dev.md) — developer notes: running the stack,
   running tests, tearing down.
 

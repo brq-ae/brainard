@@ -224,9 +224,21 @@ in the Brain; harvested lessons and the per-run summary note are plain new
 writes, same as a session filing a fresh entry or logging an event — there
 is nothing prior for them to supersede.
 
+This section documents the external-agent runtime as configured on the
+author's own deployment (ADR-0010 decision 2), with the same path caveat as
+the rest of this page — see the note at the top. There is also a
+**built-in** runtime that needs none of the paths below (no CLI, no cron,
+no token; configure a provider at `/ui/llm`), and the wrapper this
+deployment uses (`/root/brain-librarian.sh`) is a deployed instance of the
+generic, committed `scripts/brain-wrapper.sh`, configurable via
+`BRAINARD_URL`/`BRAINARD_TOKEN_FILE`/`BRAINARD_OUTBOX` env vars instead of
+hardcoded paths. See `docs/librarian.md` for both runtimes, when to pick
+which, and the raw API contract.
+
 **What runs, and what bounds it:**
 
-- `/root/brain-librarian.sh` — a hard-scoped wrapper (same pattern as
+- `/root/brain-librarian.sh` — this deployment's instance of the shipped,
+  hard-scoped wrapper `scripts/brain-wrapper.sh` (same pattern as
   `/root/brain-hub.sh`), one of the librarian's exactly two tools. It
   permits exactly three operations: `GET /v1/*` (read anything),
   `POST /v1/deposits` (checkpoint knowledge/events, same as any session),
@@ -259,7 +271,10 @@ is nothing prior for them to supersede.
   those two scoped grants are the entire enforcement boundary on what the
   librarian can do. Logs each run to a timestamped file under
   `/var/log/brain-librarian/` (created if missing), pruned to the last 30
-  runs.
+  runs. Runtime-agnostic via `LIBRARIAN_AGENT_CMD` (unset here, so this
+  deployment's invocation is exactly the `claude -p ...` form described
+  above) — see `docs/librarian.md` for the contract a non-Claude agent CLI
+  needs to satisfy.
 - `scripts/librarian-prompt.md` (committed) — the librarian's working
   prompt: identity, the four-step loop (work the flag queue, harvest
   `lesson.candidate` events, a light quality pass, close with a summary
