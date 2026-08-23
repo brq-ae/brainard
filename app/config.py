@@ -55,6 +55,22 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_api_key: str | None = None
 
+    # --- Built-in librarian engine (ADR-0010 phase 2) ---
+    # Master on/off switch for the always-on librarian loop started in
+    # app/main.py's lifespan (mirrors app/room_sweeper.py's always-on task).
+    # Default on: the loop itself already no-ops cleanly per cycle when no
+    # LLM provider is configured (app/librarian_engine.py's `run_librarian`),
+    # so leaving this true is safe out of the box -- this flag exists for an
+    # operator who wants to disable the feature outright (e.g. while
+    # debugging, or a deployment that only ever uses the external-agent
+    # runtime) without unsetting the LLM provider config.
+    librarian_enabled: bool = True
+    # Seconds between scheduled runs. Default: once daily (86400s) -- the
+    # librarian is a low-urgency curation pass, not a real-time process;
+    # matches the external-agent runtime's traditional "runs once per
+    # night" cadence (scripts/librarian-prompt.md).
+    librarian_interval_secs: int = 86400
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

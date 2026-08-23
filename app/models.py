@@ -470,6 +470,38 @@ class LlmConfig(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+# --- Built-in librarian run history (ADR-0010 phase 2: the built-in engine) ---
+
+
+class LibrarianRun(Base):
+    """One completed built-in-librarian run (app/librarian_engine.py's
+    `run_librarian`). A single row is written once, at completion --
+    there is no "in progress" row: a crash mid-run simply leaves no row for
+    that attempt (same acceptable trade-off as any unlogged crash in a
+    single-owner LAN deployment; the scheduled loop or the next owner-
+    triggered run tries again). `status` is 'skipped' when no LLM provider
+    was configured (no work attempted, no LLM call made), 'error' when the
+    run aborted early (repeated provider failures) or hit an unexpected
+    failure, and 'ok' otherwise. `counts` is a small JSON summary (flags
+    seen/merged/left-distinct/stale per type, lessons seen/harvested/
+    skipped, llm_calls/llm_failures, stale project names) -- the same
+    figures also written into the run's own summary deposit note, so this
+    table and the library/journal stay consistent without re-deriving one
+    from the other.
+    """
+
+    __tablename__ = "librarian_runs"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)  # 'ok' | 'error' | 'skipped'
+    counts: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (CheckConstraint("status IN ('ok', 'error', 'skipped')", name="ck_librarian_runs_status"),)
+
+
 # --- Agent chat rooms (ADR-0006, phase A: core rooms/messages/long-poll/
 # guardrails/notify) ---
 

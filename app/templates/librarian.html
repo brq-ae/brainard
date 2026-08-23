@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Librarian — The Brain{% endblock %}
+{% block content %}
+<div class="page-title"><h1>Librarian</h1></div>
+<p class="subtitle">The built-in curation job (ADR-0010): resolves duplicate/fork flags (merging when confident, leaving them distinct otherwise), harvests lesson.candidate events, and leaves a run-summary note. Deterministic orchestration -- the LLM is used only for judgment calls, never as an agent.</p>
+
+<div class="panel">
+  <h2>Status</h2>
+  <p><strong>Enabled</strong>: {{ 'yes' if enabled else 'no (LIBRARIAN_ENABLED=false)' }}</p>
+  <p><strong>Provider configured</strong>:
+    {% if configured %}<span class="mono">{{ effective.model }}</span> <span class="meta">({{ effective.source }})</span>{% else %}<span class="empty">not configured</span>{% endif %}
+  </p>
+  <p class="meta">Scheduled interval: every {{ interval_secs }}s</p>
+
+  {% if not configured %}
+  <div class="notice warn">
+    No LLM provider configured -- the scheduled loop and "Run now" both no-op cleanly (a run completes
+    immediately with status <span class="mono">skipped</span> and makes no LLM calls). Configure one on the
+    <a href="/ui/llm">LLM Provider</a> page first.
+  </div>
+  {% endif %}
+
+  <form method="post" action="/ui/librarian/run">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn primary">Run now</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Recent runs</h2>
+  {% if runs %}
+  <ul class="list">
+    {% for run in runs %}
+    <li class="row">
+      <span class="row-main">
+        <strong class="mono">{{ run.status }}</strong>
+        {% if run.error %}<div class="meta danger">{{ run.error }}</div>{% endif %}
+        {% if run.counts %}
+        <div class="meta">
+          {% for k, v in run.counts.items() %}<span class="sep">·</span>{{ k }}: {{ v }}{% endfor %}
+        </div>
+        {% endif %}
+      </span>
+      <span class="meta">{{ run.started_at|human_ts }} &rarr; {{ run.finished_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No runs yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -2,7 +2,7 @@
 {% block title %}Admin — Machines — The Brain{% endblock %}
 {% block content %}
 <div class="page-title"><h1>Admin — Machines</h1></div>
-<p class="subtitle">Mint and revoke per-machine bearer tokens.</p>
+<p class="subtitle">Mint, revoke, and reactivate per-machine bearer tokens.</p>
 
 {% if newly_minted %}
 <div class="notice ok">
@@ -50,17 +50,29 @@
       <div class="row">
         <span class="row-main">
           {{ m.name }}
+          {% if m.id == librarian_machine_id %}<span class="badge system">system</span>{% endif %}
           <div class="meta">created {{ m.created_at|human_ts }} <span class="sep">·</span> last seen {{ m.last_seen|human_ts if m.last_seen else "never" }}{% if m.default_project %} <span class="sep">·</span> default project: {{ m.default_project }}{% endif %}</div>
+          {% if m.id == librarian_machine_id %}
+          <div class="meta">Built-in librarian identity (ADR-0010) -- every deposit/flag-resolution the built-in librarian makes is attributed to this row. It has no usable bearer token and never authenticates over the API. <strong>Revoking it disables the built-in librarian</strong>: every scheduled or "Run now" run will skip cleanly (no LLM call, no deposit) until it's reactivated.</div>
+          {% endif %}
         </span>
         <span class="badge">{{ m.role }}</span>
         <span class="badge {{ m.status }}">{{ m.status }}</span>
         {% if m.status == "active" %}
-        <form class="inline" method="post" action="/ui/admin/machines/{{ m.id }}/revoke" data-confirm="Revoke machine &quot;{{ m.name }}&quot;? This cannot be undone.">
+        <form class="inline" method="post" action="/ui/admin/machines/{{ m.id }}/revoke" data-confirm="Revoke machine &quot;{{ m.name }}&quot;? It will stop authenticating (and, for the built-in librarian, stop running) until reactivated.">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit" class="btn danger">Revoke</button>
         </form>
+        {% elif m.status == "revoked" %}
+        <form class="inline" method="post" action="/ui/admin/machines/{{ m.id }}/reactivate">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn">Reactivate</button>
+        </form>
         {% endif %}
       </div>
+      {% if m.id == librarian_machine_id %}
+      <p class="meta">No rename/role/default-project or onboarding-prompt controls for this row -- it isn't a session-facing machine identity, so those affordances don't apply.</p>
+      {% else %}
       <details class="machine-details">
         <summary>Rename / role / default project / onboarding prompt</summary>
         <form method="post" action="/ui/admin/machines/{{ m.id }}/update">
@@ -87,6 +99,7 @@
         <div class="token-reveal" id="prompt-{{ m.id }}">{{ prompts[m.id] }}</div>
         <button type="button" class="btn" data-copy-target="prompt-{{ m.id }}">Copy prompt</button>
       </details>
+      {% endif %}
     </li>
     {% endfor %}
   </ul>

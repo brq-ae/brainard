@@ -21,6 +21,7 @@ from app.models import (
     Flag,
     Handoff,
     KnowledgeEntry,
+    LibrarianRun,
     LlmConfig,
     Machine,
     MirroredDocument,
@@ -86,6 +87,7 @@ async def _clean_tables():
         await session.execute(DoctrineVersion.__table__.delete())
         await session.execute(NotificationConfig.__table__.delete())
         await session.execute(LlmConfig.__table__.delete())
+        await session.execute(LibrarianRun.__table__.delete())
         await session.execute(Project.__table__.delete())
         await session.execute(Machine.__table__.delete())
         await session.execute(OwnerToken.__table__.delete())

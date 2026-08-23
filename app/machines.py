@@ -164,3 +164,21 @@ async def revoke_machine(db: AsyncSession, machine_id: str) -> Machine | None:
     machine.status = "revoked"
     await db.commit()
     return machine
+
+
+async def reactivate_machine(db: AsyncSession, machine_id: str) -> Machine | None:
+    """Reactivates a machine (idempotent: reactivating an already-active
+    machine is a no-op) -- the symmetric counterpart to `revoke_machine`
+    above, so revocation is never a one-way door. Restores the machine's
+    original token immediately (revoke never clears `token_hash`, only
+    flips `status`), and -- for the one reserved built-in-librarian machine
+    (app/librarian_engine.py's `LIBRARIAN_MACHINE_ID`) -- resumes normal
+    scheduled/"Run now" runs on the next attempt. Returns None if no such
+    machine exists, so callers can 404.
+    """
+    machine = await db.get(Machine, machine_id)
+    if machine is None:
+        return None
+    machine.status = "active"
+    await db.commit()
+    return machine

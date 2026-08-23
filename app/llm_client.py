@@ -150,3 +150,98 @@ def _timeout_result() -> dict:
         "latency_ms": None,
         "model_echo": None,
     }
+
+
+# --- Librarian judgment calls (ADR-0010 phase 2: the built-in engine) ---
+#
+# `chat_completion_json` is the ONE outbound call shape the built-in
+# librarian ever makes (app/librarian_engine.py): a single-shot chat
+# completion, no tool use, no follow-up turns (ADR-0010 decision 1). It
+# returns the raw assistant text; parsing that text as JSON is the caller's
+# job (deliberately -- a malformed response is an ordinary, expected outcome
+# the engine must handle conservatively, not an exception path).
+
+LIBRARIAN_CALL_TIMEOUT_SECS = 30.0
+LIBRARIAN_DEFAULT_MAX_TOKENS = 900
+
+
+class LlmCallError(Exception):
+    """Raised by `chat_completion_json` for every transport/HTTP/shape
+    failure (timeout, connection error, non-2xx status, unparseable/empty
+    response body). Callers (app/librarian_engine.py) treat this as exactly
+    one failed judgment call -- logged at WARNING with the exception type
+    only, counted toward the run's consecutive-failure abort threshold --
+    never a crash.
+    """
+
+
+async def _post_chat_messages(
+    base_url: str, model: str, api_key: str | None, messages: list[dict], *, max_tokens: int, timeout: float
+) -> httpx.Response:
+    """The one outbound call, factored out so tests can monkeypatch just
+    this call -- same "factor out the risky/mockable call" style as
+    `_post_chat_completion` above.
+    """
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    async with httpx.AsyncClient(timeout=timeout) as http_client:
+        return await http_client.post(url, json=payload, headers=headers)
+
+
+async def chat_completion_json(
+    effective: EffectiveLlmConfig,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = LIBRARIAN_DEFAULT_MAX_TOKENS,
+    timeout: float = LIBRARIAN_CALL_TIMEOUT_SECS,
+) -> str:
+    """One single-shot chat completion (system + user turn only, no history,
+    no tools) against the effective provider. Returns the raw assistant
+    message content as a string -- never parsed here. Raises `LlmCallError`
+    for every failure mode; never leaks the api_key (placed only in the
+    outbound Authorization header, same as `_post_chat_completion` above)
+    and never logs the prompt or response content -- callers log counts and
+    exception types only, per ADR-0010 phase 2's logging discipline.
+    """
+    if not effective.base_url or not effective.model:
+        raise LlmCallError("no LLM provider configured")
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        response = await _post_chat_messages(
+            effective.base_url,
+            effective.model,
+            effective.api_key,
+            messages,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        raise LlmCallError(f"transport error ({type(exc).__name__})") from exc
+
+    if response.status_code >= 400:
+        raise LlmCallError(f"provider returned HTTP {response.status_code}")
+
+    try:
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise LlmCallError("provider response did not contain a usable message") from exc
+
+    if not isinstance(content, str) or not content.strip():
+        raise LlmCallError("provider returned an empty completion")
+
+    return content

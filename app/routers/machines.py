@@ -1,9 +1,16 @@
-"""Machine registry: mint, list, revoke, update. Owner token required for
-all four.
+"""Machine registry: mint, list, revoke, reactivate, update. Owner token
+required for all five.
 
-The actual mint/list/revoke/update logic lives in app/machines.py, shared
-with the UI admin area (app/routers/ui_admin.py) so the two surfaces never
-drift.
+The actual mint/list/revoke/reactivate/update logic lives in
+app/machines.py, shared with the UI admin area (app/routers/ui_admin.py) so
+the two surfaces never drift.
+
+`reactivate` is the symmetric counterpart to `revoke` -- revocation is not a
+one-way door. This matters generally (a revoked agent machine can be
+brought back), and specifically for the one reserved built-in-librarian
+machine (app/librarian_engine.py's `LIBRARIAN_MACHINE_ID`), whose Revoke
+control now doubles as a real kill switch for the built-in librarian --
+without a reactivate path, that would be a trap.
 """
 
 from typing import Any
@@ -16,6 +23,7 @@ from app.db import get_db
 from app.errors import ApiError
 from app.machines import list_machines as _list_machines
 from app.machines import mint_machine
+from app.machines import reactivate_machine as reactivate_machine_impl
 from app.machines import revoke_machine as revoke_machine_impl
 from app.machines import update_machine as update_machine_impl
 from app.models import Machine
@@ -51,6 +59,18 @@ async def revoke_machine(
     db: AsyncSession = Depends(get_db),
 ) -> MachineRevokeResponse:
     machine = await revoke_machine_impl(db, machine_id)
+    if machine is None:
+        raise ApiError(404, "machine_not_found", f"No machine with id '{machine_id}'.")
+    return MachineRevokeResponse(id=machine.id, status=machine.status)
+
+
+@router.post("/{machine_id}/reactivate", response_model=MachineRevokeResponse)
+async def reactivate_machine(
+    machine_id: str,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> MachineRevokeResponse:
+    machine = await reactivate_machine_impl(db, machine_id)
     if machine is None:
         raise ApiError(404, "machine_not_found", f"No machine with id '{machine_id}'.")
     return MachineRevokeResponse(id=machine.id, status=machine.status)

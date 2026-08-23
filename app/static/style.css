@@ -149,6 +149,7 @@ main {
 .badge.superseded, .badge.paused { color: var(--warn); border-color: var(--warn); }
 .badge.retired, .badge.revoked, .badge.inactive { color: var(--danger); border-color: var(--danger); }
 .badge.done { color: var(--text-dim); }
+.badge.system { color: var(--accent); border-color: var(--accent-dim); }
 
 .tag {
   display: inline-block;

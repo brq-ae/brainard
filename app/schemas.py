@@ -678,6 +678,23 @@ class RoomModeSwitchResponse(BaseModel):
     announcement: str
 
 
+# --- Built-in librarian run history (ADR-0010 phase 2) ---
+
+
+class LibrarianRunItem(BaseModel):
+    id: str
+    started_at: datetime
+    finished_at: datetime
+    status: str  # 'ok' | 'error' | 'skipped'
+    counts: dict[str, Any]
+    error: str | None
+
+
+class LibrarianRunListResponse(BaseModel):
+    results: list[LibrarianRunItem]
+    next_cursor: str | None
+
+
 # --- Room delete + free-form groups (ADR-0008) ---
 
 

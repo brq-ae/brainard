@@ -82,6 +82,85 @@ async def test_revoke_unknown_machine_returns_404(client, db_session):
     assert resp.json()["error"]["code"] == "machine_not_found"
 
 
+# --- reactivate: the symmetric counterpart to revoke, so revocation is
+# never a one-way door ---
+
+
+async def test_reactivate_after_revoke_restores_authentication(client, db_session):
+    headers = await _owner_headers(db_session)
+
+    resp = await client.post("/v1/machines", json={"name": "reactivate-box"}, headers=headers)
+    assert resp.status_code == 201
+    machine_id = resp.json()["id"]
+    machine_token = resp.json()["token"]
+    machine_headers = {"Authorization": f"Bearer {machine_token}"}
+
+    # authenticates fine before revocation
+    assert (await client.get("/v1/flags", headers=machine_headers)).status_code == 200
+
+    revoke_resp = await client.post(f"/v1/machines/{machine_id}/revoke", headers=headers)
+    assert revoke_resp.status_code == 200
+    assert revoke_resp.json() == {"id": machine_id, "status": "revoked"}
+
+    # revoked -- the same token no longer authenticates
+    denied = await client.get("/v1/flags", headers=machine_headers)
+    assert denied.status_code == 401
+    assert denied.json()["error"]["code"] == "token_revoked"
+
+    reactivate_resp = await client.post(f"/v1/machines/{machine_id}/reactivate", headers=headers)
+    assert reactivate_resp.status_code == 200
+    assert reactivate_resp.json() == {"id": machine_id, "status": "active"}
+
+    # the EXACT SAME original token authenticates again -- reactivate never
+    # clears/rotates token_hash, only flips status back
+    resumed = await client.get("/v1/flags", headers=machine_headers)
+    assert resumed.status_code == 200
+
+    # list reflects active status again
+    listing = await client.get("/v1/machines", headers=headers)
+    row = next(m for m in listing.json() if m["id"] == machine_id)
+    assert row["status"] == "active"
+
+
+async def test_reactivate_idempotent_on_already_active_machine(client, db_session):
+    headers = await _owner_headers(db_session)
+    resp = await client.post("/v1/machines", json={"name": "already-active"}, headers=headers)
+    machine_id = resp.json()["id"]
+
+    first = await client.post(f"/v1/machines/{machine_id}/reactivate", headers=headers)
+    assert first.status_code == 200
+    assert first.json() == {"id": machine_id, "status": "active"}
+
+    second = await client.post(f"/v1/machines/{machine_id}/reactivate", headers=headers)
+    assert second.status_code == 200
+    assert second.json() == {"id": machine_id, "status": "active"}
+
+
+async def test_reactivate_owner_token_required(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post("/v1/machines", json={"name": "m1"}, headers=owner_headers)
+    machine_id = resp.json()["id"]
+    machine_token = resp.json()["token"]
+
+    reactivate_resp = await client.post(
+        f"/v1/machines/{machine_id}/reactivate", headers={"Authorization": f"Bearer {machine_token}"}
+    )
+    assert reactivate_resp.status_code == 403
+    assert reactivate_resp.json()["error"]["code"] == "owner_token_required"
+
+
+async def test_reactivate_missing_auth_rejected(client, db_session):
+    resp = await client.post("/v1/machines/01UNKNOWNIDXXXXXXXXXXXXXX/reactivate")
+    assert resp.status_code == 401
+
+
+async def test_reactivate_unknown_machine_returns_404(client, db_session):
+    headers = await _owner_headers(db_session)
+    resp = await client.post("/v1/machines/01UNKNOWNIDXXXXXXXXXXXXXX/reactivate", headers=headers)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "machine_not_found"
+
+
 # --- roles + default_project (feature: machine roles + prebuilt onboarding prompt) ---
 
 

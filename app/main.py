@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
 from app.errors import ApiError, api_error_handler
+from app.librarian_engine import run_librarian_loop
 from app.room_sweeper import run_sweeper
 from app.routers import (
     bootstrap,
@@ -21,6 +22,7 @@ from app.routers import (
     export,
     flags,
     health,
+    librarian,
     library,
     llm_config,
     machines,
@@ -33,6 +35,7 @@ from app.routers import (
     ui_dashboard,
     ui_doctrine,
     ui_journal,
+    ui_librarian,
     ui_library,
     ui_llm,
     ui_login,
@@ -56,12 +59,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # cycle in its own try/except, so a bad cycle never crashes the app;
     # this shutdown path just ensures the task itself is stopped cleanly.
     sweeper_task = asyncio.create_task(run_sweeper())
+    # ADR-0010 phase 2: the built-in librarian's always-on scheduled loop,
+    # started the same way as the room sweeper above -- shares the app's
+    # event loop, reliably cancelled on shutdown. app/librarian_engine.py's
+    # run_librarian_loop() already wraps every cycle in its own try/except
+    # (a bad cycle never crashes the app) and no-ops cleanly when
+    # LIBRARIAN_ENABLED is false or no LLM provider is configured.
+    librarian_task = asyncio.create_task(run_librarian_loop())
     try:
         yield
     finally:
         sweeper_task.cancel()
+        librarian_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sweeper_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await librarian_task
 
 
 app = FastAPI(title="The Brain", version="0.1.0", lifespan=lifespan)
@@ -97,6 +110,7 @@ app.include_router(bootstrap.router)
 app.include_router(export.router)
 app.include_router(notifications.router)
 app.include_router(llm_config.router)
+app.include_router(librarian.router)
 app.include_router(rooms.router)
 
 # --- UI (owner cookie session; see app/ui_auth.py) ---
@@ -109,6 +123,7 @@ app.include_router(ui_journal.router)
 app.include_router(ui_doctrine.router)
 app.include_router(ui_notifications.router)
 app.include_router(ui_llm.router)
+app.include_router(ui_librarian.router)
 app.include_router(ui_rooms.router)
 app.include_router(ui_admin.router)
 

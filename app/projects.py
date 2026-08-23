@@ -77,6 +77,36 @@ def apply_project_update(project: Project, data: dict[str, Any]) -> None:
         project.status = data["status"]
 
 
+async def stale_active_project_names(db: AsyncSession, cutoff: datetime) -> list[str]:
+    """Active projects whose latest deposit (if any) is older than `cutoff`,
+    or that have never received a deposit at all -- backs the built-in
+    librarian's run-summary staleness check (ADR-0010 phase 2,
+    app/librarian_engine.py), mirroring scripts/librarian-prompt.md's
+    external-agent equivalent ("any `active` project whose
+    `latest_deposit_at` is more than 7 days old (or null)").
+
+    Named and shaped differently from `list_projects_page` above
+    (cursor-paginated, UI-facing, newest-activity-first over ALL projects):
+    this is a small, unpaginated "give me every stale one" query for a
+    background job that needs the whole list at once, not a page render.
+    """
+    latest_deposit_subq = (
+        select(Deposit.project, func.max(Deposit.received_at).label("latest_deposit_at"))
+        .group_by(Deposit.project)
+        .subquery()
+    )
+    ts_col = latest_deposit_subq.c.latest_deposit_at
+
+    stmt = (
+        select(Project.name)
+        .outerjoin(latest_deposit_subq, Project.name == latest_deposit_subq.c.project)
+        .where(Project.status == "active")
+        .where(or_(ts_col.is_(None), ts_col < cutoff))
+        .order_by(Project.name)
+    )
+    return list((await db.scalars(stmt)).all())
+
+
 async def list_project_names(db: AsyncSession) -> list[str]:
     """All registered project names, alphabetical -- used to populate filter
     dropdowns on the UI's library/journal pages (app/routers/ui_library.py,

@@ -8,8 +8,10 @@ equivalents.
 import html
 import re
 
+from sqlalchemy import select
 from ulid import ULID
 
+import app.librarian_engine as librarian_engine_module
 from app.models import Machine, OwnerToken
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
@@ -475,3 +477,147 @@ async def test_ui_proposal_already_decided_rejected(client, db_session):
 
     second = await client.post(f"/ui/admin/proposals/{proposal_id}/reject", data={"csrf_token": csrf})
     assert second.status_code == 422
+
+
+# --- reserved built-in-librarian machine: legible, not a silent no-op
+# (independent review advisory G) ---
+
+
+async def test_admin_machines_marks_reserved_librarian_row_as_system(client, db_session):
+    await _login(client, db_session)
+    db_session.add(
+        Machine(
+            id=librarian_engine_module.LIBRARIAN_MACHINE_ID,
+            name=librarian_engine_module.LIBRARIAN_MACHINE_NAME,
+            token_hash=hash_token("unused-reserved-machine-token"),
+            status="active",
+            role="solo",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get("/ui/admin/machines")
+    assert resp.status_code == 200
+    assert "brainard-librarian" in resp.text
+    assert '<span class="badge system">system</span>' in resp.text
+    assert "Revoking it disables the built-in librarian" in resp.text
+
+
+async def test_admin_machines_hides_onboarding_prompt_affordance_for_reserved_librarian_row(client, db_session):
+    await _login(client, db_session)
+    db_session.add(
+        Machine(
+            id=librarian_engine_module.LIBRARIAN_MACHINE_ID,
+            name=librarian_engine_module.LIBRARIAN_MACHINE_NAME,
+            token_hash=hash_token("unused-reserved-machine-token"),
+            status="active",
+            role="solo",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get("/ui/admin/machines")
+    assert resp.status_code == 200
+    # the note explaining why replaces the onboarding-prompt controls
+    assert "No rename/role/default-project or onboarding-prompt controls for this row" in resp.text
+    # and no prompt-copy affordance was rendered for this specific row's id
+    assert f'id="prompt-{librarian_engine_module.LIBRARIAN_MACHINE_ID}"' not in resp.text
+
+
+async def test_admin_machines_revoke_control_still_present_for_reserved_librarian_row(client, db_session):
+    """The row must stay a genuinely useful, visible control -- not hidden --
+    since revoking it now really does disable the built-in librarian
+    (app/librarian_engine.py's `run_librarian`).
+    """
+    await _login(client, db_session)
+    db_session.add(
+        Machine(
+            id=librarian_engine_module.LIBRARIAN_MACHINE_ID,
+            name=librarian_engine_module.LIBRARIAN_MACHINE_NAME,
+            token_hash=hash_token("unused-reserved-machine-token"),
+            status="active",
+            role="solo",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get("/ui/admin/machines")
+    assert f'action="/ui/admin/machines/{librarian_engine_module.LIBRARIAN_MACHINE_ID}/revoke"' in resp.text
+    assert ">Revoke<" in resp.text
+
+
+async def test_admin_machines_ordinary_machine_still_shows_onboarding_details(client, db_session):
+    """Regression guard: the reserved-row special-casing must not affect
+    ordinary machines' existing rename/role/default-project/onboarding-prompt
+    affordance.
+    """
+    await _login(client, db_session)
+    await client.post("/ui/admin/machines", data={"name": "ordinary-machine", "csrf_token": _extract_csrf((await client.get("/ui/admin/machines")).text)})
+
+    resp = await client.get("/ui/admin/machines")
+    assert "Rename / role / default project / onboarding prompt" in resp.text
+    assert "No rename/role/default-project or onboarding-prompt controls for this row" not in resp.text
+
+
+# --- reactivate: the symmetric UI control for a revoked row, since
+# revocation is not a one-way door ---
+
+
+async def test_admin_machines_reactivate_button_shown_only_for_revoked_rows(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    create_resp = await client.post("/ui/admin/machines", data={"name": "revoke-me", "csrf_token": csrf})
+    assert create_resp.status_code == 201
+    machine = (await db_session.scalars(select(Machine).where(Machine.name == "revoke-me"))).one()
+
+    before = await client.get("/ui/admin/machines")
+    assert f'action="/ui/admin/machines/{machine.id}/revoke"' in before.text
+    assert f'action="/ui/admin/machines/{machine.id}/reactivate"' not in before.text
+
+    revoke_resp = await client.post(f"/ui/admin/machines/{machine.id}/revoke", data={"csrf_token": csrf})
+    assert revoke_resp.status_code == 303
+
+    after = await client.get("/ui/admin/machines")
+    assert f'action="/ui/admin/machines/{machine.id}/reactivate"' in after.text
+    assert f'action="/ui/admin/machines/{machine.id}/revoke"' not in after.text
+    assert ">Reactivate<" in after.text
+
+
+async def test_admin_machines_reactivate_actually_reactivates(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    await client.post("/ui/admin/machines", data={"name": "revoke-then-reactivate", "csrf_token": csrf})
+    machine = (await db_session.scalars(select(Machine).where(Machine.name == "revoke-then-reactivate"))).one()
+
+    await client.post(f"/ui/admin/machines/{machine.id}/revoke", data={"csrf_token": csrf})
+    await db_session.refresh(machine)
+    assert machine.status == "revoked"
+
+    reactivate_resp = await client.post(f"/ui/admin/machines/{machine.id}/reactivate", data={"csrf_token": csrf})
+    assert reactivate_resp.status_code == 303
+
+    await db_session.refresh(machine)
+    assert machine.status == "active"
+
+    listing = await client.get("/ui/admin/machines")
+    assert f'action="/ui/admin/machines/{machine.id}/revoke"' in listing.text  # Revoke control is back
+
+
+async def test_admin_machines_reactivate_without_csrf_rejected(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/admin/machines")
+    csrf = _extract_csrf(page.text)
+
+    await client.post("/ui/admin/machines", data={"name": "csrf-guard-machine", "csrf_token": csrf})
+    machine = (await db_session.scalars(select(Machine).where(Machine.name == "csrf-guard-machine"))).one()
+    await client.post(f"/ui/admin/machines/{machine.id}/revoke", data={"csrf_token": csrf})
+
+    resp = await client.post(f"/ui/admin/machines/{machine.id}/reactivate", data={})
+    assert resp.status_code == 403
+
+    await db_session.refresh(machine)
+    assert machine.status == "revoked"  # unchanged
