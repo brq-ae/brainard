@@ -468,6 +468,32 @@ class LlmConfigTestResponse(BaseModel):
     model_echo: str | None = None
 
 
+class LlmModelsRequest(BaseModel):
+    """Both optional -- see app/llm_config.py's `resolve_models_source` for
+    the exact fallback rule: when `base_url` is given, `api_key` is used
+    exactly as given (never silently mixed with whatever key is currently
+    saved for a *different* provider); when `base_url` is omitted, both
+    values come from the effective stored/env config together.
+    """
+
+    base_url: str | None = None
+    api_key: str | None = None
+
+
+class LlmModelsResponse(BaseModel):
+    """`models` is just the `id` values from the provider's `GET
+    {base_url}/models` (OpenAI-compatible `{"data": [{"id": ...}, ...]}`),
+    sorted, deduplicated, and capped (app/llm_client.py's
+    `MODELS_LIST_CAP`) -- `truncated` says whether the cap actually cut
+    anything, so the UI can disclose it rather than silently showing a
+    partial list as if it were complete.
+    """
+
+    models: list[str]
+    count: int
+    truncated: bool = False
+
+
 # --- Flags (contracts-v1.md §3, ADR-0004 librarian inbox) ---
 
 

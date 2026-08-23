@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import httpx
 from ulid import ULID
 
+import app.llm_client as llm_client_module
 import app.llm_config as llm_config_module
 from app.models import LlmConfig, Machine, OwnerToken
 from app.security import generate_machine_token, generate_owner_token, hash_token
@@ -224,6 +225,140 @@ async def test_llm_test_connection_without_csrf_rejected(client, db_session):
     await _login(client, db_session)
     resp = await client.post("/ui/llm/test", data={})
     assert resp.status_code == 403
+
+
+# --- model discovery ("Fetch models" button, app/static/llm.js, POST /ui/llm/models) ---
+
+
+def _install_get_models_stub(monkeypatch, handler) -> None:
+    monkeypatch.setattr(llm_client_module, "_get_models", handler)
+
+
+async def test_llm_page_renders_fetch_models_button_and_config(client, db_session):
+    await _login(client, db_session)
+    resp = await client.get("/ui/llm")
+    assert resp.status_code == 200
+    assert 'id="llm-fetch-models-btn"' in resp.text
+    assert 'id="llm-config"' in resp.text
+    assert 'data-csrf="' in resp.text
+    assert '/static/llm.js' in resp.text
+
+
+async def test_llm_models_endpoint_happy_path(client, db_session, monkeypatch):
+    await _login(client, db_session)
+    page = await client.get("/ui/llm")
+    csrf = _extract_csrf(page.text)
+
+    async def fake_get_models(base_url, api_key, *, timeout):
+        return httpx.Response(200, json={"data": [{"id": "zeta-model"}, {"id": "alpha-model"}]})
+
+    _install_get_models_stub(monkeypatch, fake_get_models)
+
+    resp = await client.post(
+        "/ui/llm/models",
+        data={"base_url": "http://ollama:11434/v1", "api_key": "", "csrf_token": csrf},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["models"] == ["alpha-model", "zeta-model"]
+    assert data["truncated"] is False
+
+
+async def test_llm_models_endpoint_without_csrf_rejected(client, db_session):
+    await _login(client, db_session)
+    resp = await client.post("/ui/llm/models", data={"base_url": "http://ollama:11434/v1"})
+    assert resp.status_code == 403
+
+
+async def test_llm_models_endpoint_machine_token_cannot_reach_ui(client, db_session):
+    machine_token = await _machine_token(db_session)
+    resp = await client.post(
+        "/ui/llm/models",
+        data={"base_url": "http://ollama:11434/v1"},
+        headers={"Authorization": f"Bearer {machine_token}"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+
+async def test_llm_models_endpoint_clean_error_no_provider(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/llm")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post("/ui/llm/models", data={"csrf_token": csrf})
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "no_llm_provider_configured"
+
+
+async def test_llm_models_endpoint_api_key_never_leaked(client, db_session, monkeypatch):
+    await _login(client, db_session)
+    page = await client.get("/ui/llm")
+    csrf = _extract_csrf(page.text)
+
+    async def fake_get_models(base_url, api_key, *, timeout):
+        return httpx.Response(200, json={"data": [{"id": "m1"}]})
+
+    _install_get_models_stub(monkeypatch, fake_get_models)
+
+    secret = "sk-uisecretvalue777"
+    resp = await client.post(
+        "/ui/llm/models",
+        data={"base_url": "http://ollama:11434/v1", "api_key": secret, "csrf_token": csrf},
+    )
+    assert resp.status_code == 200
+    assert secret not in resp.text
+
+
+# --- XSS: model ids are PROVIDER-supplied, i.e. untrusted (same posture as
+# app/room_ai.py's model-output transcript content) ---
+
+
+async def test_llm_models_endpoint_returns_malicious_ids_as_plain_json_not_html(client, db_session, monkeypatch):
+    """The endpoint's response is JSON (Content-Type: application/json),
+    never HTML -- a malicious model id can only ever be rendered by the
+    page's own JS, and only via textContent (see the static-source check
+    below), never interpolated into a server-rendered HTML response here.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/llm")
+    csrf = _extract_csrf(page.text)
+
+    hostile_id = "<img src=x onerror=alert(1)>"
+
+    async def fake_get_models(base_url, api_key, *, timeout):
+        return httpx.Response(200, json={"data": [{"id": hostile_id}]})
+
+    _install_get_models_stub(monkeypatch, fake_get_models)
+
+    resp = await client.post(
+        "/ui/llm/models",
+        data={"base_url": "http://ollama:11434/v1", "csrf_token": csrf},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.json()["models"] == [hostile_id]  # raw JSON data, not HTML -- inert in this context
+
+
+def test_llm_js_renders_via_textcontent_not_innerhtml():
+    """Static-source check on app/static/llm.js: the model-id-rendering
+    path must use textContent/createElement (inert against markup) and
+    must never assign untrusted content via innerHTML -- same discipline,
+    same check style, as tests/test_ui_rooms.py's
+    `test_rooms_js_renders_via_textcontent_not_innerhtml` for the
+    analogous model-output-rendering surface.
+    """
+    from pathlib import Path
+
+    js_path = Path(__file__).resolve().parent.parent / "app" / "static" / "llm.js"
+    source = js_path.read_text()
+
+    code_only = "\n".join(line for line in source.splitlines() if not line.strip().startswith("//"))
+
+    assert ".innerHTML" not in code_only, "llm.js must never assign to .innerHTML for provider-supplied content"
+    assert "textContent" in source
+    assert "createElement" in source
 
 
 # --- auth gating ---

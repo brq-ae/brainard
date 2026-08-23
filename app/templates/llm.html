@@ -40,6 +40,17 @@
   <p class="empty">No LLM provider configured yet (neither environment nor database).</p>
   {% endif %}
 
+  <p class="meta">
+    Call timeout: <strong>{{ call_timeout_secs|int }}s</strong> (LLM_CALL_TIMEOUT_SECS)
+    <span class="sep">·</span>
+    Test timeout: <strong>{{ test_timeout_secs|int }}s</strong> (LLM_TEST_TIMEOUT_SECS)
+  </p>
+  <p class="meta">
+    Env-configured, read-only here -- a change requires a restart. Local or reasoning models (ones that
+    "think" before answering) may need a larger LLM_CALL_TIMEOUT_SECS; a timeout means the model was still
+    working, not that the provider is unreachable.
+  </p>
+
   <form method="post" action="/ui/llm/test">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit" class="btn">Test connection</button>
@@ -56,6 +67,10 @@
     <span class="sep">·</span> LM Studio (<span class="mono">http://localhost:1234/v1</span>)
     <span class="sep">·</span> vLLM (<span class="mono">http://localhost:8000/v1</span>)
   </p>
+  <!-- Config for app/static/llm.js, read via data-* attributes only -- no
+       inline event handlers/JS in this template (same discipline as
+       app/templates/room_view.html's #room-config). -->
+  <div id="llm-config" data-csrf="{{ csrf_token }}"></div>
   <form method="post" action="/ui/llm">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="field">
@@ -65,6 +80,17 @@
     <div class="field">
       <label for="model">Model</label>
       <input type="text" id="model" name="model" class="mono" placeholder="llama3.1" required>
+      <button type="button" class="btn" id="llm-fetch-models-btn">Fetch models</button>
+      <p class="meta">Discovers what the provider at Base URL actually has installed -- or type the model name
+        directly above; not every provider supports discovery.</p>
+      <div id="llm-models-error" class="notice danger" style="display:none"></div>
+      <div id="llm-models-picker-wrap" style="display:none">
+        <label for="llm-models-picker">Discovered models</label>
+        <select id="llm-models-picker" class="mono">
+          <option value="">-- select a discovered model --</option>
+        </select>
+        <p id="llm-models-truncated-note" class="meta" style="display:none"></p>
+      </div>
     </div>
     <div class="field">
       <label for="api_key">API key (optional)</label>
@@ -97,4 +123,6 @@
   <p class="empty">No history yet.</p>
   {% endif %}
 </div>
+
+<script src="/static/llm.js"></script>
 {% endblock %}

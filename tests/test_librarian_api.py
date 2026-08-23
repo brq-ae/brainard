@@ -167,10 +167,12 @@ async def test_get_runs_pagination(client, db_session, monkeypatch):
 
 async def test_run_exceeding_timeout_writes_error_row_and_returns_enveloped_error(client, db_session, monkeypatch):
     headers = await _owner_headers(db_session)
-    # The real 600s limit would make this test itself hang for ten minutes;
-    # shrink it to a few milliseconds so `asyncio.wait_for` trips almost
-    # immediately against a `run_librarian` that deliberately never finishes.
-    monkeypatch.setattr(librarian_router_module, "INLINE_RUN_TIMEOUT_SECS", 0.05)
+    # The real (derived, now potentially minutes-long -- see
+    # tests/test_librarian_inline_timeout.py) limit would make this test
+    # itself hang; shrink the EFFECTIVE wrapper timeout to a few
+    # milliseconds so `asyncio.wait_for` trips almost immediately against a
+    # `run_librarian` that deliberately never finishes.
+    monkeypatch.setattr(librarian_router_module, "effective_inline_run_timeout_secs", lambda limits=None: 0.05)
 
     async def hanging_run_librarian(*, limits, run_id):
         await asyncio.sleep(10)  # far longer than the patched timeout
@@ -184,6 +186,8 @@ async def test_run_exceeding_timeout_writes_error_row_and_returns_enveloped_erro
     data = resp.json()
     assert data["error"]["code"] == "librarian_run_timeout"
     assert "did not finish" in data["error"]["detail"].lower()
+    # names the lever the owner can actually pull -- not just "check logs"
+    assert "LIBRARIAN_INLINE_RUN_TIMEOUT_SECS" in data["error"]["detail"]
 
     rows = (await db_session.execute(LibrarianRun.__table__.select())).all()
     assert len(rows) == 1
@@ -191,5 +195,6 @@ async def test_run_exceeding_timeout_writes_error_row_and_returns_enveloped_erro
     assert row.status == "error"
     assert row.error is not None
     assert "did not finish" in row.error.lower() or "cancelled" in row.error.lower()
+    assert "LIBRARIAN_INLINE_RUN_TIMEOUT_SECS" in row.error
     assert row.finished_at is not None
     assert row.started_at is not None

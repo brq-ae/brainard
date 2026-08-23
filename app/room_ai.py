@@ -50,6 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ulid import ULID
 
 from app.auth import Principal
+from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
 from app.llm_client import LlmCallError, chat_completion_json
@@ -81,8 +82,16 @@ ROOM_AI_ENVELOPE_PROJECT = "brainard"
 # window even after prompt/system overhead, while still covering a long
 # room transcript in full most of the time.
 TRANSCRIPT_CHAR_BUDGET = 40_000
-CALL_TIMEOUT_SECS = 30.0
 VALID_DEPOSIT_NAMESPACES = frozenset({"lessons", "howto", "reference"})
+
+# Headroom for a reasoning model's chain-of-thought PLUS the actual JSON
+# answer -- same rationale as app/llm_client.py's LIBRARIAN_DEFAULT_MAX_TOKENS
+# (a real deployment observed a local reasoning model exhaust a much
+# smaller budget on internal reasoning alone before any content). `lessons`
+# gets a larger budget than the other three actions since its output is a
+# list of full title+body entries, not a single short judgment.
+ROOM_AI_MAX_TOKENS = 2000
+ROOM_AI_LESSONS_MAX_TOKENS = 2800
 
 # Head+tail split of the budget (see `_format_transcript_for_prompt` below):
 # half for the opening context (topic, initial positions), half for the
@@ -399,10 +408,10 @@ def _parse_lessons_response(content: str) -> dict | None:
 
 # action -> (system-prompt builder, response parser, max_tokens)
 _ACTIONS: dict[str, tuple] = {
-    "summarize": (_build_summarize_system_prompt, _parse_summarize_response, 900),
-    "verdict": (_build_verdict_system_prompt, _parse_verdict_response, 900),
-    "decisions": (_build_decisions_system_prompt, _parse_decisions_response, 900),
-    "lessons": (_build_lessons_system_prompt, _parse_lessons_response, 1400),
+    "summarize": (_build_summarize_system_prompt, _parse_summarize_response, ROOM_AI_MAX_TOKENS),
+    "verdict": (_build_verdict_system_prompt, _parse_verdict_response, ROOM_AI_MAX_TOKENS),
+    "decisions": (_build_decisions_system_prompt, _parse_decisions_response, ROOM_AI_MAX_TOKENS),
+    "lessons": (_build_lessons_system_prompt, _parse_lessons_response, ROOM_AI_LESSONS_MAX_TOKENS),
 }
 ACTIONS = frozenset(_ACTIONS)
 
@@ -457,15 +466,26 @@ async def run_action(db: AsyncSession, room_id: str, action: str) -> RoomAiActio
     system_prompt = build_system_prompt(nonce)
     user_prompt = _build_user_prompt(room, formatted.text, formatted.truncated, nonce)
 
+    # Owner-configurable (app/config.py's `llm_call_timeout_secs`, env
+    # LLM_CALL_TIMEOUT_SECS) -- read fresh per call rather than cached at
+    # import time, same as every other per-request settings read in this
+    # app (e.g. app/routers/ui_librarian.py).
+    timeout = get_settings().llm_call_timeout_secs
+
     try:
         content = await chat_completion_json(
             effective,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_tokens=max_tokens,
-            timeout=CALL_TIMEOUT_SECS,
+            timeout=timeout,
         )
     except LlmCallError as exc:
+        # `exc`'s message (app/llm_client.py) is always safe to surface
+        # here -- never the api_key, never the prompt/response content --
+        # and, for a timeout specifically, self-explaining rather than the
+        # old "transport error (ReadTimeout)" (reads like a network fault
+        # even when the provider was simply still working).
         raise ApiError(
             503,
             "llm_call_failed",

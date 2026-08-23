@@ -988,3 +988,94 @@ async def test_action_result_json_carries_raw_text_as_data_not_html(client, db_s
 
     assert resp.status_code == 200
     assert resp.json()["result"]["summary"] == hostile_summary
+
+
+# --- configurable timeout (app/config.py's LLM_CALL_TIMEOUT_SECS) ---
+
+
+async def test_run_action_uses_configured_call_timeout(client, db_session, monkeypatch):
+    """A real deployment hit a hardcoded 30s timeout with a local reasoning
+    model on an ordinary room transcript; the call timeout must now come
+    from settings, not a module constant.
+    """
+    from app.config import get_settings
+
+    owner_headers = await _owner_headers(db_session)
+    await _configure_provider(db_session)
+    room = await _create_room_via_api(client, owner_headers)
+
+    captured = {}
+
+    async def fake_chat_completion_json(effective, *, system_prompt, user_prompt, max_tokens, timeout):
+        captured["timeout"] = timeout
+        return _summarize_response()
+
+    monkeypatch.setattr(room_ai_module, "chat_completion_json", fake_chat_completion_json)
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/ai/summarize", headers=owner_headers)
+
+    assert resp.status_code == 200, resp.json()
+    assert captured["timeout"] == get_settings().llm_call_timeout_secs
+
+
+async def test_run_action_uses_overridden_call_timeout_from_settings(client, db_session, monkeypatch):
+    """Same as above, but with a distinctive non-default value monkeypatched
+    onto app.room_ai's own `get_settings` import, proving the value is read
+    live from settings rather than baked in at import time.
+    """
+    from types import SimpleNamespace
+
+    owner_headers = await _owner_headers(db_session)
+    await _configure_provider(db_session)
+    room = await _create_room_via_api(client, owner_headers)
+
+    monkeypatch.setattr(room_ai_module, "get_settings", lambda: SimpleNamespace(llm_call_timeout_secs=917.0))
+
+    captured = {}
+
+    async def fake_chat_completion_json(effective, *, system_prompt, user_prompt, max_tokens, timeout):
+        captured["timeout"] = timeout
+        return _summarize_response()
+
+    monkeypatch.setattr(room_ai_module, "chat_completion_json", fake_chat_completion_json)
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/ai/summarize", headers=owner_headers)
+
+    assert resp.status_code == 200, resp.json()
+    assert captured["timeout"] == 917.0
+
+
+async def test_timeout_failure_message_is_self_explaining_and_enveloped(client, db_session, monkeypatch):
+    """The message app/llm_client.py raises for a real provider timeout
+    (verbatim, modulo the actual configured seconds) must reach the owner
+    through the enveloped error shape with the existing "nothing was
+    stored" reassurance -- not the old "transport error (ReadTimeout)"
+    wording, which reads like a network fault even though the provider may
+    simply still be working (a local or reasoning model).
+    """
+    from app.llm_client import LlmCallError
+
+    owner_headers = await _owner_headers(db_session)
+    await _configure_provider(db_session)
+    room = await _create_room_via_api(client, owner_headers)
+
+    timeout_message = (
+        "the provider did not respond within 180s -- a local or reasoning model may need a longer "
+        "LLM_CALL_TIMEOUT_SECS, or try a smaller/non-reasoning model"
+    )
+    _install_llm_stub(monkeypatch, [LlmCallError(timeout_message)])
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/ai/summarize", headers=owner_headers)
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"]["code"] == "llm_call_failed"
+    detail = body["error"]["detail"]
+    assert "did not respond within 180s" in detail
+    assert "LLM_CALL_TIMEOUT_SECS" in detail
+    assert "nothing was stored" in detail
+    assert "transport error" not in detail.lower()
+    assert "ReadTimeout" not in detail
+
+    rows = (await db_session.execute(KnowledgeEntry.__table__.select())).all()
+    assert rows == []

@@ -18,9 +18,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import Principal, require_owner
+from app.config import get_settings
 from app.db import get_db
-from app.llm_client import test_llm_connection
-from app.llm_config import EffectiveLlmConfig, create_version, mask_api_key, resolve_llm_config
+from app.errors import ApiError
+from app.llm_client import LlmModelsError, list_provider_models, test_llm_connection
+from app.llm_config import EffectiveLlmConfig, create_version, mask_api_key, resolve_llm_config, resolve_models_source
 from app.llm_config import history as config_history
 from app.models import LlmConfig
 from app.schemas import (
@@ -29,6 +31,8 @@ from app.schemas import (
     LlmConfigResponse,
     LlmConfigTestResponse,
     LlmEffectiveConfig,
+    LlmModelsRequest,
+    LlmModelsResponse,
 )
 
 router = APIRouter(prefix="/v1/llm-config", tags=["llm-config"])
@@ -97,3 +101,33 @@ async def test_llm_config(
     effective = await resolve_llm_config(db)
     result = await test_llm_connection(effective)
     return LlmConfigTestResponse(**result)
+
+
+@router.post("/models", response_model=LlmModelsResponse)
+async def list_llm_models(
+    body: LlmModelsRequest | None = None,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> LlmModelsResponse:
+    """Discovers what models a provider actually has available (`GET
+    {base_url}/models`, the OpenAI-compatible shape every provider this app
+    targets -- Ollama, OpenAI, OpenRouter, DeepSeek, LM Studio, vLLM --
+    exposes), so the owner doesn't have to type an exact model tag from
+    memory. `body` is entirely optional (an empty POST is valid): when it
+    supplies `base_url`, that (and only the also-supplied `api_key`, never
+    a different provider's stored one -- see `resolve_models_source`) is
+    probed, letting the owner discover models BEFORE saving a config at
+    all; otherwise the effective stored/env config is used, same source
+    `POST /v1/llm-config/test` probes.
+
+    Every failure (no provider configured/given, connection refused/DNS/
+    timeout, 401/403, a non-JSON or unexpected body shape) is a clean
+    enveloped `ApiError` -- never a raw traceback, never the api_key.
+    """
+    base_url, api_key = await resolve_models_source(db, body.base_url if body else None, body.api_key if body else None)
+    timeout = get_settings().llm_test_timeout_secs
+    try:
+        models, truncated = await list_provider_models(base_url, api_key, timeout=timeout)
+    except LlmModelsError as exc:
+        raise ApiError(503, exc.code, str(exc)) from exc
+    return LlmModelsResponse(models=models, count=len(models), truncated=truncated)

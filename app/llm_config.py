@@ -318,6 +318,51 @@ async def resolve_llm_config(db: AsyncSession) -> EffectiveLlmConfig:
     )
 
 
+# --- Model discovery source resolution (GET {base_url}/models -- app/
+# llm_client.py's `list_provider_models`, app/routers/llm_config.py's
+# POST /v1/llm-config/models and its UI equivalent) ---
+
+
+async def resolve_models_source(db: AsyncSession, base_url: str | None, api_key: str | None) -> tuple[str, str | None]:
+    """Resolve which base_url/api_key to probe for `GET {base_url}/models`.
+
+    Deliberately all-or-nothing on `base_url`, not independent per-field
+    fallback: when the caller supplies a `base_url` (discovering models for
+    a provider they haven't saved yet), the `api_key` used is EXACTLY what
+    they supplied (None if they left it blank) -- it never silently falls
+    back to whatever key happens to be stored for a *different*,
+    already-saved provider. Mixing an old provider's secret key into a
+    request aimed at a new, owner-typed host would be a real (if narrow)
+    key-leak risk, not a convenience worth the trade. Only when `base_url`
+    is omitted entirely does resolution fall through to the effective
+    stored/env config, where base_url and api_key are guaranteed to be the
+    same trusted pairing.
+
+    Raises `ApiError(503, "no_llm_provider_configured", ...)` -- same code
+    app/room_ai.py's `run_action` uses for the identical condition -- when
+    neither an explicit `base_url` nor an effective one resolves.
+    `base_url`/`api_key`, when explicitly supplied, are validated with the
+    same rigor as `create_version` (header-injection/URL-injection guards)
+    since they are about to be used to build an outbound request exactly
+    like a stored config would be.
+    """
+    if base_url:
+        validate_base_url(base_url)
+        if api_key:
+            validate_api_key(api_key)
+        return base_url, (api_key or None)
+
+    effective = await resolve_llm_config(db)
+    if not effective.base_url:
+        raise ApiError(
+            503,
+            "no_llm_provider_configured",
+            "No LLM provider is configured -- set one up first (owner UI: /ui/llm, or POST /v1/llm-config), "
+            "or supply base_url directly in this request.",
+        )
+    return effective.base_url, effective.api_key
+
+
 # --- API-key masking (never serve the raw key back, once stored) ---
 
 

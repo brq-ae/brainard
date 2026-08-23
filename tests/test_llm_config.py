@@ -591,6 +591,12 @@ async def test_test_llm_config_connection_error_returns_clean_error(client, db_s
 
 
 async def test_test_llm_config_timeout_returns_clean_error(client, db_session, monkeypatch):
+    """The message must be self-explaining -- "the provider did not
+    respond in time", not the old "transport error (ReadTimeout)"/bare
+    "Connection timed out" wording that reads like a network fault when
+    the provider (e.g. a local reasoning model) may simply still be
+    working. See app/llm_client.py's `_timeout_result`.
+    """
     headers = await _owner_headers(db_session)
     await client.post("/v1/llm-config", json=_body(), headers=headers)
 
@@ -603,7 +609,11 @@ async def test_test_llm_config_timeout_returns_clean_error(client, db_session, m
     assert resp.status_code == 200
     data = resp.json()
     assert data["ok"] is False
-    assert "timed out" in data["detail"].lower()
+    assert "did not respond within" in data["detail"]
+    assert "LLM_TEST_TIMEOUT_SECS" in data["detail"]
+    assert "reasoning" in data["detail"].lower()
+    assert "ReadTimeout" not in data["detail"]
+    assert "ConnectTimeout" not in data["detail"]
 
 
 async def test_test_llm_config_401_returns_clean_error(client, db_session, monkeypatch):

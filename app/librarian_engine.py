@@ -84,7 +84,7 @@ import asyncio
 import base64
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -136,15 +136,28 @@ class LibrarianLimits:
     max_fork_flags: int = 25
     max_lesson_events: int = 25
     max_llm_calls: int = 100
-    call_timeout_secs: float = 30.0
+    # Owner-configurable (app/config.py's `llm_call_timeout_secs`, env
+    # LLM_CALL_TIMEOUT_SECS) -- a `default_factory` rather than a plain
+    # literal so every `LibrarianLimits()` constructed without an explicit
+    # override (including `DEFAULT_LIMITS` below, and ad-hoc instances in
+    # tests) picks up whatever `get_settings()` currently returns, same
+    # "read once per instance, restart to change in production" posture as
+    # the rest of this module's env-sourced values. A real deployment hit
+    # the previous hardcoded 30s default with a local reasoning model on an
+    # ordinary transcript -- see app/llm_client.py's module docstring.
+    call_timeout_secs: float = field(default_factory=lambda: get_settings().llm_call_timeout_secs)
     max_consecutive_failures: int = 3
     stale_project_days: int = 7
 
 
 DEFAULT_LIMITS = LibrarianLimits()
 
-MERGE_MAX_TOKENS = 900
-LESSON_MAX_TOKENS = 900
+# Headroom for a reasoning model's chain-of-thought PLUS the actual JSON
+# answer -- see app/llm_client.py's LIBRARIAN_DEFAULT_MAX_TOKENS docstring
+# for the observed real-world failure mode (a small budget lets the model
+# exhaust it on internal reasoning alone, returning empty `content`).
+MERGE_MAX_TOKENS = 2000
+LESSON_MAX_TOKENS = 2000
 
 ENTRY_TRUNCATE_CHARS = 4000
 EVENT_SUMMARY_TRUNCATE_CHARS = 2000
@@ -577,11 +590,16 @@ async def _process_flag_type(
                     budget.record_success()
                 except LlmCallError as exc:
                     budget.record_failure()
+                    # `exc`'s message is always safe to log (never the
+                    # api_key, never prompt/response content -- see
+                    # app/llm_client.py's LlmCallError docstring) and, for a
+                    # timeout, self-explaining rather than a bare exception
+                    # type name that reads like a network fault.
                     logger.warning(
                         "librarian: LLM call failed judging %s flag %s (%s) -- consecutive failures=%d/%d",
                         flag_type,
                         flag.id,
-                        type(exc).__name__,
+                        exc,
                         budget.consecutive_failures,
                         limits.max_consecutive_failures,
                     )
@@ -695,11 +713,13 @@ async def _harvest_lessons(
                     budget.record_success()
                 except LlmCallError as exc:
                     budget.record_failure()
+                    # See the duplicate/fork-flag branch above -- `exc`'s
+                    # message is safe to log and self-explaining.
                     logger.warning(
                         "librarian: LLM call failed judging lesson.candidate event %s (%s) -- "
                         "consecutive failures=%d/%d",
                         event.id,
-                        type(exc).__name__,
+                        exc,
                         budget.consecutive_failures,
                         limits.max_consecutive_failures,
                     )

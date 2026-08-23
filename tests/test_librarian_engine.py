@@ -827,3 +827,113 @@ async def test_revoke_then_reactivate_via_real_endpoints_resumes_normal_runs(cli
     assert result.counts["duplicate_merged"] == 1
     flag = (await db_session.scalars(select(Flag).where(Flag.entry_id == newer_id))).one()
     assert flag.resolved_at is not None
+
+
+# --- configurable timeout (app/config.py's LLM_CALL_TIMEOUT_SECS) ---
+
+
+def test_librarian_limits_default_call_timeout_comes_from_settings(monkeypatch):
+    """`LibrarianLimits.call_timeout_secs` uses a `default_factory` reading
+    `get_settings()` so a fresh `LibrarianLimits()` (including the module's
+    own `DEFAULT_LIMITS`, computed once at import time) reflects the
+    owner-configured `LLM_CALL_TIMEOUT_SECS` rather than a hardcoded
+    literal -- a real deployment hit the previous hardcoded 30s default
+    with a local reasoning model on an ordinary transcript.
+    """
+    monkeypatch.setattr(librarian_engine_module, "get_settings", lambda: SimpleNamespace(llm_call_timeout_secs=713.0))
+
+    limits = librarian_engine_module.LibrarianLimits()
+
+    assert limits.call_timeout_secs == 713.0
+
+
+async def test_duplicate_flag_merge_call_uses_configured_call_timeout(client, db_session, monkeypatch):
+    """End to end through `run_librarian`: the timeout actually threaded
+    into `chat_completion_json` for a duplicate-flag judgment call is
+    `limits.call_timeout_secs`, not a stale module constant.
+    """
+    machine_headers, _ = await _machine_headers(db_session)
+    await _configure_provider(db_session)
+    await _make_duplicate_flag(client, machine_headers, key="timeoutcheck1")
+
+    captured = {}
+
+    async def fake_chat_completion_json(effective, *, system_prompt, user_prompt, max_tokens, timeout):
+        captured["timeout"] = timeout
+        return _merge_response(duplicate=True, confidence="high")
+
+    monkeypatch.setattr(librarian_engine_module, "chat_completion_json", fake_chat_completion_json)
+
+    custom_limits = LibrarianLimits(
+        max_duplicate_flags=25, max_fork_flags=25, max_lesson_events=25, max_llm_calls=100, call_timeout_secs=248.0
+    )
+    result = await run_librarian(session_factory=AsyncSessionLocal, limits=custom_limits)
+
+    assert result.status == "ok"
+    assert captured["timeout"] == 248.0
+
+
+async def test_lesson_harvest_call_uses_configured_call_timeout(client, db_session, monkeypatch):
+    machine_headers, _ = await _machine_headers(db_session)
+    await _configure_provider(db_session)
+    body = _deposit_body(
+        project="brain",
+        events=[
+            {
+                "seq": 1,
+                "ts": "2026-08-06T12:00:00Z",
+                "kind": "lesson.candidate",
+                "summary": "Zzztimeoutcheck a candidate lesson worth checking for this test",
+                "tags": [],
+                "payload": {},
+            }
+        ],
+    )
+    resp = await client.post("/v1/deposits", json=body, headers=machine_headers)
+    assert resp.status_code == 200
+
+    captured = {}
+
+    async def fake_chat_completion_json(effective, *, system_prompt, user_prompt, max_tokens, timeout):
+        captured["timeout"] = timeout
+        return _lesson_response(worth_recording=False)
+
+    monkeypatch.setattr(librarian_engine_module, "chat_completion_json", fake_chat_completion_json)
+
+    custom_limits = LibrarianLimits(
+        max_duplicate_flags=25, max_fork_flags=25, max_lesson_events=25, max_llm_calls=100, call_timeout_secs=356.0
+    )
+    result = await run_librarian(session_factory=AsyncSessionLocal, limits=custom_limits)
+
+    assert result.status == "ok"
+    assert captured["timeout"] == 356.0
+
+
+async def test_llm_call_failure_message_is_logged_and_safe(client, db_session, monkeypatch, caplog):
+    """The improved, self-explaining LlmCallError message (app/llm_client.py)
+    must actually reach the librarian's WARNING log line, not just the
+    bare exception type name -- otherwise an owner debugging a timed-out
+    librarian run from server logs alone would see nothing more useful
+    than before.
+    """
+    import logging
+
+    machine_headers, _ = await _machine_headers(db_session)
+    await _configure_provider(db_session)
+    await _make_duplicate_flag(client, machine_headers, key="logmsgcheck1")
+
+    timeout_message = (
+        "the provider did not respond within 180s -- a local or reasoning model may need a longer "
+        "LLM_CALL_TIMEOUT_SECS, or try a smaller/non-reasoning model"
+    )
+    _install_llm_stub(monkeypatch, [LlmCallError(timeout_message)])
+
+    with caplog.at_level(logging.WARNING, logger="app.librarian_engine"):
+        result = await run_librarian(session_factory=AsyncSessionLocal, limits=LIMITS)
+
+    # One failed judgment call, below the consecutive-failure abort
+    # threshold -- the run still finishes "ok" overall (the flag is simply
+    # left unresolved for a future run), but the failure was counted and,
+    # critically, its message actually reached the logs.
+    assert result.counts["llm_failures"] == 1
+    assert any(timeout_message in record.getMessage() for record in caplog.records)
