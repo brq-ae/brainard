@@ -16,14 +16,35 @@ restrict to a small, boring, filesystem-safe charset. Unlike those
 validators, a bad room name here isn't rejected (the room already exists;
 rendering its export must always succeed) -- it degrades to a safe
 fallback name instead.
+
+ADR-0012 (stage 3, decision 11: "export lists files, does not bundle
+them"): both render functions below also take the room's current
+attachments and list them as references -- filename, size, who attached,
+when, and the id needed to fetch it (`GET .../attachments/<id>/download`)
+-- never the file's bytes. `RoomAttachment.filename` is already sanitized
+through `safe_filename_component` at upload/attach time (app/attachments.py)
+before it ever reaches the database, but it is routed through
+`safe_filename_component` again here regardless, for the same reason this
+module already treats `room.name` this way: this function's OWN contract is
+"never emit an unsafe value into a rendered export/header", independent of
+what any particular caller upstream already guaranteed.
 """
+
+from __future__ import annotations
 
 import re
 import unicodedata
 from datetime import UTC
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.models import Room, RoomMessage
+
+if TYPE_CHECKING:
+    # Import only for type-checking: app.attachments imports THIS module
+    # (`safe_filename_component`, just below), so a runtime import here
+    # would be circular. `RoomAttachmentView` is just a type hint below --
+    # never constructed or introspected at runtime by this module.
+    from app.attachments import RoomAttachmentView
 
 # Same forbidden-Unicode-category set app/llm_config.py uses: Cc (control,
 # incl. C1 0x80-0x9F, e.g. NEL U+0085), Cf (format -- zero-width/bidi-
@@ -85,17 +106,45 @@ def _message_header(m: RoomMessage) -> str:
     return f"**{m.sender}**{marker} (seq {m.seq}, {_iso(m.created_at)})"
 
 
+def _attachment_markdown_line(view: RoomAttachmentView) -> str:
+    a = view.attachment
+    safe_name = safe_filename_component(a.filename)
+    return f'- "{safe_name}" ({view.byte_size} bytes) -- attached by {a.uploaded_by} at {_iso(a.created_at)} -- id: {a.id}'
+
+
+def _attachment_json(view: RoomAttachmentView) -> dict[str, Any]:
+    a = view.attachment
+    return {
+        "id": a.id,
+        "filename": safe_filename_component(a.filename),
+        "byte_size": view.byte_size,
+        "uploaded_by": a.uploaded_by,
+        "attached_at": _iso(a.created_at),
+    }
+
+
 def render_transcript_markdown(
-    room: Room, members: list[str], sides: dict[str, str | None], messages: list[RoomMessage]
+    room: Room,
+    members: list[str],
+    sides: dict[str, str | None],
+    messages: list[RoomMessage],
+    attachments: list[RoomAttachmentView] | None = None,
 ) -> str:
     """Full transcript as markdown: a header block (name, mode/topic,
     members+sides, status, created/closed times, message count) followed by
-    one block per message, oldest-first (chat reading order, same as
+    an "Attachments" section (ADR-0012 decision 11: listed as references --
+    filename, size, who attached, when, fetch id -- never bundled bytes),
+    then one block per message, oldest-first (chat reading order, same as
     `app.rooms.get_all_messages`) -- `**sender** (seq, ISO time)` then the
     message text on the following line(s), with `kind='system'` messages
     marked inline. No model involved; this is pure formatting over
     already-stored data.
+
+    `attachments` defaults to `None` (treated as empty) rather than a
+    required parameter, so existing callers (and tests) that predate
+    ADR-0012 stage 3 keep working unchanged.
     """
+    attachments = attachments or []
     member_line = ", ".join(f"{m} ({sides[m]})" if sides.get(m) else m for m in members) or "(none)"
     lines = [
         f"# {room.name}",
@@ -114,6 +163,13 @@ def render_transcript_markdown(
         lines.append(f"- Closed: {_iso(room.closed_at)}")
     lines.append(f"- Messages: {len(messages)}")
     lines.append("")
+    lines.append("## Attachments")
+    lines.append("")
+    if not attachments:
+        lines.append("*(none)*")
+    else:
+        lines.extend(_attachment_markdown_line(v) for v in attachments)
+    lines.append("")
     lines.append("---")
     lines.append("")
 
@@ -129,12 +185,19 @@ def render_transcript_markdown(
 
 
 def render_transcript_json(
-    room: Room, members: list[str], sides: dict[str, str | None], messages: list[RoomMessage]
+    room: Room,
+    members: list[str],
+    sides: dict[str, str | None],
+    messages: list[RoomMessage],
+    attachments: list[RoomAttachmentView] | None = None,
 ) -> dict[str, Any]:
-    """Structured JSON form: room metadata + a flat `messages` array,
-    oldest-first -- machine-consumption counterpart to
-    `render_transcript_markdown` above, same underlying data.
+    """Structured JSON form: room metadata + an `attachments` array (ADR-0012
+    decision 11: references only, never bundled bytes) + a flat `messages`
+    array, oldest-first -- machine-consumption counterpart to
+    `render_transcript_markdown` above, same underlying data. See that
+    function's docstring for the `attachments` parameter's default.
     """
+    attachments = attachments or []
     return {
         "room": {
             "id": room.id,
@@ -148,6 +211,7 @@ def render_transcript_json(
             "closed_at": _iso(room.closed_at),
             "message_count": len(messages),
         },
+        "attachments": [_attachment_json(v) for v in attachments],
         "messages": [
             {
                 "seq": m.seq,

@@ -36,6 +36,15 @@ CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0
 FROM base AS test
 
 COPY tests ./tests
+# scripts/brain-wrapper.sh (ADR-0012 decision 12) has its own test coverage
+# (tests/test_brain_wrapper.py) that drives the REAL script via subprocess
+# against a throwaway local HTTP server -- never a modified copy -- so it
+# needs to be present, byte-for-byte, in this image too. `curl` is what the
+# script itself shells out to and is not part of the python:3.12-slim base.
+COPY scripts ./scripts
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir .[dev]
 
 CMD ["pytest", "-v"]

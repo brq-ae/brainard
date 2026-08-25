@@ -12,6 +12,7 @@ a single DB session across its wait -- see that function's docstring.
 
 import asyncio
 import base64
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -20,11 +21,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
+from app.attachments import release_blobs_for_deleted_room
+from app.auth import Principal
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
-from app.models import Room, RoomMember, RoomMessage
+from app.models import Room, RoomAttachment, RoomMember, RoomMessage
 from app.notify import notify_room_closed
 from app.room_modes import DEFAULT_MODE, ROOM_MODES, role_text_for, validate_mode
+
+logger = logging.getLogger(__name__)
 
 # --- room creation ---
 
@@ -241,6 +246,11 @@ async def create_room(
         max_messages=resolved_max,
         message_count=0,
         notify_on_close=True,
+        # ADR-0012 decision 7: always created allowed (the checkbox is an
+        # opt-out) -- no create-time parameter for it, same posture
+        # `notify_on_close` already has here; toggled mid-room instead via
+        # `set_agent_uploads_allowed` below.
+        agent_uploads_allowed=True,
         created_at=now,
         mode=mode,
         topic=cleaned_topic,
@@ -484,7 +494,9 @@ async def _apply_close(db: AsyncSession, room: Room, reason: str) -> None:
     await notify_room_closed(db, room)
 
 
-async def post_message(db: AsyncSession, room_id: str, sender: str, text: str, kind: str = "message") -> tuple[RoomMessage, Room]:
+async def post_message(
+    db: AsyncSession, room_id: str, sender: str, text: str, kind: str = "message", *, principal: Principal
+) -> tuple[RoomMessage, Room]:
     """Posts one message, assigning the next per-room `seq` and incrementing
     `message_count` under a `SELECT ... FOR UPDATE` row lock on the room
     (acquired below, right before those two operations) -- concurrent posts
@@ -505,6 +517,18 @@ async def post_message(db: AsyncSession, room_id: str, sender: str, text: str, k
     concurrent-post case now that the lock serializes same-room writers --
     `_next_seq` and the insert always run for one room-lock holder at a
     time.
+
+    `principal` (the caller's AUTHENTICATED identity, from app/auth.py) is
+    required and is what fixes the same `sender="owner"` impersonation bug
+    app/attachments.py's `_clean_sender` fixes: `sender` is a bare,
+    client-supplied string with no identity of its own, so before this fix
+    any machine token could post a message with `sender="owner"` and have
+    it recorded -- and rendered in the transcript -- as coming from the
+    owner. `sender == "owner"` is now only accepted when
+    `principal.kind == "owner"`; every other `sender` (a room member's
+    `agent_name`) is unaffected -- machine tokens are deliberately not
+    bound to one agent identity in this system, so the membership check
+    just below remains the only, and sufficient, guard for that case.
     """
     if kind not in VALID_POST_KINDS:
         raise ApiError(
@@ -541,6 +565,13 @@ async def post_message(db: AsyncSession, room_id: str, sender: str, text: str, k
         )
 
     sender = sender.strip()
+    if sender == "owner" and principal.kind != "owner":
+        raise ApiError(
+            403,
+            "owner_sender_requires_owner_token",
+            "`sender=owner` can only be claimed by a request authenticated with the owner token. Recovery: "
+            "authenticate as the owner, or post as this room's own member `agent_name` instead.",
+        )
     if sender != "owner":
         members = await get_members(db, room_id)
         if sender not in members:
@@ -884,6 +915,186 @@ async def switch_room_mode(
     return room, announcement_text
 
 
+# --- POST /v1/rooms/{id}/agent-uploads (ADR-0012 decisions 7/9: owner-only,
+# mid-session toggle of the room's agent-upload switch) ---
+
+
+def _agent_uploads_announcement(allowed: bool) -> str:
+    """The kind='system' announcement text `set_agent_uploads_allowed` posts
+    (ADR-0012 decision 9: "agents are briefed, not just refused"). Disabling
+    is phrased as an explicit directive (do not generate/upload, put content
+    in a message instead) rather than a bare status line, and reminds
+    agents that decision 8's Attach-from-Brain path is unaffected either
+    way -- the same "state the policy, don't just rely on the API 404/403
+    backstop" posture the room-join prompt takes for this same switch.
+    """
+    if allowed:
+        return "Agent file uploads are now allowed in this room."
+    return (
+        "Agent file uploads are now disabled in this room. Agents: do not generate or upload a file -- put "
+        "the content directly in a room message instead. You may still attach a document already saved in "
+        "the Brain (Attach from Brain) even while this is off."
+    )
+
+
+async def set_agent_uploads_allowed(db: AsyncSession, room_id: str, allowed: bool) -> tuple[Room, str]:
+    """ADR-0012 decisions 7/9: owner-only mid-session toggle of
+    `Room.agent_uploads_allowed`. Consistent with how `switch_room_mode`
+    (above) toggles mode mid-session -- identical `SELECT ... FOR UPDATE` +
+    `populate_existing` row lock, held across the update AND the
+    kind='system' announcement post, both in the SAME commit, so a
+    concurrent toggle/post/close can never observe a half-applied change or
+    clobber this one. Always posts an announcement, even if `allowed`
+    already matched the room's current value -- same unconditional-post
+    posture `switch_room_mode` takes for mode/topic, rather than special-
+    casing a no-op call.
+
+    Only an open room may be toggled (self-explaining 'room_closed', same
+    posture as `switch_room_mode`) -- a closed room accepts no further
+    attachments at all regardless of this switch
+    (`add_room_attachment`'s own 'room_closed' guardrail), so there is
+    nothing left to toggle.
+    """
+    if not isinstance(allowed, bool):
+        raise ApiError(422, "invalid_agent_uploads_allowed", f"`allowed` must be a boolean, got {allowed!r}.")
+
+    # Unlocked pre-check: existence never needs the row lock to be correct
+    # (mirrors switch_room_mode's/close_room's own "unlocked pre-checks"
+    # reasoning) -- a 404 for a genuinely nonexistent room doesn't need
+    # serializing on anything.
+    room = await db.get(Room, room_id)
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Serialization point: acquire the room's row lock, same pattern as
+    # every other mutator in this file. `populate_existing` is required for
+    # the identical reason those functions document: `room` may already be
+    # in this Session's identity map from the unlocked `db.get` above, and
+    # without it SQLAlchemy would leave that already-loaded object's
+    # attributes untouched even though the FOR UPDATE SQL below legitimately
+    # re-fetches newer committed data.
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+    if room.status != "open":
+        raise ApiError(
+            409,
+            "room_closed",
+            f"Room '{room.name}' is closed; its agent-upload setting can no longer be changed.",
+        )
+
+    room.agent_uploads_allowed = allowed
+    announcement_text = _agent_uploads_announcement(allowed)
+
+    now = datetime.now(UTC)
+    seq = await _next_seq(db, room.id)
+    db.add(
+        RoomMessage(
+            id=str(ULID()),
+            room_id=room.id,
+            seq=seq,
+            sender="system",
+            text=announcement_text,
+            kind="system",
+            created_at=now,
+        )
+    )
+    room.message_count += 1
+    # Deliberately no done/cap guardrail check here -- same reasoning
+    # switch_room_mode's own docstring gives: this must never itself trip
+    # the cap and silently close the room it just changed.
+
+    await db.commit()
+    return room, announcement_text
+
+
+# --- ADR-0012 stage 3: kind='system' announcements when an attachment is
+# added to or removed from a room, so an agent long-polling the room learns
+# about the change without a new channel (mirrors the toggle announcement
+# above -- same reasoning, a different trigger). ---
+
+
+def _attachment_added_text(filename: str, byte_size: int, uploaded_by: str) -> str:
+    """`filename` is never raw user input by the time it reaches here: every
+    caller passes an already-committed `RoomAttachment.filename`, which
+    app/attachments.py ran through app/room_export.py's
+    `safe_filename_component` before storing it -- a small ASCII allowlist
+    that excludes `"` and every control/format/line-separator character, so
+    it can never break out of the quotes below or forge a fake extra
+    message/line in the transcript.
+    """
+    return f'Attachment added: "{filename}" ({byte_size} bytes), by {uploaded_by}.'
+
+
+def _attachment_removed_text(filename: str, removed_by: str) -> str:
+    """Same filename-safety guarantee as `_attachment_added_text` above."""
+    return f'Attachment removed: "{filename}", by {removed_by}.'
+
+
+async def _post_attachment_system_message(db: AsyncSession, room_id: str, text: str) -> RoomMessage | None:
+    """Shared poster for both announcement texts above. Deliberately its own
+    standalone locked transaction rather than sharing the one
+    app/attachments.py's add/delete functions already committed: this file
+    imports app.attachments (`release_blobs_for_deleted_room`), so the
+    reverse import would be circular, and every attachment mutation already
+    fully commits on its own before any caller of this function runs -- so
+    there is no partial state to protect by trying to merge the two into one
+    transaction anyway. Same `SELECT ... FOR UPDATE` + `populate_existing`
+    room lock as `switch_room_mode`/`set_agent_uploads_allowed` above.
+
+    Best-effort: the attachment add/delete this announces already succeeded
+    and committed by the time this runs, so a failure here (room gone, a
+    transient DB error, ...) is logged and swallowed rather than turned into
+    a 500 for a request whose real work already succeeded -- same posture
+    app/notify.py's `notify_room_closed` takes for the best-effort ntfy ping
+    on room close. Returns the posted message, or None if nothing was
+    posted (room not found, or the post itself failed).
+    """
+    try:
+        room = await db.scalar(
+            select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+        )
+        if room is None:
+            return None
+        now = datetime.now(UTC)
+        seq = await _next_seq(db, room.id)
+        message = RoomMessage(id=str(ULID()), room_id=room.id, seq=seq, sender="system", text=text, kind="system", created_at=now)
+        db.add(message)
+        room.message_count += 1
+        await db.commit()
+        return message
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "best-effort attachment system-message post failed for room %s -- attachment operation still succeeded",
+            room_id,
+        )
+        return None
+
+
+async def post_attachment_added_message(
+    db: AsyncSession, room_id: str, *, filename: str, byte_size: int, uploaded_by: str
+) -> RoomMessage | None:
+    """Called by app/routers/room_attachments.py and app/routers/ui_rooms.py
+    after a successful upload or Attach-from-Brain, so agents long-polling
+    this room learn a file was added without a new channel.
+    """
+    return await _post_attachment_system_message(
+        db, room_id, _attachment_added_text(filename, byte_size, uploaded_by)
+    )
+
+
+async def post_attachment_removed_message(
+    db: AsyncSession, room_id: str, *, filename: str, removed_by: str
+) -> RoomMessage | None:
+    """Called by app/routers/room_attachments.py and app/routers/ui_rooms.py
+    after a successful owner delete of an attachment.
+    """
+    return await _post_attachment_system_message(db, room_id, _attachment_removed_text(filename, removed_by))
+
+
 # --- GET /v1/rooms/{id}/messages -- the long-poll ---
 
 POLL_INTERVAL_SECS = 1
@@ -941,8 +1152,9 @@ async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list
 
 async def delete_room(db: AsyncSession, room_id: str) -> tuple[int, int]:
     """Hard-deletes a room and everything under it: its messages, then its
-    members, then the room row itself, all in one transaction (one commit).
-    Returns (messages_deleted, members_deleted).
+    members, then its attachment references, then the room row itself, all
+    in one transaction (one commit). Returns (messages_deleted,
+    members_deleted).
 
     EXPLICIT application-level cascade, not FK ondelete=CASCADE: `RoomMember.
     room_id` and `RoomMessage.room_id` (app/models.py) are plain
@@ -955,6 +1167,29 @@ async def delete_room(db: AsyncSession, room_id: str) -> tuple[int, int]:
     delete path (API, UI) goes through, same as every other multi-row
     guardrail in this module, rather than relying on schema-level cascade
     semantics a reader would have to go find in the migration.
+
+    ADR-0012 gap closed here: `RoomAttachment.room_id` IS `ondelete="CASCADE"`
+    (a deliberate, narrow, documented exception to the convention above --
+    see that model's docstring) because this function predates the
+    attachments table and didn't know it existed. DB-level cascade alone
+    dropped the reference rows fine but never ran the reference-counted
+    blob sweep, orphaning any blob that only this room referenced (row and
+    bytes both left on disk with nothing pointing at them). Fixed by
+    deleting `room_attachments` explicitly, same as `room_messages`/
+    `room_members` above (making the CASCADE a harmless no-op backstop
+    instead of the only thing standing between this delete and a 500,
+    exactly the follow-up that model's docstring calls for), and -- after
+    this transaction commits -- eagerly running
+    `app.attachments.release_blobs_for_deleted_room` against the blob
+    hashes this room used to reference. That reuses the exact same
+    reference-counted check `sweep_expired_blobs` runs (a blob survives if
+    ANY other room still references it, open or within its own grace
+    period, or a Brain `MirroredDocument` references it) -- the only thing
+    special about a hard delete is that THIS room's own reference is gone
+    immediately, with no grace period of its own to wait out (ADR-0012's
+    `RoomAttachment` docstring: "a hard delete is a stronger, more
+    deliberate owner action than a room merely closing, so losing the
+    grace-period cushion on explicit delete is expected, not a bug").
 
     Rooms are transient chat, not curated knowledge (ADR-0008 decision 2):
     this is a genuine hard delete, not a status flip -- there is no
@@ -983,7 +1218,11 @@ async def delete_room(db: AsyncSession, room_id: str) -> tuple[int, int]:
     until this transaction commits, at which point its own room_id lookup
     (`post_message`'s/`post_closing_nudge`'s own `db.get`/lock re-check)
     finds the room gone and reports its own clean 404/no-op -- never a raw
-    IntegrityError, and never a message/member row left behind.
+    IntegrityError, and never a message/member row left behind. The
+    post-commit blob reclaim below is deliberately OUTSIDE this lock (it
+    takes its own, per-blob locks, same as `sweep_expired_blobs`) -- the
+    room row is already gone by then, so nothing about it needs protecting
+    any further.
     """
     # Unlocked pre-check: existence never needs the row lock to be correct
     # (mirrors post_message's/close_room's own "unlocked pre-checks"
@@ -1008,10 +1247,30 @@ async def delete_room(db: AsyncSession, room_id: str) -> tuple[int, int]:
         # between the unlocked pre-check and acquiring this lock.
         raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
 
+    # Captured BEFORE the delete below removes these rows -- this is the
+    # only chance to know which blobs this room used to reference; ADR-0012.
+    attachment_hashes = list(
+        (await db.scalars(select(RoomAttachment.blob_sha256).where(RoomAttachment.room_id == room_id))).all()
+    )
+
     messages_deleted = (await db.execute(delete(RoomMessage).where(RoomMessage.room_id == room_id))).rowcount
     members_deleted = (await db.execute(delete(RoomMember).where(RoomMember.room_id == room_id))).rowcount
+    # Explicit, same as messages/members above -- the FK's ondelete=CASCADE
+    # (app/models.py's RoomAttachment) is now a harmless backstop, not the
+    # only thing preventing an FK violation on the room delete below.
+    await db.execute(delete(RoomAttachment).where(RoomAttachment.room_id == room_id))
     await db.delete(room)
     await db.commit()
+
+    if attachment_hashes:
+        # Deliberately after the commit above, same ordering rationale
+        # app.attachments.sweep_expired_blobs documents for its own file
+        # removal: the room (and its attachment references) are already
+        # durably gone at this point, so the worst crash outcome here is an
+        # orphaned blob a later sweep pass still cleans up -- never a
+        # dangling reference to bytes that no longer exist.
+        await release_blobs_for_deleted_room(db, attachment_hashes)
+
     return messages_deleted, members_deleted
 
 

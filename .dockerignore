@@ -26,10 +26,14 @@ __pycache__/
 .mypy_cache/
 .ruff_cache
 
-# Docs and dev-only scripts -- not needed inside the image
+# Docs -- not needed inside the image
 docs/
-scripts/
 *.md
+
+# scripts/ IS needed: the test stage COPYs it in so
+# tests/test_brain_wrapper.py can drive the real
+# scripts/brain-wrapper.sh via subprocess (never a copy elsewhere). Keep
+# this comment in sync with the Dockerfile's `COPY scripts ./scripts` line.
 
 # Editors / OS
 .DS_Store

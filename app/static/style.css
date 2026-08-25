@@ -131,6 +131,14 @@ main {
 
 .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .row-main { flex: 1; min-width: 0; }
+.row-main .meta { display: block; margin-top: 2px; }
+.row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* ADR-0012: a form that sits inline alongside other controls in a .row
+   (attachment download/delete/save, attach-from-Brain results) rather than
+   stacking full-width like the page's other, standalone forms. */
+.inline-form { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+.checkbox-label { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-weight: normal; }
+.checkbox-label input[type="checkbox"] { width: auto; }
 
 .meta { color: var(--text-dim); font-size: 0.88em; }
 .meta .sep { margin: 0 6px; color: var(--text-dimmer); }
@@ -226,6 +234,18 @@ form.inline { display: inline; }
 .machine-details > .token-reveal,
 .machine-details > .btn,
 .machine-details > p { margin-top: 10px; }
+
+/* ADR-0013: per-participant join-prompt copy buttons -- a simple wrapping
+   row, same .btn spacing pattern already used by the AI-actions row. */
+#room-copy-buttons-panel .btn { margin-top: 6px; margin-right: 6px; }
+
+/* ADR-0013: the transcript panel is now a <details class="panel">, open by
+   default -- its <summary> carries the h2 so the live count stays visible
+   (and keeps updating) whether the panel is expanded or collapsed. */
+#room-transcript-panel > summary { cursor: pointer; list-style-position: outside; }
+#room-transcript-panel > summary h2 { display: inline; margin: 0; }
+#room-transcript-panel .list,
+#room-transcript-panel .empty { margin-top: 12px; }
 
 .pagination { display: flex; gap: 12px; margin-top: 16px; }
 

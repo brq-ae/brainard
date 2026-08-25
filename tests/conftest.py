@@ -13,6 +13,8 @@ from httpx import ASGITransport, AsyncClient
 from app.db import AsyncSessionLocal, engine
 from app.main import app
 from app.models import (
+    AttachmentBlob,
+    AttachmentStorageStats,
     Base,
     BootstrapFetch,
     Deposit,
@@ -29,6 +31,7 @@ from app.models import (
     OwnerToken,
     Project,
     Room,
+    RoomAttachment,
     RoomMember,
     RoomMessage,
 )
@@ -71,15 +74,23 @@ async def _clean_tables():
     foreign keys: flags before the entries they reference, entries/mirrored
     documents/journal/handoff rows before their deposit, deposits before
     machines/projects, doctrine_versions/bootstrap_fetches before the
-    machines/projects they reference.
+    machines/projects they reference. ADR-0012: room_attachments before
+    rooms (rooms.RoomAttachment.room_id is ondelete=CASCADE, but explicit is
+    still clearer than relying on it -- same reasoning as
+    app.rooms.delete_room's own explicit delete) and attachment_blobs after
+    mirrored_documents/room_attachments (both reference it by sha256, no
+    cascade).
     """
     async with AsyncSessionLocal() as session:
         await session.execute(RoomMessage.__table__.delete())
         await session.execute(RoomMember.__table__.delete())
+        await session.execute(RoomAttachment.__table__.delete())
         await session.execute(Room.__table__.delete())
         await session.execute(Flag.__table__.delete())
         await session.execute(KnowledgeEntry.__table__.delete())
         await session.execute(MirroredDocument.__table__.delete())
+        await session.execute(AttachmentBlob.__table__.delete())
+        await session.execute(AttachmentStorageStats.__table__.delete())
         await session.execute(Event.__table__.delete())
         await session.execute(Handoff.__table__.delete())
         await session.execute(Deposit.__table__.delete())

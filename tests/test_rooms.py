@@ -13,7 +13,10 @@ from ulid import ULID
 import app.notify as notify_module
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
-from app.models import Machine, OwnerToken, Room, RoomMember, RoomMessage
+from app.attachments import blob_path
+from app.auth import Principal
+from app.config import get_settings
+from app.models import AttachmentBlob, Machine, OwnerToken, Room, RoomAttachment, RoomMember, RoomMessage
 from app.rooms import close_room as close_room_op
 from app.rooms import delete_room as delete_room_op
 from app.rooms import post_closing_nudge as post_closing_nudge_op
@@ -492,6 +495,32 @@ async def test_post_message_non_member_rejected(client, db_session):
     )
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "sender_not_room_member"
+
+
+async def test_post_message_machine_token_cannot_claim_owner_sender(client, db_session):
+    """Independent-review Fix 1 (BLOCKER): `sender` alone carries no
+    identity -- before this fix, ANY valid machine token could pass
+    `sender=owner` and have the message recorded (and rendered in the
+    transcript) as coming from the owner. The claim is now bound to the
+    AUTHENTICATED principal, so a machine token is rejected outright,
+    before the (irrelevant here) membership check ever runs.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "owner", "text": "not really the owner"}, headers=machine_headers
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "owner_sender_requires_owner_token"
+
+    # Nothing was posted -- a subsequent genuine owner post is still seq 1.
+    real_post = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "owner", "text": "actually the owner"}, headers=owner_headers
+    )
+    assert real_post.status_code == 200
+    assert real_post.json()["seq"] == 1
 
 
 async def test_post_message_to_closed_room_rejected(client, db_session):
@@ -1232,6 +1261,122 @@ async def test_delete_room_does_not_affect_other_rooms(client, db_session):
     assert still_there.json()["message_count"] == 1
 
 
+# --- ADR-0012 stage 2: delete_room's attachment blob-reclaim fix ---
+#
+# RoomAttachment.room_id is ondelete="CASCADE" (a documented, narrow
+# exception -- see that model's docstring): before this fix, delete_room
+# dropped a room's attachment reference rows via that DB-level cascade but
+# never ran the reference-counted blob sweep, orphaning any blob only that
+# room referenced (row AND bytes left on disk with nothing pointing at
+# them). These three tests exercise the real fix end to end, through the
+# real v1 upload/save endpoints, not by hand-writing rows.
+
+
+def _pdf_bytes(body: bytes = b"hello") -> bytes:
+    return b"%PDF-1.4\n" + body + b"\n%%EOF"
+
+
+async def test_delete_room_reclaims_an_orphaned_blob(client, db_session):
+    """The concrete bug: a blob referenced by ONLY the deleted room must be
+    gone -- both the attachment_blobs row and the file on disk -- right
+    after the delete, with no grace period to wait out (a hard delete
+    forfeits the grace-period cushion on its own reference; see
+    RoomAttachment's docstring).
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    upload_resp = await client.post(
+        f"/v1/rooms/{room['id']}/attachments",
+        params={"filename": "doc.pdf", "sender": "owner"},
+        content=_pdf_bytes(b"delete-room-reclaim"),
+        headers=owner_headers,
+    )
+    assert upload_resp.status_code == 201, upload_resp.json()
+
+    attachment_row = await db_session.get(RoomAttachment, upload_resp.json()["id"])
+    sha256_hex = attachment_row.blob_sha256
+    path = blob_path(get_settings().attachment_storage_dir, sha256_hex)
+    assert path.exists()
+
+    delete_resp = await client.delete(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert delete_resp.status_code == 200
+
+    assert (await db_session.get(AttachmentBlob, sha256_hex)) is None
+    assert not path.exists()
+
+
+async def test_delete_room_does_not_reclaim_blob_shared_with_another_live_room(client, db_session):
+    """The other half of decision 4: two rooms deduped to the same blob --
+    deleting ONE of them must never delete the file the other room still
+    needs.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room_a = await _create_room(client, owner_headers, name="room-a", members=["a1", "a2"])
+    room_b = await _create_room(client, owner_headers, name="room-b", members=["b1", "b2"])
+    payload = _pdf_bytes(b"shared-between-two-live-rooms")
+
+    up_a = await client.post(
+        f"/v1/rooms/{room_a['id']}/attachments",
+        params={"filename": "a.pdf", "sender": "owner"},
+        content=payload,
+        headers=owner_headers,
+    )
+    assert up_a.status_code == 201
+    up_b = await client.post(
+        f"/v1/rooms/{room_b['id']}/attachments",
+        params={"filename": "b.pdf", "sender": "owner"},
+        content=payload,
+        headers=owner_headers,
+    )
+    assert up_b.status_code == 201
+
+    row_a = await db_session.get(RoomAttachment, up_a.json()["id"])
+    sha256_hex = row_a.blob_sha256
+    path = blob_path(get_settings().attachment_storage_dir, sha256_hex)
+    assert path.exists()
+
+    delete_resp = await client.delete(f"/v1/rooms/{room_a['id']}", headers=owner_headers)
+    assert delete_resp.status_code == 200
+
+    # room_b (untouched, still open) still references the exact same blob.
+    assert (await db_session.get(AttachmentBlob, sha256_hex)) is not None
+    assert path.exists()
+
+
+async def test_delete_room_does_not_reclaim_blob_referenced_by_a_brain_document(client, db_session):
+    """Decision 3/4: once "Save to Brain" links a blob to a MirroredDocument
+    row, it must survive forever -- deleting the room that originally held
+    the file must never take the blob down with it.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    upload_resp = await client.post(
+        f"/v1/rooms/{room['id']}/attachments",
+        params={"filename": "keep.pdf", "sender": "owner"},
+        content=_pdf_bytes(b"saved-to-brain-then-room-deleted"),
+        headers=owner_headers,
+    )
+    assert upload_resp.status_code == 201
+    attachment_id = upload_resp.json()["id"]
+
+    save_resp = await client.post(
+        f"/v1/rooms/{room['id']}/attachments/{attachment_id}/save",
+        json={"project": "delete-room-reclaim-test"},
+        headers=owner_headers,
+    )
+    assert save_resp.status_code == 200, save_resp.json()
+
+    row = await db_session.get(RoomAttachment, attachment_id)
+    sha256_hex = row.blob_sha256
+    path = blob_path(get_settings().attachment_storage_dir, sha256_hex)
+
+    delete_resp = await client.delete(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert delete_resp.status_code == 200
+
+    assert (await db_session.get(AttachmentBlob, sha256_hex)) is not None
+    assert path.exists()
+
+
 # --- delete_room row-lock race safety (fix-first review finding) ---
 #
 # delete_room now takes the room's row lock (SELECT ... FOR UPDATE, same
@@ -1250,6 +1395,13 @@ async def test_delete_room_does_not_affect_other_rooms(client, db_session):
 COMMIT_DELAY = 0.4
 HEAD_START = 0.05
 RACE_TRIALS = 3
+
+# These races post as an "agent-a" sender, i.e. a machine-authenticated
+# call -- post_message now requires a `principal` to bind the `sender`
+# claim to (fix for the sender="owner" impersonation bug); the concurrency
+# invariant under test here is unrelated to that identity check, so a
+# single fixed machine principal is reused across all of them.
+_RACE_MACHINE_PRINCIPAL = Principal(kind="machine", machine=Machine(id=str(ULID())))
 
 
 def _delayed_commit_session(delay: float):
@@ -1293,7 +1445,7 @@ async def test_delete_room_race_delete_wins_against_post_message_done(client, db
             await asyncio.sleep(HEAD_START)
             async with loser_session:
                 try:
-                    return await post_message_op(loser_session, room_id, "agent-a", "goodbye", "done")
+                    return await post_message_op(loser_session, room_id, "agent-a", "goodbye", "done", principal=_RACE_MACHINE_PRINCIPAL)
                 except ApiError as exc:
                     return exc
 
@@ -1339,7 +1491,7 @@ async def test_delete_room_race_post_message_done_wins_against_delete(client, db
 
         async def run_post():
             async with winner_session:
-                return await post_message_op(winner_session, room_id, "agent-a", "goodbye", "done")
+                return await post_message_op(winner_session, room_id, "agent-a", "goodbye", "done", principal=_RACE_MACHINE_PRINCIPAL)
 
         async def run_delete():
             await asyncio.sleep(HEAD_START)
@@ -1716,7 +1868,7 @@ async def test_switch_mode_race_switch_wins_against_post_message(client, db_sess
         async def run_post():
             await asyncio.sleep(HEAD_START)
             async with loser_session:
-                return await post_message_op(loser_session, room_id, "agent-a", "hello", "message")
+                return await post_message_op(loser_session, room_id, "agent-a", "hello", "message", principal=_RACE_MACHINE_PRINCIPAL)
 
         start = time.monotonic()
         switch_result, post_result = await asyncio.gather(run_switch(), run_post())
@@ -1757,7 +1909,7 @@ async def test_switch_mode_race_post_message_wins_against_switch(client, db_sess
 
         async def run_post():
             async with winner_session:
-                return await post_message_op(winner_session, room_id, "agent-a", "hello", "message")
+                return await post_message_op(winner_session, room_id, "agent-a", "hello", "message", principal=_RACE_MACHINE_PRINCIPAL)
 
         async def run_switch():
             await asyncio.sleep(HEAD_START)

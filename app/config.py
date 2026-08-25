@@ -136,6 +136,85 @@ class Settings(BaseSettings):
             return None
         return value
 
+    # --- Room file attachments (ADR-0012 storage core; app/attachments.py)
+    # ---
+    # A disk-usage investigation on the host running this app (ADR-0012
+    # decision 6) measured a single 20 GB root filesystem at ~85% used,
+    # ~2.9 GB free, shared by the OS, Docker images, the Postgres volume,
+    # and any attachments -- neither container has a disk limit set, so an
+    # unbounded upload path can exhaust the disk and stop Postgres writing,
+    # taking the whole app down. Every bound below exists to prevent that,
+    # not to be a generous quota; all five are read once at process startup
+    # like every other env-sourced value in this module (a change requires a
+    # restart) and fail loudly at construction when out of range, same
+    # posture as `llm_call_timeout_secs` above.
+    #
+    # Max bytes for a single uploaded file. Default 10 MiB (ADR-0012
+    # decision 6, replacing an earlier, unshipped 25 MB guess). Bounded
+    # 1 KiB (a lower bound below which "file upload" stops being a
+    # meaningful feature) to 100 MiB (comfortably above the default, but
+    # still well inside the default global ceiling -- an operator raising
+    # this is trusted to also raise the ceiling if they mean to store
+    # bigger files routinely).
+    attachment_max_file_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
+    # Max number of attachment references a single room may accumulate.
+    # Default 10 (ADR-0012 decision 6). Bounded 1-1000 -- a secondary guard
+    # against one room consuming the shared global budget on its own; the
+    # global ceiling below is the primary protection.
+    attachment_max_files_per_room: int = Field(default=10, ge=1, le=1000)
+    # Global ceiling on total attachment storage (summed across deduplicated
+    # blobs, decision 2 -- NOT summed across room references, which would
+    # double-count a deduped file). Default 500 MiB (decision 6, replacing
+    # an earlier, unshipped 100 MB-per-room guess -- this is a single
+    # server-wide total, not per-room). Bounded 1 MiB to 1 TiB: the lower
+    # bound keeps the setting meaningful, the upper bound is a sanity cap
+    # against a fat-fingered value, not tied to any one host's actual disk
+    # size (this app may run on hosts far larger or smaller than the one the
+    # ADR's 20 GB measurement was taken on).
+    attachment_global_ceiling_bytes: int = Field(default=500 * 1024 * 1024, ge=1024 * 1024, le=1024**4)
+    # Free-disk floor: refuse any upload that would leave less than this
+    # much free space, checked immediately before every write
+    # (app/attachments.py), and -- since the independent-review Fix 2 --
+    # coordinated across concurrently in-flight uploads via a process-wide
+    # reservation counter (app/attachments.py's `_reserve_upload_budget`/
+    # `_release_upload_budget`) so N simultaneous uploads can no longer each
+    # observe "enough headroom" at the same instant and collectively
+    # overshoot it. Default 2 GiB (decision 6) -- deliberately set BELOW
+    # the measured ~2.9 GB free on the reference host: a 3 GB floor would
+    # reject every upload from day one on that host, making the feature
+    # unusable as shipped. Bounded 100 MiB (a floor that low is barely a
+    # floor at all, but still catches the worst case) to 1 TiB.
+    #
+    # This is a SECONDARY, LIVE guard, not the primary one: the global
+    # ceiling above (`attachment_global_ceiling_bytes`) is THE primary
+    # protection -- a hard cap enforced under the same `SELECT ... FOR
+    # UPDATE` row-lock discipline as every other counter this module
+    # checks (`AttachmentStorageStats`), so it can never be raced past
+    # regardless of concurrency, full stop. This floor, by contrast, is a
+    # live read of the ACTUAL filesystem (`shutil.disk_usage()`) at write
+    # time: it catches disk pressure the ceiling has no way to see --
+    # anything else on the host consuming space (logs, backups, the
+    # database itself), which is exactly why it exists at all -- but it
+    # remains fundamentally a snapshot-and-check against real-world state,
+    # not a DB-enforced hard limit like the ceiling is.
+    attachment_free_disk_floor_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=100 * 1024 * 1024, le=1024**4)
+    # Grace period after a room closes before its (otherwise-unreferenced)
+    # attachments become eligible for deletion (decision 5). Default 7 days
+    # -- rooms auto-close on a timer, possibly overnight (ADR-0007), so
+    # instant deletion at close would destroy files the owner meant to
+    # keep. Bounded 0 (delete-on-close, for an operator who wants no grace
+    # at all) to 365 days (a full year is already far beyond "grace" and
+    # into "effectively permanent" -- an operator who wants that should
+    # save the file to the Brain instead, decision 3).
+    attachment_grace_period_days: int = Field(default=7, ge=0, le=365)
+    # Filesystem directory attachment blobs are written under -- the mount
+    # point of the `attachment_data` named volume this ADR adds to
+    # docker-compose.yml (decision 2, same "one more named volume" pattern
+    # `db_data` already uses). Not bounded/validated beyond being a
+    # non-empty string: an operator running outside Docker may point this
+    # anywhere writable.
+    attachment_storage_dir: str = Field(default="/data/attachments", min_length=1)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

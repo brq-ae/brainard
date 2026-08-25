@@ -17,6 +17,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     ARRAY,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Computed,
@@ -359,6 +360,24 @@ class MirroredDocument(Base):
     search_vector: Mapped[str | None] = mapped_column(
         TSVECTOR, Computed(_MIRRORED_DOCUMENT_SEARCH_VECTOR_SQL, persisted=True), nullable=True
     )
+    # ADR-0012 decision 3/4: set only when this document was born from
+    # "saving" a room attachment to the Brain -- links this deposit's
+    # `content` back to the exact blob it was extracted/copied from, so
+    # app/attachments.py's reference-counted deletion sweep can see "a Brain
+    # document still references this blob" and keep the blob alive forever
+    # (supersede-never-erase: a MirroredDocument row is never deleted, so
+    # once set this reference never goes away, regardless of what happens to
+    # the room(s) that originally held the file). NULL for every ordinary
+    # deposited document (the overwhelming majority) -- this column is
+    # exclusively the room-attachment-to-Brain bridge, nothing else writes
+    # it. No ondelete: `attachment_blobs` rows this points at are only ever
+    # removed by the sweep once nothing (including this column) references
+    # them, so the FK's default RESTRICT should never actually fire; if it
+    # ever did, that would mean the sweep's own referenced-check was wrong,
+    # and RESTRICT surfacing a loud DB error is the correct failure mode.
+    blob_sha256: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("attachment_blobs.sha256"), nullable=True, index=True
+    )
 
     __table_args__ = (
         Index("ix_mirrored_documents_project_path", "project", "path"),
@@ -527,6 +546,15 @@ class Room(Base):
     # (no API surface sets it false in phase A), but modeled as a column so a
     # future per-room opt-out doesn't need a migration.
     notify_on_close: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # ADR-0012 decision 7: per-room opt-out disabling AGENT (never owner)
+    # file uploads -- same "always-on boolean the owner can flip off" shape
+    # as `notify_on_close` just above. Default true (agent uploads allowed);
+    # toggleable mid-room by the owner (app/rooms.py's
+    # `set_agent_uploads_allowed`, same row-lock + system-announcement
+    # pattern `switch_room_mode` uses). Decision 8: this only blocks
+    # CREATING new files -- attaching a document already saved in the Brain
+    # is unaffected by this flag either way.
+    agent_uploads_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     close_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -612,3 +640,115 @@ class RoomMessage(Base):
         # usable index for the ordinary range/cursor lookups.
         Index("ix_room_messages_room_seq", "room_id", "seq", unique=True),
     )
+
+
+# --- Room file attachments (ADR-0012) ---
+
+
+class AttachmentBlob(Base):
+    """One piece of content-addressed blob storage (ADR-0012 decision 2):
+    the bytes live once, on disk in the `attachment_data` named volume
+    (docker-compose.yml), at a path derived *only* from `sha256` (see
+    app/attachments.py's `blob_path` -- never from any filename, so path
+    traversal via a supplied name is impossible by construction). The
+    display filename is deliberately NOT stored here -- it lives on
+    `RoomAttachment.filename` (and, once a file is saved, implicitly on the
+    `MirroredDocument` row it becomes) precisely so the same blob can appear
+    under different names in different rooms with zero duplication
+    (decision 2: "identical uploads dedupe automatically").
+
+    `sha256` is the primary key, not a separate server ULID -- content
+    addressing means the hash already *is* the identity; a second surrogate
+    id would only invite the two ever drifting apart.
+
+    Lifetime is reference-counted (decision 4), never a status flag on this
+    row: app/attachments.py's sweep computes "erase when no `MirroredDocument`
+    references this hash AND every `RoomAttachment` referencing it belongs
+    to a room that is closed and past its grace period" fresh from
+    `RoomAttachment`/`MirroredDocument`/`Room` state each pass, rather than
+    caching the answer here -- one less place for that answer to go stale.
+    """
+
+    __tablename__ = "attachment_blobs"
+
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("byte_size > 0", name="ck_attachment_blobs_byte_size_positive"),
+        # A sha256 hex digest is always exactly 64 lowercase hex characters
+        # -- app/attachments.py never writes anything else here, but the
+        # constraint makes that invariant enforced at the DB level too, not
+        # just trusted of the application layer (defense in depth for the
+        # same "path traversal impossible by construction" property the
+        # storage-path derivation relies on).
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_attachment_blobs_sha256_hex64"),
+    )
+
+
+class RoomAttachment(Base):
+    """A room's reference to one blob (ADR-0012 decision 2): "a room does
+    not own a blob -- it holds an attachment reference row." `filename` is
+    the DISPLAY name (owner/agent-supplied, sanitized through
+    app/room_export.py's `safe_filename_component` before it ever reaches
+    this column -- see app/attachments.py) -- it lives here, not on
+    `AttachmentBlob`, specifically so two rooms sharing a deduped blob can
+    each call it something different.
+
+    `room_id` uses `ondelete="CASCADE"`, a deliberate, narrow exception to
+    this codebase's usual convention of explicit application-level cascade
+    over FK-level cascade (see `Room.delete_room`'s docstring in
+    app/rooms.py, which spells out that convention for `room_members`/
+    `room_messages`). app/rooms.py's `delete_room` is out of scope for the
+    task that introduced this table (ADR-0012's storage core landed while a
+    parallel task owned the room UI/routers, `app/rooms.py` included) and
+    does not know `room_attachments` exists, so without DB-level cascade,
+    deleting a room that has any attachment would raise an unhandled FK
+    violation. CASCADE here means an explicit room hard-delete also
+    immediately drops that room's attachment references (and, transitively,
+    any blob that leaves unreferenced becomes sweep-eligible next pass) --
+    correct: a hard delete is a stronger, more deliberate owner action than
+    a room merely closing, so losing the grace-period cushion on explicit
+    delete is expected, not a bug. app/rooms.py's `delete_room` now DOES
+    add `room_attachments` to its own explicit deletes (ADR-0012 stage 2,
+    alongside `release_blobs_for_deleted_room`'s eager blob reclaim), for
+    consistency with the rest of that function -- the CASCADE here is a
+    harmless no-op backstop, not the only thing standing between a delete
+    and a 500.
+    """
+
+    __tablename__ = "room_attachments"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # server ULID
+    room_id: Mapped[str] = mapped_column(
+        String(26), ForeignKey("rooms.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    blob_sha256: Mapped[str] = mapped_column(String(64), ForeignKey("attachment_blobs.sha256"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    # The room member's `agent_name` that uploaded it, or the literal
+    # 'owner' -- same sender vocabulary as `RoomMessage.sender`.
+    uploaded_by: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AttachmentStorageStats(Base):
+    """Single-row (fixed 'singleton' PK, same enforcement trick as
+    `OwnerToken`) running total of bytes committed across all
+    `AttachmentBlob` rows -- the denormalized counter the global-ceiling
+    check (ADR-0012 decision 6) locks and reads under `SELECT ... FOR
+    UPDATE` before admitting a genuinely new (non-deduplicated) blob, same
+    "lock the row, read the current total, decide, write" discipline
+    `Room.message_count` uses for the per-room message cap (app/rooms.py).
+    Kept as its own row rather than a `SUM(byte_size)` over
+    `attachment_blobs` on every upload so the ceiling check is one cheap
+    locked row read, not a full-table aggregate under lock (which would
+    serialize *every* upload globally, not just genuinely-new-content ones).
+    """
+
+    __tablename__ = "attachment_storage_stats"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True, default="singleton")
+    total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    __table_args__ = (CheckConstraint("total_bytes >= 0", name="ck_attachment_storage_stats_total_bytes_nonneg"),)

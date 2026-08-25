@@ -263,3 +263,74 @@ async def test_get_doctrine_owner_only(client, db_session):
     resp = await client.get("/v1/doctrine", headers=machine_headers)
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "owner_token_required"
+
+
+# --- ADR-0012 decision 13: the "delete local copies" doctrine rule ---
+#
+# Doctrine has no code-level seed anywhere in this app (deliberately --
+# it's owner-authored, versioned, owner-only-write data; see
+# app/routers/doctrine.py's module docstring: "the one collection where
+# full trust does not apply -- no AI may alter the rulebook"). So there is
+# nothing to unit test about the rule's *content* being present in a fixed
+# location. What IS testable, and what actually matters for ADR-0012
+# decision 13's "default tier (G5-G10 range)" claim, is that a rule
+# carrying this text and tier="default" is accepted by POST
+# /v1/doctrine/global, is classified as a *default* (overridable) rule --
+# never non_negotiable -- by GET /v1/doctrine, and can be overridden by a
+# project overlay the same way any other default-tier rule (e.g. this
+# file's G3 fixture) already can be. This is the acceptance test the owner
+# can point at to confirm the real rule, once they write it into their live
+# doctrine, will behave the way decision 13 requires.
+ADR_0012_CLEANUP_RULE_TEXT = (
+    "Delete local copies of fetched files once you're done with them, using the wrapper's "
+    "`cleanup` verb (never a self-constructed path). A file saved to the Brain is always "
+    "re-fetchable later. A file merely fetched into a room (not saved to the Brain) is scratch: "
+    "it is deleted once the room closes plus its grace period, so after a room closes, only "
+    "Brain-saved files can still be safely re-fetched."
+)
+
+
+def _global_body_with_cleanup_rule(rule_id: str = "G11", **overrides) -> dict:
+    body = _global_body()
+    body["rules"] = [*body["rules"], {"id": rule_id, "tier": "default", "text": ADR_0012_CLEANUP_RULE_TEXT}]
+    body.update(overrides)
+    return body
+
+
+async def test_adr0012_cleanup_rule_accepted_and_classified_default_not_non_negotiable(client, db_session):
+    headers = await _owner_headers(db_session)
+    resp = await client.post("/v1/doctrine/global", json=_global_body_with_cleanup_rule(), headers=headers)
+    assert resp.status_code == 201
+    rules_by_id = {r["id"]: r for r in resp.json()["rules"]}
+    assert rules_by_id["G11"]["tier"] == "default"
+    assert rules_by_id["G11"]["text"] == ADR_0012_CLEANUP_RULE_TEXT
+
+    get_resp = await client.get("/v1/doctrine", headers=headers)
+    assert get_resp.status_code == 200
+    global_rules_by_id = {r["id"]: r for r in get_resp.json()["global"]["rules"]}
+    assert global_rules_by_id["G11"]["tier"] == "default"
+    assert global_rules_by_id["G11"]["tier"] != "non_negotiable"
+
+
+async def test_adr0012_cleanup_rule_is_overridable_like_any_default_tier_rule(client, db_session):
+    """Proves the tier assignment is load-bearing, not cosmetic: a
+    non_negotiable rule cannot be overridden by a project overlay
+    (test_overlay_override_of_non_negotiable_rejected_naming_id_and_tier
+    above), but decision 13 explicitly calls for the *default* tier, so an
+    overlay naming this rule's id must succeed.
+    """
+    headers = await _owner_headers(db_session)
+    await client.post("/v1/doctrine/global", json=_global_body_with_cleanup_rule(), headers=headers)
+    await _make_project(db_session, "brain")
+
+    resp = await client.post(
+        "/v1/doctrine/overlays/brain",
+        json={
+            "content": "# Brain overlay",
+            "overrides": [{"id": "G11", "text": "Same policy, plus: also purge the outbox."}],
+            "additions": [],
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201
+    assert resp.json()["overrides"] == [{"id": "G11", "text": "Same policy, plus: also purge the outbox."}]

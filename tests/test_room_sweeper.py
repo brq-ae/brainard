@@ -17,7 +17,9 @@ from datetime import UTC, datetime, timedelta
 from ulid import ULID
 
 import app.notify as notify_module
-from app.models import Machine, OwnerToken, Room
+from app.attachments import blob_path as attachment_blob_path
+from app.config import get_settings
+from app.models import AttachmentBlob, Machine, OwnerToken, Room, RoomAttachment
 from app.room_sweeper import WARN_SECONDS, sweep_once
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
@@ -321,3 +323,159 @@ async def test_sweep_once_isolates_a_failing_nudge_and_continues(client, db_sess
     bad_detail = await _get_room(client, machine_headers, bad_room["id"])
     bad_system_messages = [m for m in bad_detail["messages"] if m["kind"] == "system"]
     assert bad_system_messages == []  # its nudge raised, was caught, and was skipped this cycle
+
+
+# --- ADR-0012 stage 3: the sweeper reclaims expired scratch attachment
+# blobs. app.attachments.sweep_expired_blobs's own reference-counting logic
+# (grace period, shared-blob protection, Brain-document protection) is
+# already exercised directly in tests/test_attachments.py; these prove it's
+# actually wired into the cycle sweep_once runs. ---
+
+
+def _pdf_bytes(body: bytes = b"sweeper-test-body") -> bytes:
+    return b"%PDF-1.4\n" + body + b"\n%%EOF"
+
+
+async def _upload(client, headers, room_id, *, filename="doc.pdf", sender="owner", content=None) -> dict:
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/attachments",
+        params={"filename": filename, "sender": sender},
+        content=content if content is not None else _pdf_bytes(),
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.json()
+    return resp.json()
+
+
+async def _close_room(client, headers, room_id: str) -> dict:
+    resp = await client.post(f"/v1/rooms/{room_id}/close", headers=headers)
+    assert resp.status_code == 200, resp.json()
+    return resp.json()
+
+
+async def _backdate_closed_at(db_session, room_id: str, closed_at: datetime) -> None:
+    room = await db_session.get(Room, room_id)
+    room.closed_at = closed_at
+    await db_session.commit()
+
+
+async def test_sweep_once_reclaims_expired_scratch_blob_after_grace_period(client, db_session, monkeypatch):
+    monkeypatch.setattr(get_settings(), "attachment_grace_period_days", 7)
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    uploaded = await _upload(client, owner_headers, room["id"], content=_pdf_bytes(b"reclaim-me"))
+    attachment = await db_session.get(RoomAttachment, uploaded["id"])
+    sha256 = attachment.blob_sha256
+    path = attachment_blob_path(get_settings().attachment_storage_dir, sha256)
+    assert path.exists()
+
+    await _close_room(client, owner_headers, room["id"])
+    await _backdate_closed_at(db_session, room["id"], datetime.now(UTC) - timedelta(days=8))
+
+    result = await sweep_once()
+    assert sha256 in result["reclaimed_blobs"]
+    assert (await db_session.get(AttachmentBlob, sha256)) is None
+    assert not path.exists()
+
+
+async def test_sweep_once_does_not_reclaim_before_grace_period_elapses(client, db_session, monkeypatch):
+    monkeypatch.setattr(get_settings(), "attachment_grace_period_days", 7)
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    uploaded = await _upload(client, owner_headers, room["id"])
+    attachment = await db_session.get(RoomAttachment, uploaded["id"])
+    sha256 = attachment.blob_sha256
+    path = attachment_blob_path(get_settings().attachment_storage_dir, sha256)
+
+    await _close_room(client, owner_headers, room["id"])
+    # Closed only 1 day ago -- well inside the 7-day grace period.
+    await _backdate_closed_at(db_session, room["id"], datetime.now(UTC) - timedelta(days=1))
+
+    result = await sweep_once()
+    assert sha256 not in result["reclaimed_blobs"]
+    assert (await db_session.get(AttachmentBlob, sha256)) is not None
+    assert path.exists()
+
+
+async def test_sweep_once_does_not_reclaim_blob_still_referenced_by_a_live_room(client, db_session, monkeypatch):
+    monkeypatch.setattr(get_settings(), "attachment_grace_period_days", 0)
+    owner_headers = await _owner_headers(db_session)
+    room_a = await _create_room(client, owner_headers, name="sweeper-live-a")
+    room_b = await _create_room(client, owner_headers, name="sweeper-live-b")
+    content = _pdf_bytes(b"shared-with-a-live-room")
+
+    uploaded_a = await _upload(client, owner_headers, room_a["id"], content=content)
+    uploaded_b = await _upload(client, owner_headers, room_b["id"], content=content)
+    attachment_a = await db_session.get(RoomAttachment, uploaded_a["id"])
+    attachment_b = await db_session.get(RoomAttachment, uploaded_b["id"])
+    assert attachment_a.blob_sha256 == attachment_b.blob_sha256  # deduped to the same blob
+    sha256 = attachment_a.blob_sha256
+
+    # Only room_a closes (long enough ago to clear its own grace period);
+    # room_b stays open and still references the same blob.
+    await _close_room(client, owner_headers, room_a["id"])
+    await _backdate_closed_at(db_session, room_a["id"], datetime.now(UTC) - timedelta(days=1))
+
+    result = await sweep_once()
+    assert sha256 not in result["reclaimed_blobs"]
+    assert (await db_session.get(AttachmentBlob, sha256)) is not None
+
+
+async def test_sweep_once_does_not_reclaim_blob_referenced_by_a_brain_document(client, db_session, monkeypatch):
+    monkeypatch.setattr(get_settings(), "attachment_grace_period_days", 0)
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    uploaded = await _upload(client, owner_headers, room["id"], content=_pdf_bytes(b"saved-to-brain"))
+    attachment = await db_session.get(RoomAttachment, uploaded["id"])
+    sha256 = attachment.blob_sha256
+
+    save_resp = await client.post(
+        f"/v1/rooms/{room['id']}/attachments/{uploaded['id']}/save",
+        json={"project": "sweeper-brain-test"},
+        headers=owner_headers,
+    )
+    assert save_resp.status_code == 200, save_resp.json()
+
+    await _close_room(client, owner_headers, room["id"])
+    await _backdate_closed_at(db_session, room["id"], datetime.now(UTC) - timedelta(days=1))
+
+    result = await sweep_once()
+    assert sha256 not in result["reclaimed_blobs"]
+    assert (await db_session.get(AttachmentBlob, sha256)) is not None
+    path = attachment_blob_path(get_settings().attachment_storage_dir, sha256)
+    assert path.exists()  # a Brain document keeps the file forever
+
+
+async def test_sweep_once_isolates_a_failing_attachment_sweep_and_still_closes_rooms(client, db_session, monkeypatch):
+    """A failure in the attachment-blob sweep must not kill the sweeper loop
+    or block this same cycle's room time-closing.
+    """
+    import app.room_sweeper as sweeper_module
+
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    expiring_room = await _create_room(client, owner_headers, name="sweeper-fail-isolation-room")
+    await _backdate_expires_at(db_session, expiring_room["id"], datetime.now(UTC) - timedelta(seconds=5))
+
+    async def flaky_sweep_expired_blobs(*args, **kwargs):
+        raise RuntimeError("simulated attachment sweep failure")
+
+    monkeypatch.setattr(sweeper_module, "sweep_expired_blobs", flaky_sweep_expired_blobs)
+
+    result = await sweep_once()  # must not raise
+    assert result["reclaimed_blobs"] == []
+    assert result["closed"] == [expiring_room["id"]]  # unaffected by the attachment sweep's failure
+
+    detail = await _get_room(client, machine_headers, expiring_room["id"])
+    assert detail["status"] == "closed"
+    assert detail["close_reason"] == "time"
+
+
+async def test_sweep_once_attachment_sweep_reports_nothing_reclaimed_when_nothing_is_eligible(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    await _upload(client, owner_headers, room["id"])  # room stays open
+
+    result = await sweep_once()
+    assert result["reclaimed_blobs"] == []
+    assert "reclaimed_blobs" in result  # the new key is always present, even when empty

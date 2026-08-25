@@ -163,6 +163,7 @@ async def get_room_endpoint(
         max_messages=room.max_messages,
         message_count=room.message_count,
         notify_on_close=room.notify_on_close,
+        agent_uploads_allowed=room.agent_uploads_allowed,
         created_at=room.created_at,
         closed_at=room.closed_at,
         close_reason=room.close_reason,
@@ -179,10 +180,13 @@ async def get_room_endpoint(
 async def post_room_message_endpoint(
     room_id: str,
     body: RoomPostMessageRequest,
-    _principal: Principal = Depends(require_machine_or_owner),
+    principal: Principal = Depends(require_machine_or_owner),
     db: AsyncSession = Depends(get_db),
 ) -> RoomPostMessageResponse:
-    message, room = await post_message_op(db, room_id, body.sender, body.text, body.kind)
+    # `principal` (not just `body.sender`) is passed through so post_message
+    # can reject a machine token claiming `sender="owner"` -- see that
+    # function's docstring for the impersonation this closes.
+    message, room = await post_message_op(db, room_id, body.sender, body.text, body.kind, principal=principal)
     return RoomPostMessageResponse(id=message.id, seq=message.seq, room_status=room.status, close_reason=room.close_reason)
 
 

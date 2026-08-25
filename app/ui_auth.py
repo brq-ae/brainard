@@ -21,7 +21,7 @@ import logging
 import secrets
 from typing import Any
 
-from fastapi import Cookie, Depends, Form, Response
+from fastapi import Cookie, Depends, Form, Header, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException
@@ -144,4 +144,21 @@ async def require_csrf(
     to, the form itself was just submitted wrong or forged.
     """
     if not secrets.compare_digest(csrf_token, session.get("csrf", "")):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid. Reload the page and retry.")
+
+
+async def require_csrf_header(
+    session: dict[str, Any] = Depends(require_ui_session),
+    x_csrf_token: str = Header(default=""),
+) -> None:
+    """Same CSRF check as `require_csrf`, but reads the token from an
+    `X-CSRF-Token` request header instead of a form field -- for the one
+    endpoint whose body isn't form-encoded (ADR-0012's raw streamed file
+    upload, `POST /ui/rooms/{id}/attachments`: the body IS the file's raw
+    bytes, so there is no hidden form field to carry a token in). Fetched
+    via JS (app/static/room_attachments.js), never an ordinary HTML form
+    submission. Same synchronizer-token comparison as `require_csrf` --
+    only the transport differs.
+    """
+    if not secrets.compare_digest(x_csrf_token, session.get("csrf", "")):
         raise HTTPException(status_code=403, detail="CSRF token missing or invalid. Reload the page and retry.")

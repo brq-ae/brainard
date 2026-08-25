@@ -9,6 +9,13 @@ background task. Roughly every SWEEP_INTERVAL seconds it:
   (b) posts a one-time "closing soon" system-message nudge (app.rooms.
       post_closing_nudge) into every open room entering its warning
       window, guarded by `closing_warned_at` so it can never double-post.
+  (c) (ADR-0012 stage 3) reclaims scratch attachment blobs whose
+      reference-counted lifetime has expired -- app.attachments.
+      `sweep_expired_blobs`, the SAME reference-counted lock-check-delete
+      domain logic already covered directly in tests/test_attachments.py
+      (grace period, shared-blob protection, Brain-document protection);
+      this task only wires that logic into the existing cycle so it
+      actually runs.
 
 `sweep_once` is the testable unit: callers (tests, `run_sweeper` below)
 pass a `session_factory` and get back exactly what one cycle did, without
@@ -30,6 +37,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.attachments import sweep_expired_blobs
 from app.db import AsyncSessionLocal
 from app.models import Room
 from app.rooms import close_room, post_closing_nudge
@@ -134,14 +142,45 @@ async def _warn_closing_rooms(session_factory: async_sessionmaker[AsyncSession])
     return warned
 
 
+async def _sweep_attachment_blobs(session_factory: async_sessionmaker[AsyncSession]) -> list[str]:
+    """ADR-0012 stage 3: one pass of `app.attachments.sweep_expired_blobs`,
+    on its own short-lived session -- same per-iteration session discipline
+    as the two scans above, and the same isolation: wrapped in its own
+    try/except so a failure here (a transient DB error, anything else
+    unexpected) is logged and skipped, never raised -- it must not abort
+    this cycle's room-closing/nudging (which already ran, above, by the
+    time this is called) or crash the always-on loop `run_sweeper` starts.
+    A failed pass is simply retried next cycle, same recovery posture as
+    every other step in this file.
+
+    `sweep_expired_blobs` already does the real work -- reference-counted
+    check under a row lock, one commit per blob, so no partial state from a
+    mid-sweep failure -- and is exercised directly (grace period, shared-
+    blob protection, Brain-document protection) in
+    tests/test_attachments.py; this function only adds the try/except and
+    the log line so a background caller sees what was reclaimed.
+    """
+    try:
+        async with session_factory() as session:
+            deleted = await sweep_expired_blobs(session)
+    except Exception:
+        logger.exception("room sweeper: attachment blob sweep failed -- will retry next cycle")
+        return []
+    if deleted:
+        logger.info("room sweeper: reclaimed %d expired attachment blob(s): %s", len(deleted), deleted)
+    return deleted
+
+
 async def sweep_once(session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal) -> dict[str, list[str]]:
-    """One sweep cycle (ADR-0007 decision 3). Returns
-    `{"closed": [room_id, ...], "warned": [room_id, ...]}` -- call this
-    directly in tests rather than waiting on the 60s `run_sweeper` loop.
+    """One sweep cycle (ADR-0007 decision 3; ADR-0012 stage 3 adds the
+    attachment-blob reclaim). Returns `{"closed": [room_id, ...], "warned":
+    [room_id, ...], "reclaimed_blobs": [sha256, ...]}` -- call this directly
+    in tests rather than waiting on the 60s `run_sweeper` loop.
     """
     closed = await _close_expired_rooms(session_factory)
     warned = await _warn_closing_rooms(session_factory)
-    return {"closed": closed, "warned": warned}
+    reclaimed_blobs = await _sweep_attachment_blobs(session_factory)
+    return {"closed": closed, "warned": warned, "reclaimed_blobs": reclaimed_blobs}
 
 
 async def run_sweeper(session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal) -> None:

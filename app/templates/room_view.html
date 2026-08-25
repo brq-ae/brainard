@@ -38,17 +38,25 @@
      this page). -->
 <div id="room-config" data-room-id="{{ room.id }}" data-last-seq="{{ last_seq }}" data-status="{{ room.status }}" data-expires-at="{{ room.expires_at.isoformat() if room.expires_at else '' }}" data-csrf="{{ csrf_token }}"></div>
 
-<div class="panel">
-  <h2>Transcript</h2>
-  <ul class="list" id="room-messages">
-    {% for m in messages %}
-    <li class="row" data-seq="{{ m.seq }}">
-      <span class="row-main"><strong>{{ m.sender }}</strong>: {{ m.text }}</span>
-      <span class="meta">{{ m.created_at|human_ts }}</span>
-    </li>
-    {% endfor %}
-  </ul>
-  <p class="empty" id="room-messages-empty" {% if messages %}style="display:none"{% endif %}>No messages yet.</p>
+<div class="panel" id="room-copy-buttons-panel">
+  <h2>Copy join prompt</h2>
+  <p class="meta">One-click copy per participant -- paste directly into that agent's own tab.</p>
+  <!-- ADR-0013: one button per participant, generated dynamically from
+       `members` (never hardcoded to two -- rooms are not limited to a
+       fixed pair). Each button targets the SAME hidden token-reveal
+       element the "Join prompts" section at the bottom of this page
+       defines (id="join-prompt-<loop index>") -- this loop iterates
+       `members` in the same order as that section's loop, so loop.index
+       lines up below and no second copy of the (fairly large) join-prompt
+       text is rendered onto the page. The shared [data-copy-target]
+       handler in app/static/main.js reads that element's .textContent
+       regardless of where in the DOM the triggering button lives. Note:
+       this comment intentionally avoids a live Jinja print expression --
+       Jinja2 evaluates expressions inside HTML comments too, and `loop` is
+       only defined inside the for-loop below. -->
+  {% for m in members %}
+  <button type="button" class="btn" data-copy-target="join-prompt-{{ loop.index }}">Copy join prompt — {% if sides.get(m) %}{{ side_labels[sides[m]] }}{% else %}Agent {{ loop.index }}{% endif %}</button>
+  {% endfor %}
 </div>
 
 <div class="panel">
@@ -122,6 +130,9 @@
   </form>
 </div>
 
+<!-- ADR-0013: owner-controls cluster (post/stop/switch-mode) moved down as a
+     unit -- internal relative order unchanged -- to sit just above the
+     transcript, per the new top-to-bottom section order. -->
 <div class="panel" id="room-post-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>
   <h2>Post as owner</h2>
   <form method="post" action="/ui/rooms/{{ room.id }}/post">
@@ -173,6 +184,107 @@
   </details>
 </div>
 
+<!-- ADR-0012: files panel -- current attachments (name, size, who attached,
+     when) with download/delete/Save-to-Brain controls, upload, the owner's
+     agent-upload checkbox, and the Attach-from-Brain search picker. Placed
+     with the rest of the owner-controls cluster (post/stop/switch-mode
+     above), above the transcript, per ADR-0013's established section order.
+     `a.attachment.filename`/`a.attachment.uploaded_by` are untrusted content
+     (a sanitized-but-still-owner/agent-supplied filename; a room member
+     name) -- rendered through ordinary Jinja2 autoescape only, same
+     discipline as every other untrusted field on this page, never `|safe`. -->
+<div class="panel" id="room-attachments-panel">
+  <h2>Files</h2>
+
+  {% if attachments %}
+  <ul class="list" id="room-attachments-list">
+    {% for a in attachments %}
+    <li class="row" data-attachment-id="{{ a.attachment.id }}">
+      <span class="row-main">
+        <strong>{{ a.attachment.filename }}</strong>
+        <span class="meta">{{ a.byte_size }} bytes &middot; attached by {{ a.attachment.uploaded_by }} &middot; {{ a.attachment.created_at|human_ts }}</span>
+      </span>
+      <span class="row-actions">
+        <a class="btn" href="/ui/rooms/{{ room.id }}/attachments/{{ a.attachment.id }}/download">Download</a>
+        <form method="post" action="/ui/rooms/{{ room.id }}/attachments/{{ a.attachment.id }}/delete" class="inline-form" data-confirm="Delete '{{ a.attachment.filename }}'? This cannot be undone.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn danger">Delete</button>
+        </form>
+        <form method="post" action="/ui/rooms/{{ room.id }}/attachments/{{ a.attachment.id }}/save" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <select name="project" required>
+            <option value="" disabled selected>Save to project&hellip;</option>
+            {% for p in project_names %}
+            <option value="{{ p }}">{{ p }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="btn">Save to Brain</button>
+        </form>
+      </span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty" id="room-attachments-empty">No attachments yet.</p>
+  {% endif %}
+
+  <h3>Upload a PDF</h3>
+  {% if room.status == 'open' %}
+  <div id="room-attachment-upload">
+    <input type="file" id="attachment-file-input" accept="application/pdf">
+    <button type="button" class="btn primary" id="attachment-upload-btn">Upload</button>
+    <div id="attachment-upload-error" class="notice danger" style="display:none"></div>
+  </div>
+  {% else %}
+  <p class="meta">Room is closed -- no further attachments can be added.</p>
+  {% endif %}
+
+  <h3>Attach from Brain</h3>
+  <p class="meta">
+    Search the Brain and attach an existing document's file into this room -- allowed even while agent uploads
+    are disabled below, since it creates no new file.
+  </p>
+  <div class="field">
+    <label for="attach-search-input">Search</label>
+    <input type="text" id="attach-search-input" placeholder="Title or content&hellip;" {% if room.status != 'open' %}disabled{% endif %}>
+  </div>
+  <ul class="list" id="attach-search-results"></ul>
+  <p class="empty" id="attach-search-empty" style="display:none">No matching documents with an attachable file.</p>
+
+  <h3>Agent uploads</h3>
+  <p class="meta">
+    When off, agents are asked not to generate or upload files (they can still attach a document already
+    saved in the Brain, above). Toggling mid-room posts a system announcement to both agents.
+  </p>
+  <form method="post" action="/ui/rooms/{{ room.id }}/agent-uploads">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="checkbox-label">
+      <input type="checkbox" name="allowed" value="1" {% if room.agent_uploads_allowed %}checked{% endif %} {% if room.status != 'open' %}disabled{% endif %}>
+      Allow agents to upload files to this room
+    </label>
+    <button type="submit" class="btn" {% if room.status != 'open' %}disabled{% endif %}>Update</button>
+  </form>
+</div>
+
+<!-- ADR-0013: transcript is now collapsible (still the main content, so it
+     defaults open) with a live message count in its own header. That count
+     reuses the exact same update path as the page-header #room-count span
+     (app/static/rooms.js's poll(), which now sets both from one
+     data.message_count value in the same place) rather than adding a
+     second, independently-updated counter that could drift from it. -->
+<details class="panel" id="room-transcript-panel" open>
+  <summary><h2>Transcript (<span id="room-transcript-count">{{ room.message_count }}</span> messages)</h2></summary>
+  <ul class="list" id="room-messages">
+    {% for m in messages %}
+    <li class="row" data-seq="{{ m.seq }}">
+      <span class="row-main"><strong>{{ m.sender }}</strong>: {{ m.text }}</span>
+      <span class="meta">{{ m.created_at|human_ts }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="empty" id="room-messages-empty" {% if messages %}style="display:none"{% endif %}>No messages yet.</p>
+</details>
+
 <div class="panel">
   <details class="machine-details">
     <summary>Join prompts</summary>
@@ -192,4 +304,5 @@
 <script src="/static/room_form.js"></script>
 <script src="/static/rooms.js"></script>
 <script src="/static/room_ai.js"></script>
+<script src="/static/room_attachments.js"></script>
 {% endblock %}

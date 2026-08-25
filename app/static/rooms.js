@@ -36,6 +36,13 @@
   var list = document.getElementById("room-messages");
   var emptyNotice = document.getElementById("room-messages-empty");
   var countEl = document.getElementById("room-count");
+  // ADR-0013: the transcript panel's own "Transcript (N messages)" header
+  // count -- deliberately updated in the exact same place as countEl below
+  // (poll()'s data.message_count handling), from the same value, so the
+  // two displays of the same number can never drift apart. This element is
+  // absent on pages that don't render the transcript panel; getElementById
+  // returning null is handled the same way countEl already is.
+  var transcriptCountEl = document.getElementById("room-transcript-count");
   var statusBadge = document.getElementById("room-status-badge");
   var closedBanner = document.getElementById("room-closed-banner");
   var closeReasonEl = document.getElementById("room-close-reason");
@@ -148,8 +155,9 @@
           appendMessage(messages[i]);
           if (messages[i].seq > lastSeq) lastSeq = messages[i].seq;
         }
-        if (countEl && typeof data.message_count === "number") {
-          countEl.textContent = String(data.message_count);
+        if (typeof data.message_count === "number") {
+          if (countEl) countEl.textContent = String(data.message_count);
+          if (transcriptCountEl) transcriptCountEl.textContent = String(data.message_count);
         }
         if (data.status === "closed") {
           showClosed(data.close_reason);

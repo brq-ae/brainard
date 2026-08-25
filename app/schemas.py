@@ -630,6 +630,9 @@ class RoomDetailResponse(BaseModel):
     max_messages: int
     message_count: int
     notify_on_close: bool
+    # ADR-0012 decision 7: per-room agent-upload switch -- same "only in
+    # Detail, not List/Create" exposure `notify_on_close` above already has.
+    agent_uploads_allowed: bool
     created_at: datetime
     closed_at: datetime | None
     close_reason: str | None
@@ -743,6 +746,54 @@ class RoomGroupAssignResponse(BaseModel):
     # The group actually applied, after trim/blank-to-None -- echoes what
     # `_validate_group` resolved `group` to, not necessarily the raw input.
     group: str | None
+
+
+# --- Room file attachments (ADR-0012 stage 2) ---
+
+
+class RoomAttachmentOut(BaseModel):
+    id: str
+    room_id: str
+    filename: str
+    byte_size: int
+    uploaded_by: str
+    created_at: datetime
+
+
+class RoomAttachmentListResponse(BaseModel):
+    results: list[RoomAttachmentOut]
+
+
+class RoomAttachFromBrainRequest(BaseModel):
+    document_id: str = Field(min_length=1)
+    sender: str = Field(min_length=1)
+
+
+class RoomAttachmentSaveRequest(BaseModel):
+    # Documents require a project (contracts-v1.md §5) -- unlike knowledge
+    # items, there is no "universal" option here; an unregistered name is
+    # auto-stubbed the same way any deposit's project is.
+    project: str = Field(min_length=1)
+
+
+class RoomAttachmentSaveResponse(BaseModel):
+    document_id: str
+    path: str
+    version: int
+    project: str
+
+
+class RoomAgentUploadsRequest(BaseModel):
+    allowed: bool
+
+
+class RoomAgentUploadsResponse(BaseModel):
+    id: str
+    agent_uploads_allowed: bool
+    # The kind='system' announcement text posted into the room's transcript
+    # by this toggle (ADR-0012 decision 9) -- same shape as
+    # RoomModeSwitchResponse.announcement.
+    announcement: str
 
 
 # --- Room AI actions (ADR-0011) ---

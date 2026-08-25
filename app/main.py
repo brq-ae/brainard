@@ -29,6 +29,7 @@ from app.routers import (
     notifications,
     projects,
     proposals,
+    room_attachments,
     rooms,
     rooms_ai,
     search,
@@ -114,6 +115,7 @@ app.include_router(llm_config.router)
 app.include_router(librarian.router)
 app.include_router(rooms.router)
 app.include_router(rooms_ai.router)
+app.include_router(room_attachments.router)
 
 # --- UI (owner cookie session; see app/ui_auth.py) ---
 app.include_router(ui_login.router)

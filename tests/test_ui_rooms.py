@@ -908,6 +908,332 @@ async def test_room_view_topic_xss_escaped_in_header_and_join_prompts(client, db
     assert escaped in join_part  # topic shown inside the join-prompt boxes' role text, escaped
 
 
+# --- ADR-0013: room page layout + join-prompt copy buttons ---
+
+
+def _fake_room(**overrides) -> Room:
+    """An unsaved Room ORM instance for direct template-rendering tests
+    below -- used only to exercise room_view.html's Jinja logic with member
+    counts/shapes the *domain* layer (app/rooms.py's REQUIRED_MEMBER_COUNT
+    == 2, out of this change's scope) doesn't currently allow to be created
+    through the real create-room path. No DB round-trip involved.
+    """
+    defaults = dict(
+        id="room-template-fake",
+        name="Template Fixture Room",
+        status="open",
+        max_messages=100,
+        message_count=0,
+        notify_on_close=True,
+        created_at=datetime.now(UTC),
+        closed_at=None,
+        close_reason=None,
+        mode="freeform",
+        topic=None,
+        expires_at=None,
+        closing_warned_at=None,
+        group_name=None,
+    )
+    defaults.update(overrides)
+    return Room(**defaults)
+
+
+def _render_room_view(*, room, members, sides, side_labels, join_prompts, messages=(), mode_label="Freeform") -> str:
+    """Renders room_view.html directly (bypassing the /ui/rooms/{id} route
+    entirely) so the new per-participant copy-button loop (ADR-0013
+    decision 2) can be exercised with a member list shape the domain layer
+    doesn't currently produce (more than two members) -- this is a template
+    logic test, not an end-to-end one.
+    """
+    from types import SimpleNamespace
+
+    from app.routers.ui_rooms import ROOM_MODES, ROOM_MODES_JSON
+    from app.templates_env import templates
+
+    fake_request = SimpleNamespace(url=SimpleNamespace(path="/ui/rooms/room-template-fake"))
+    template = templates.env.get_template("room_view.html")
+    return template.render(
+        request=fake_request,
+        csrf_token="test-csrf-token",
+        room=room,
+        members=members,
+        sides=sides,
+        side_labels=side_labels,
+        mode_label=mode_label,
+        messages=list(messages),
+        last_seq=0,
+        join_prompts=join_prompts,
+        room_modes=ROOM_MODES,
+        room_modes_json=ROOM_MODES_JSON,
+        transcript_md="",
+        llm_configured=False,
+        room_ai_actions=[],
+        room_ai_namespaces=[],
+        project_names=[],
+        error=None,
+        deposited=False,
+    )
+
+
+def test_room_view_copy_buttons_generated_dynamically_for_more_than_two_members_with_mixed_roles():
+    """Proves the new "Copy join prompt" row (room_view.html) is a genuine
+    loop over `members` (ADR-0013 decision 2, "not hardcoded to two"), not
+    a fixed pair -- three participants here, two carrying a side/role and
+    one without, so the per-member role-vs-fallback label logic (decision
+    3) is also exercised in the same room rather than across two rooms that
+    could coincidentally each look like a fixed pair.
+    """
+    room = _fake_room(message_count=7)
+    members = ["cmdr", "builder", "observer"]
+    sides = {"cmdr": "lead", "builder": "build", "observer": None}
+    side_labels = {"lead": "Commander", "build": "Builder"}
+    join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
+
+    html_out = _render_room_view(room=room, members=members, sides=sides, side_labels=side_labels, join_prompts=join_prompts)
+
+    # One button per member -- three, not a hardcoded two -- each pointing
+    # at the same hidden token-reveal element the bottom "Join prompts"
+    # section defines for that member (no duplicated hidden text block).
+    assert html_out.count('data-copy-target="join-prompt-1"') == 2  # new row + bottom section
+    assert html_out.count('data-copy-target="join-prompt-2"') == 2
+    assert html_out.count('data-copy-target="join-prompt-3"') == 2
+
+    assert "Copy join prompt — Commander" in html_out
+    assert "Copy join prompt — Builder" in html_out
+    # `observer` has no side -> ordinal fallback, per decision 3.
+    assert "Copy join prompt — Agent 3" in html_out
+
+
+def test_room_view_copy_button_labels_fall_back_to_agent_ordinal_without_roles():
+    """A room with no roles at all (freeform, `sides` all falsy) must label
+    every button "Agent N", never the bare member name and never a blank
+    label -- the fallback branch of decision 3.
+    """
+    room = _fake_room(message_count=0)
+    members = ["alpha", "beta", "gamma", "delta"]
+    sides = {m: None for m in members}
+    join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
+
+    html_out = _render_room_view(room=room, members=members, sides=sides, side_labels=None, join_prompts=join_prompts)
+
+    assert "Copy join prompt — Agent 1" in html_out
+    assert "Copy join prompt — Agent 2" in html_out
+    assert "Copy join prompt — Agent 3" in html_out
+    assert "Copy join prompt — Agent 4" in html_out
+
+
+async def test_room_view_copy_button_labels_use_role_in_real_debate_room(client, db_session):
+    """End-to-end (real /ui/rooms/{id} route, real create-room API) sibling
+    of the two template-level tests above: a two-member debate room's
+    buttons must read the side label ("For"/"Against"), not "Agent 1"/
+    "Agent 2".
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(
+        client,
+        owner_headers,
+        name="debate-copy-buttons",
+        members=["alice", "bob"],
+        mode="debate",
+        topic="Cats vs dogs",
+        sides={"alice": "for", "bob": "against"},
+    )
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Copy join prompt — For" in resp.text
+    assert "Copy join prompt — Against" in resp.text
+    assert "Copy join prompt — Agent 1" not in resp.text
+    assert "Copy join prompt — Agent 2" not in resp.text
+
+
+async def test_room_view_copy_button_labels_fall_back_in_real_freeform_room(client, db_session):
+    """End-to-end sibling: a freeform (no-roles) two-member room falls back
+    to "Agent 1"/"Agent 2" through the real route, same as the template-
+    level test above.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="freeform-copy-buttons", members=["agent-a", "agent-b"])
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Copy join prompt — Agent 1" in resp.text
+    assert "Copy join prompt — Agent 2" in resp.text
+
+
+async def test_room_view_copy_button_click_target_matches_bottom_section_join_prompt(client, db_session):
+    """Each new button's data-copy-target must resolve to the SAME hidden
+    element the bottom "Join prompts" section already defines -- reusing
+    the shared [data-copy-target] handler (ADR-0013 decision 4) rather than
+    a second copy-to-clipboard path or a duplicated hidden text block.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="copy-target-room", members=["agent-a", "agent-b"])
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    text = resp.text
+
+    assert text.count('data-copy-target="join-prompt-1"') == 2
+    assert text.count('data-copy-target="join-prompt-2"') == 2
+    # Exactly one hidden token-reveal element per member id -- the new row
+    # does not render a second copy of the join-prompt text.
+    assert text.count('id="join-prompt-1"') == 1
+    assert text.count('id="join-prompt-2"') == 1
+
+
+async def test_room_view_section_order_matches_adr_0013(client, db_session):
+    """Top-to-bottom order per ADR-0013 decision 1: room info (unchanged,
+    not separately markered here), join-prompt copy buttons, export, AI
+    actions, the owner-controls cluster (post/stop/switch-mode, moved as a
+    unit), transcript (now collapsible), then the full join-prompts section
+    at the very bottom.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="order-room")
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    text = resp.text
+
+    copy_buttons_idx = text.index('id="room-copy-buttons-panel"')
+    export_idx = text.index("<h2>Export</h2>")
+    ai_idx = text.index('id="room-ai-panel"')
+    post_idx = text.index('id="room-post-panel"')
+    stop_idx = text.index('id="room-stop-panel"')
+    switch_mode_idx = text.index('id="room-switch-mode-panel"')
+    transcript_idx = text.index('id="room-transcript-panel"')
+    join_prompts_idx = text.index(">Join prompts<")
+
+    assert (
+        copy_buttons_idx
+        < export_idx
+        < ai_idx
+        < post_idx
+        < stop_idx
+        < switch_mode_idx
+        < transcript_idx
+        < join_prompts_idx
+    )
+
+
+async def test_room_view_transcript_collapsible_open_by_default_with_live_count(client, db_session):
+    """ADR-0013 decision 7: the transcript becomes a <details> that
+    defaults open, with a live message count in its header -- "Transcript
+    (N messages)" -- reusing the room's actual message_count.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="hi")
+    await _post_message_via_api(client, machine_headers, room["id"], sender="agent-b", text="there")
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    text = resp.text
+
+    m = re.search(r'<details class="panel" id="room-transcript-panel"([^>]*)>', text)
+    assert m, "transcript panel must be rendered as a <details> element"
+    assert "open" in m.group(1), "transcript must default to open, not collapsed"
+
+    assert '<span id="room-transcript-count">2</span>' in text
+    assert re.search(r"Transcript \(<span[^>]*>2</span>\s*messages\)", text), (
+        "transcript header must show a live 'Transcript (N messages)' count"
+    )
+
+
+async def test_room_view_transcript_count_element_reused_not_duplicated(client, db_session):
+    """The transcript header's count and the page-header count must be two
+    *different* DOM elements (distinct ids) both driven from the same
+    room.message_count value server-side, and the SAME live-update path
+    client-side (app/static/rooms.js) -- not a second, independently
+    tracked counter that could drift (ADR-0013 decision 7's "does not add
+    a second counter that could drift from it").
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="hi")
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    text = resp.text
+
+    assert '<span id="room-count">1</span>' in text
+    assert '<span id="room-transcript-count">1</span>' in text
+
+
+def test_rooms_js_transcript_count_updated_alongside_room_count():
+    """Static-source check on app/static/rooms.js: the new transcript-
+    header count element must be looked up once (getElementById) and
+    updated from the exact same `data.message_count` handling block that
+    already drives #room-count (ADR-0013 decision 7's "hook the header
+    there" -- app/static/rooms.js:151-153 in the ADR/task description),
+    not a second poll or a second branch that could fall out of sync.
+    """
+    from pathlib import Path
+
+    js_path = Path(__file__).resolve().parent.parent / "app" / "static" / "rooms.js"
+    source = js_path.read_text()
+
+    assert 'getElementById("room-transcript-count")' in source
+
+    # The two elements must be updated inside the same
+    # `if (typeof data.message_count === "number")` conditional, not two
+    # separate ones -- extract that block and check both assignments live
+    # inside it.
+    match = re.search(
+        r'if \(typeof data\.message_count === "number"\) \{(.*?)\n\s*\}', source, re.DOTALL
+    )
+    assert match, "expected a single typeof-data.message_count guard block in rooms.js"
+    block = match.group(1)
+    assert "countEl.textContent" in block
+    assert "transcriptCountEl.textContent" in block
+
+
+def test_main_js_copy_handler_three_tier_fallback_order():
+    """Static-source check on app/static/main.js (no JS test runner in this
+    Python-based repo -- see test_rooms_js_renders_via_textcontent_not_innerhtml
+    for the established pattern this follows). ADR-0013 decision 5: the
+    shared [data-copy-target] handler's fallback order must be
+    navigator.clipboard.writeText -> hidden-textarea execCommand('copy') ->
+    window.prompt last resort -- and the copied-confirmation must be driven
+    by each tier's actual result, never fired unconditionally before the
+    copy is known to have worked.
+    """
+    from pathlib import Path
+
+    js_path = Path(__file__).resolve().parent.parent / "app" / "static" / "main.js"
+    source = js_path.read_text()
+
+    clipboard_idx = source.index("navigator.clipboard")
+    exec_command_idx = source.index("document.execCommand")
+    prompt_idx = source.index("window.prompt(")
+    assert clipboard_idx < exec_command_idx < prompt_idx, (
+        "fallback tiers must appear in order: clipboard API, then execCommand, then window.prompt"
+    )
+
+    # Tier 2's hidden textarea must never be visible or affect layout, and
+    # must always be cleaned up.
+    assert "createElement(\"textarea\")" in source
+    assert "document.body.appendChild(textarea)" in source
+    assert "document.body.removeChild(textarea)" in source
+    assert "finally" in source
+
+    # The success/failure confirmation must be gated on the real result of
+    # each tier -- not called unconditionally right after the copy attempt.
+    assert "showSuccess" in source
+    assert "showFailure" in source
+    assert 'navigator.clipboard.writeText(text).then(showSuccess, fallToExecCommandThenPrompt)' in source
+    assert "if (execCommandCopy())" in source, "execCommand's boolean return value must gate success/failure"
+
+    # The failure path still falls through to the manual-copy dialog
+    # (decision 5's "last resort"), it doesn't just give up.
+    assert re.search(r"showFailure\(\);\s*\n\s*window\.prompt\(", source), (
+        "on execCommand failure, must show the failed state and still offer the window.prompt fallback"
+    )
+
+
 def test_rooms_js_renders_via_textcontent_not_innerhtml():
     """Static-source check on app/static/rooms.js: the message-append path
     must use textContent/createTextNode (inert against markup) and must
@@ -1372,3 +1698,313 @@ async def test_ui_switch_mode_topic_xss_escaped_in_header_and_announcement(clien
         assert payload not in transcript_part
         assert escaped in transcript_part  # topic shown inside the announcement message, escaped
         assert "Mode switched to Debate." in transcript_part
+
+
+# --- ADR-0012: room file attachments -- owner UI ---
+
+
+def _pdf_bytes(body: bytes = b"hello") -> bytes:
+    return b"%PDF-1.4\n" + body + b"\n%%EOF"
+
+
+async def _api_upload(client, owner_headers, room_id, *, filename="doc.pdf", sender="owner", content=None):
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/attachments",
+        params={"filename": filename, "sender": sender},
+        content=content if content is not None else _pdf_bytes(),
+        headers=owner_headers,
+    )
+    assert resp.status_code == 201, resp.json()
+    return resp.json()
+
+
+async def _ui_upload(client, room_id, csrf_token, *, filename="doc.pdf", content=None):
+    return await client.post(
+        f"/ui/rooms/{room_id}/attachments",
+        params={"filename": filename},
+        content=content if content is not None else _pdf_bytes(),
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+
+async def test_room_view_files_panel_shows_attachment_details(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="files-panel-room")
+    await _api_upload(client, owner_headers, room["id"], filename="report.pdf", content=_pdf_bytes(b"panel-body"))
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "report.pdf" in resp.text
+    assert f"{len(_pdf_bytes(b'panel-body'))} bytes" in resp.text
+    assert "attached by owner" in resp.text
+    assert "No attachments yet." not in resp.text
+
+
+async def test_room_view_files_panel_empty_state(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="files-panel-empty")
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "No attachments yet." in resp.text
+
+
+async def test_room_view_attachment_filename_xss_inert_end_to_end(client, db_session):
+    """Uploading a file whose CLIENT-supplied name is an XSS payload: the
+    sanitizer (app/room_export.py's safe_filename_component, applied at
+    upload time) is the primary defense, and the raw payload must never
+    appear anywhere in the rendered page either way.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="filename-xss-room")
+    malicious = XSS_SCRIPT + ".pdf"
+    uploaded = await _api_upload(client, owner_headers, room["id"], filename=malicious)
+    assert XSS_SCRIPT not in uploaded["filename"]
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert XSS_SCRIPT not in resp.text
+    assert "<script>" not in resp.text.lower().replace(" ", "")
+
+
+async def test_room_view_attachment_filename_xss_inert_via_template_autoescape(client, db_session):
+    """Defense in depth, independent of the sanitizer: a `RoomAttachment`
+    row inserted directly with a filename the sanitizer would never itself
+    produce (simulating anything that ever bypassed it) must still render
+    inert -- proving room_view.html's rendering of `a.attachment.filename`
+    is ordinary Jinja2 autoescape, never `|safe`, same discipline as every
+    other untrusted field on this page.
+    """
+    from datetime import UTC, datetime as dt
+
+    from app.models import AttachmentBlob, RoomAttachment
+
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="filename-xss-template-room")
+
+    blob = AttachmentBlob(sha256="b" * 64, byte_size=10, created_at=dt.now(UTC))
+    db_session.add(blob)
+    await db_session.flush()
+    db_session.add(
+        RoomAttachment(
+            id=str(ULID()),
+            room_id=room["id"],
+            blob_sha256=blob.sha256,
+            filename=XSS_IMG,
+            uploaded_by="owner",
+            created_at=dt.now(UTC),
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert XSS_IMG not in resp.text
+
+    from markupsafe import escape as markupsafe_escape
+
+    assert str(markupsafe_escape(XSS_IMG)) in resp.text
+
+
+async def test_ui_upload_attachment_succeeds(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-upload-room")
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await _ui_upload(client, room["id"], csrf, filename="uploaded.pdf")
+    assert resp.status_code == 201
+    assert resp.json()["filename"] == "uploaded.pdf"
+
+    view = await client.get(f"/ui/rooms/{room['id']}")
+    assert "uploaded.pdf" in view.text
+
+
+async def test_ui_upload_attachment_without_csrf_header_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-upload-no-csrf")
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/attachments", params={"filename": "doc.pdf"}, content=_pdf_bytes()
+    )
+    assert resp.status_code == 403
+
+
+async def test_ui_upload_attachment_machine_token_cannot_reach_ui(client, db_session):
+    # Deliberately `_owner_headers` (bearer-only), NOT `_owner_headers_and_login`
+    # -- this client must carry NO session cookie at all, so the machine
+    # bearer token below is the only credential on the request; a leftover
+    # owner cookie from an earlier login on this same client would let the
+    # request through for the wrong reason and defeat the point of this test.
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-upload-machine")
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/attachments",
+        params={"filename": "doc.pdf"},
+        content=_pdf_bytes(),
+        headers={**machine_headers, "X-CSRF-Token": "irrelevant"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+
+async def test_ui_download_attachment_headers(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-download-room")
+    payload = _pdf_bytes(b"ui-download-body")
+    uploaded = await _api_upload(client, owner_headers, room["id"], filename="ui-report.pdf", content=payload)
+
+    resp = await client.get(f"/ui/rooms/{room['id']}/attachments/{uploaded['id']}/download")
+    assert resp.status_code == 200
+    assert resp.headers["content-disposition"] == 'attachment; filename="ui-report.pdf"'
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert resp.content == payload
+
+
+async def test_ui_delete_attachment_via_form(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-delete-room")
+    uploaded = await _api_upload(client, owner_headers, room["id"], filename="to-delete.pdf")
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/attachments/{uploaded['id']}/delete",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    view = await client.get(f"/ui/rooms/{room['id']}")
+    # Gone from the files panel specifically (a precise check, not a bare
+    # substring one -- ADR-0012 stage 3 now legitimately posts a system
+    # message into the transcript on the same page that names the deleted
+    # file, see the assertions below).
+    assert f'data-attachment-id="{uploaded["id"]}"' not in view.text
+    assert "No attachments yet." in view.text
+    # The removal is announced in the transcript (ADR-0012 stage 3 item 2)
+    # so an agent long-polling the room learns about it.
+    assert "Attachment removed:" in view.text
+    assert "to-delete.pdf" in view.text  # named in the system message(s)
+
+
+async def test_ui_delete_attachment_without_csrf_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-delete-no-csrf")
+    uploaded = await _api_upload(client, owner_headers, room["id"])
+    resp = await client.post(f"/ui/rooms/{room['id']}/attachments/{uploaded['id']}/delete", data={})
+    assert resp.status_code == 403
+
+
+async def test_ui_save_attachment_to_brain_leaves_room_copy_readable(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-save-room")
+    payload = _pdf_bytes(b"ui-save-body")
+    uploaded = await _api_upload(client, owner_headers, room["id"], filename="ui-save.pdf", content=payload)
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/attachments/{uploaded['id']}/save",
+        data={"project": "ui-save-project", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == f"/ui/rooms/{room['id']}?deposited=1"
+
+    # Room copy unaffected -- still listed, still downloadable.
+    view = await client.get(f"/ui/rooms/{room['id']}")
+    assert "ui-save.pdf" in view.text
+    download = await client.get(f"/ui/rooms/{room['id']}/attachments/{uploaded['id']}/download")
+    assert download.status_code == 200
+    assert download.content == payload
+
+
+async def test_ui_attach_search_returns_documents_with_a_blob(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    source_room = await _create_room_via_api(client, owner_headers, name="ui-search-source")
+    # A space-separated filename, not a hyphenated one: Postgres's default
+    # text search config indexes a hyphenated "searchable-spec.pdf" as ONE
+    # compound lexeme (verified against this exact stack: `to_tsvector`
+    # doesn't split it), so a plain single-word query would never match it
+    # -- unrelated to this endpoint's own logic, just how FTS tokenizes
+    # hyphens+dots. Space-separated words tokenize individually instead.
+    uploaded = await _api_upload(client, owner_headers, source_room["id"], filename="brainard widget spec.pdf")
+    save_resp = await client.post(
+        f"/v1/rooms/{source_room['id']}/attachments/{uploaded['id']}/save",
+        json={"project": "ui-attach-search-project"},
+        headers=owner_headers,
+    )
+    assert save_resp.status_code == 200, save_resp.json()
+
+    resp = await client.get(f"/ui/rooms/{source_room['id']}/attach-search?q=widget")
+    assert resp.status_code == 200
+    results = resp.json()["results"]
+    assert any(r["title"] == "brainard widget spec.pdf" for r in results)
+
+
+async def test_ui_attach_from_brain_via_form(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    source_room = await _create_room_via_api(client, owner_headers, name="ui-attach-source")
+    uploaded = await _api_upload(client, owner_headers, source_room["id"], filename="reusable.pdf")
+    save_resp = await client.post(
+        f"/v1/rooms/{source_room['id']}/attachments/{uploaded['id']}/save",
+        json={"project": "ui-attach-from-brain-project"},
+        headers=owner_headers,
+    )
+    document_id = save_resp.json()["document_id"]
+
+    target_room = await _create_room_via_api(client, owner_headers, name="ui-attach-target")
+    page = await client.get(f"/ui/rooms/{target_room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{target_room['id']}/attach-from-brain",
+        data={"document_id": document_id, "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    view = await client.get(f"/ui/rooms/{target_room['id']}")
+    assert "reusable.pdf" in view.text
+
+
+async def test_ui_agent_uploads_checkbox_reflects_state(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-checkbox-room")
+
+    on = await client.get(f"/ui/rooms/{room['id']}")
+    assert 'name="allowed" value="1" checked' in on.text
+
+    off_resp = await client.post(f"/v1/rooms/{room['id']}/agent-uploads", json={"allowed": False}, headers=owner_headers)
+    assert off_resp.status_code == 200
+
+    off = await client.get(f"/ui/rooms/{room['id']}")
+    assert 'name="allowed" value="1" checked' not in off.text
+
+
+async def test_ui_toggle_agent_uploads_via_form(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-toggle-room")
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/agent-uploads", data={"csrf_token": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["agent_uploads_allowed"] is False
+
+    view = await client.get(f"/ui/rooms/{room['id']}")
+    assert "Agent file uploads are now disabled in this room." in view.text
+
+
+async def test_ui_toggle_agent_uploads_without_csrf_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-toggle-no-csrf")
+    resp = await client.post(f"/ui/rooms/{room['id']}/agent-uploads", data={})
+    assert resp.status_code == 403

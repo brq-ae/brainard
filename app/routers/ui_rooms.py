@@ -122,12 +122,24 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from markupsafe import Markup
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException
-from starlette.responses import JSONResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
+from app.attachments import add_attachment_from_brain_document
+from app.attachments import blob_path as attachment_blob_path
+from app.attachments import (
+    delete_room_attachment as delete_room_attachment_op,
+)
+from app.attachments import get_room_attachment_for_download
+from app.attachments import list_room_attachments as list_room_attachments_op
+from app.attachments import RoomAttachmentView
+from app.attachments import save_attachment_to_brain
+from app.attachments import upload_pdf_attachment as upload_pdf_attachment_op
+from app.auth import Principal
+from app.config import get_settings
 from app.db import get_db
 from app.errors import ApiError
 from app.llm_config import resolve_llm_config
-from app.models import Room
+from app.models import AttachmentBlob, Room, RoomAttachment
 from app.onboarding import TOKEN_PLACEHOLDER, generate_room_join_prompt, resolve_base_url
 from app.projects import list_project_names
 from app.room_ai import ACTIONS as ROOM_AI_ACTIONS
@@ -145,12 +157,30 @@ from app.rooms import get_member_sides, get_members, get_members_for_rooms, get_
 from app.rooms import list_room_groups as list_room_groups_op
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
+from app.rooms import post_attachment_added_message, post_attachment_removed_message
 from app.rooms import post_message as post_message_op
+from app.rooms import set_agent_uploads_allowed as set_agent_uploads_allowed_op
 from app.rooms import switch_room_mode as switch_room_mode_op
+from app.search import run_search
 from app.templates_env import templates
-from app.ui_auth import require_csrf, require_ui_session
+from app.ui_auth import require_csrf, require_csrf_header, require_ui_session
 
 router = APIRouter(prefix="/ui/rooms", tags=["ui"])
+
+# ADR-0012 decision 14: same download response-header discipline the v1 API
+# router (app/routers/room_attachments.py) uses -- kept as one small
+# duplicated helper rather than a cross-import between the two router files
+# (this codebase's routers don't import each other; app/attachments.py is
+# the shared layer both call into).
+_ATTACH_SEARCH_TYPES = frozenset({"document", "decision"})
+
+
+def _attachment_download_headers(filename: str) -> dict[str, str]:
+    return {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    }
 
 ROOM_LIST_LIMIT = 20
 INITIAL_MESSAGE_LIMIT = 50
@@ -241,7 +271,11 @@ def _parse_duration_seconds(preset: str, custom_value: str, custom_unit: str) ->
 
 
 def _join_prompts_by_member(
-    request: Request, room: Room, members: list[str], sides: dict[str, str | None]
+    request: Request,
+    room: Room,
+    members: list[str],
+    sides: dict[str, str | None],
+    attachments: list[RoomAttachmentView],
 ) -> dict[str, str]:
     """The generated room-join prompt (app/onboarding.py's
     `generate_room_join_prompt`) for each of the room's members, keyed by
@@ -257,6 +291,13 @@ def _join_prompts_by_member(
     params (a prior review flagged this), so e.g. a debate room's join
     prompts now actually carry the For/Against stance text, the topic, and
     the deadline line, not just the generic freeform framing.
+
+    ADR-0012 (stage 3): also passes the room's current
+    `agent_uploads_allowed` and `attachments` (the same list `_room_context`
+    below already fetched for the files panel -- passed in rather than
+    re-queried, one fetch per render) through to `generate_room_join_prompt`,
+    so every member's join prompt states the current file policy and the
+    room's current attachments up front (decision 9).
     """
     base_url = resolve_base_url(request)
     return {
@@ -270,6 +311,8 @@ def _join_prompts_by_member(
             topic=room.topic,
             side=sides.get(agent_name),
             deadline=room.expires_at,
+            agent_uploads_allowed=room.agent_uploads_allowed,
+            attachments=attachments,
         )
         for agent_name in members
     }
@@ -289,12 +332,18 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
     last_seq = messages[-1].seq if messages else 0
     mode_def = ROOM_MODES[room.mode]
 
+    # ADR-0012 (stage 3): fetched once, here, and reused by the transcript
+    # render just below (decision 11: export lists attachments), the join
+    # prompts further down (so each member's prompt lists the room's current
+    # attachments), and the files panel context key.
+    attachments = await list_room_attachments_op(db, room_id)
+
     # ADR-0011: the full transcript, oldest-first, rendered as markdown once
     # here so the "Copy transcript" button (app/static/main.js's existing
     # data-copy-target pattern) has something to read from -- distinct from
     # `messages` above, which is only the live view's bounded recent window.
     all_messages = await get_all_messages(db, room_id)
-    transcript_md = render_transcript_markdown(room, members, sides, all_messages)
+    transcript_md = render_transcript_markdown(room, members, sides, all_messages, attachments)
 
     effective = await resolve_llm_config(db)
     llm_configured = bool(effective.base_url and effective.model)
@@ -307,7 +356,7 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
         "side_labels": mode_def.side_labels,
         "messages": messages,
         "last_seq": last_seq,
-        "join_prompts": _join_prompts_by_member(request, room, members, sides),
+        "join_prompts": _join_prompts_by_member(request, room, members, sides, attachments),
         # ADR-0009: the switch-mode form's mode dropdown, sourced from the
         # same ROOM_MODES/ROOM_MODES_JSON the create-room form uses (never a
         # second, divergent mode list) -- see this module's docstring.
@@ -319,6 +368,12 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
         "room_ai_actions": sorted(ROOM_AI_ACTIONS),
         "room_ai_namespaces": sorted(ROOM_AI_NAMESPACES),
         "project_names": await list_project_names(db),
+        # ADR-0012: the files panel -- current attachments (each already
+        # paired with its blob's byte_size, app/attachments.py's
+        # `list_room_attachments`) and the project names again double as the
+        # Save-to-Brain form's project picker (same list, same reasoning as
+        # the AI-deposit form just above).
+        "attachments": attachments,
     }
 
 
@@ -536,7 +591,11 @@ async def room_post(
         # sender='owner' -- this counts toward the room's message cap same
         # as any member post (app.rooms.post_message's guardrail logic is
         # sender-agnostic beyond the membership check it skips for 'owner').
-        await post_message_op(db, room_id, "owner", text)
+        # principal=owner is genuinely true here: this route is guarded by
+        # `require_ui_session`, which only ever accepts the owner's UI
+        # cookie (app/ui_auth.py -- "Never accepts a machine token") -- so
+        # the claimed 'owner' sender is exactly who's authenticated.
+        await post_message_op(db, room_id, "owner", text, principal=Principal(kind="owner"))
     except ApiError as exc:
         ctx = await _room_context(db, request, room_id)
         if ctx is None:
@@ -694,7 +753,8 @@ async def room_transcript_markdown(
     members = await get_members(db, room_id)
     sides = await get_member_sides(db, room_id)
     messages = await get_all_messages(db, room_id)
-    body = render_transcript_markdown(room, members, sides, messages)
+    attachments = await list_room_attachments_op(db, room_id)
+    body = render_transcript_markdown(room, members, sides, messages, attachments)
     filename = transcript_filename(room, "md")
     return Response(
         content=body,
@@ -718,7 +778,8 @@ async def room_transcript_json(
     members = await get_members(db, room_id)
     sides = await get_member_sides(db, room_id)
     messages = await get_all_messages(db, room_id)
-    payload = render_transcript_json(room, members, sides, messages)
+    attachments = await list_room_attachments_op(db, room_id)
+    payload = render_transcript_json(room, members, sides, messages, attachments)
     filename = transcript_filename(room, "json")
     return JSONResponse(
         content=payload,
@@ -798,3 +859,191 @@ async def room_ai_action(
             "truncated_notice": result.truncated_notice,
         }
     )
+
+
+# --- ADR-0012: room file attachments -- owner UI ---
+#
+# Upload is the one action here that is NOT an ordinary HTML form post: the
+# request body is the file's raw bytes (app/static/room_attachments.js does
+# a JS `fetch(url, {body: file})`), streamed straight into
+# `upload_pdf_attachment_op` -- never buffered whole, and never routed
+# through FastAPI's multipart/UploadFile machinery, which would spool the
+# whole part to a temp file before this handler even runs. Because the body
+# isn't form-encoded, CSRF here travels in an `X-CSRF-Token` header instead
+# of a hidden form field (`require_csrf_header`, app/ui_auth.py) -- every
+# other action below is a plain form post and uses the ordinary
+# `require_csrf` form-field check, same as the rest of this file.
+
+
+@router.post("/{room_id}/attachments", status_code=201)
+async def room_upload_attachment(
+    room_id: str,
+    request: Request,
+    filename: str = Query(..., min_length=1),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf_header),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """JS-fetched (app/static/room_attachments.js), never a browser
+    navigation -- same posture as `room_ai_action` above: any ApiError
+    (bad magic bytes, too large, cap/ceiling/disk-floor exceeded, agent-
+    uploads-disabled -- moot here since sender is always 'owner', room
+    closed, ...) is deliberately left to propagate to the app-level handler
+    (app/errors.py's `api_error_handler`), landing as the same
+    `{"error": {"code", "detail", ...}}` envelope the v1 API uses, so the JS
+    reads `error.code`/`error.detail` the same way `room_ai.js` already
+    does.
+    """
+    # principal=owner: this route is guarded by require_ui_session, which
+    # only ever accepts the owner's UI cookie -- see the identical note on
+    # room_post above.
+    attachment = await upload_pdf_attachment_op(
+        db, request.stream(), room_id=room_id, sender="owner", principal=Principal(kind="owner"), display_filename=filename
+    )
+    blob = await db.get(AttachmentBlob, attachment.blob_sha256)
+    await post_attachment_added_message(
+        db, room_id, filename=attachment.filename, byte_size=blob.byte_size, uploaded_by=attachment.uploaded_by
+    )
+    return JSONResponse({"id": attachment.id, "filename": attachment.filename}, status_code=201)
+
+
+@router.get("/{room_id}/attachments/{attachment_id}/download")
+async def room_download_attachment(
+    room_id: str,
+    attachment_id: str,
+    _session: dict = Depends(require_ui_session),
+    db: AsyncSession = Depends(get_db),
+) -> FileResponse:
+    try:
+        attachment, blob = await get_room_attachment_for_download(db, room_id=room_id, attachment_id=attachment_id)
+    except ApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    settings = get_settings()
+    path = attachment_blob_path(settings.attachment_storage_dir, blob.sha256)
+    return FileResponse(path=path, media_type="application/pdf", headers=_attachment_download_headers(attachment.filename))
+
+
+@router.post("/{room_id}/attachments/{attachment_id}/delete")
+async def room_delete_attachment(
+    room_id: str,
+    attachment_id: str,
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    snapshot = await db.get(RoomAttachment, attachment_id)
+    filename = snapshot.filename if snapshot is not None and snapshot.room_id == room_id else None
+    try:
+        await delete_room_attachment_op(db, room_id=room_id, attachment_id=attachment_id)
+    except ApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    if filename is not None:
+        await post_attachment_removed_message(db, room_id, filename=filename, removed_by="owner")
+    return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
+
+
+@router.post("/{room_id}/attachments/{attachment_id}/save")
+async def room_save_attachment_to_brain(
+    room_id: str,
+    attachment_id: str,
+    request: Request,
+    project: str = Form(...),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        await save_attachment_to_brain(db, room_id=room_id, attachment_id=attachment_id, project=project)
+    except ApiError as exc:
+        ctx = await _room_context(db, request, room_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.") from exc
+        return templates.TemplateResponse(
+            request,
+            "room_view.html",
+            {"csrf_token": session["csrf"], "error": exc.detail, "deposited": False, **ctx},
+            status_code=exc.status_code,
+        )
+    return RedirectResponse(url=f"/ui/rooms/{room_id}?deposited=1", status_code=303)
+
+
+@router.get("/{room_id}/attach-search")
+async def room_attach_search(
+    room_id: str,
+    q: str = Query(default=""),
+    _session: dict = Depends(require_ui_session),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Backs the "Attach from Brain" search picker (ADR-0012 decision 10,
+    JS-driven live search -- app/static/room_attachments.js), reusing
+    app.search.run_search UNCHANGED (scope='all' so both mirrored ADRs and
+    docs are candidates). Restricted here to the two MirroredDocument-backed
+    result types ('document', 'decision') -- the only kinds that could
+    possibly carry a `blob_sha256` to attach; library/handoff/event results
+    are never attachable and are filtered out rather than surfaced only to
+    fail with `document_not_attachable` on every click. Read-only: no CSRF
+    needed, same posture as every other GET in this file.
+    """
+    if not q.strip():
+        return JSONResponse({"results": []})
+    results, _next_cursor = await run_search(db, q=q, scope="all", limit=10)
+    return JSONResponse(
+        {
+            "results": [
+                {"id": r.id, "title": r.snippet, "project": r.project, "type": r.type}
+                for r in results
+                if r.type in _ATTACH_SEARCH_TYPES
+            ]
+        }
+    )
+
+
+@router.post("/{room_id}/attach-from-brain")
+async def room_attach_from_brain(
+    room_id: str,
+    document_id: str = Form(...),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        # principal=owner: this route is guarded by require_ui_session,
+        # which only ever accepts the owner's UI cookie -- see the
+        # identical note on room_post above.
+        attachment = await add_attachment_from_brain_document(
+            db, room_id=room_id, sender="owner", principal=Principal(kind="owner"), document_id=document_id
+        )
+    except ApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    blob = await db.get(AttachmentBlob, attachment.blob_sha256)
+    await post_attachment_added_message(
+        db, room_id, filename=attachment.filename, byte_size=blob.byte_size, uploaded_by=attachment.uploaded_by
+    )
+    return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
+
+
+@router.post("/{room_id}/agent-uploads")
+async def room_set_agent_uploads_allowed(
+    room_id: str,
+    request: Request,
+    # An unchecked HTML checkbox submits no field at all -- presence, not
+    # value, is what a checked box means (same convention as every other
+    # checkbox this codebase's forms already imply).
+    allowed: str = Form(default=""),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        await set_agent_uploads_allowed_op(db, room_id, bool(allowed))
+    except ApiError as exc:
+        ctx = await _room_context(db, request, room_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.") from exc
+        return templates.TemplateResponse(
+            request,
+            "room_view.html",
+            {"csrf_token": session["csrf"], "error": exc.detail, "deposited": False, **ctx},
+            status_code=exc.status_code,
+        )
+    return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)

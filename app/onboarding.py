@@ -29,12 +29,30 @@ unconditionally, after the poll/reply mechanics): the owner may switch a
 room's mode mid-session (app/rooms.py's `switch_room_mode`), and a joining
 agent needs to know to watch for the resulting system announcement, adopt
 the new stance, and suggest -- never perform -- a switch itself.
+
+ADR-0012 (stage 3, decision 9: "agents are briefed, not just refused")
+further extends `generate_room_join_prompt` with a file-policy paragraph
+(`_room_attachments_policy_block`), inserted right after the intro -- ahead
+of even the mode/session block -- so an agent learns the room's file policy
+before it does anything else, and never discovers a restriction by trying.
+When agent uploads are disabled it is phrased as a directive (do not
+generate a file, do not offer to, do not plan around attaching one -- put
+the content in a message instead), not a bare status line, mirroring how
+`_MODE_SWITCH_PRIMING` above and the anti-injection framing in `intro`
+already state a rule as an instruction rather than leaving the agent to
+infer it from a future 403. The block always lists the room's current
+attachments (name, size, who attached, when) and the fetch endpoint, and
+always states decision 13's cleanup doctrine (delete local copies when
+done; Brain-saved files are always re-fetchable, scratch files die with the
+room). The API's own 403 (`app/attachments.py`'s `agent_uploads_disabled`)
+remains a backstop -- reaching it means this briefing failed.
 """
 
 from datetime import UTC, datetime
 
 from starlette.requests import Request
 
+from app.attachments import RoomAttachmentView
 from app.config import get_settings
 from app.roles import ROLE_DESCRIPTIONS
 from app.room_modes import ROOM_MODES, closing_instruction_for, role_text_for
@@ -190,6 +208,97 @@ def _room_session_block(
     return " ".join(lines)
 
 
+def _attachment_line(base_url: str, room_id: str, view: RoomAttachmentView) -> str:
+    """One `- "name" (size bytes), attached by X at TIME (fetch: URL)` line
+    for the file-policy block's attachment listing. `view.attachment.filename`
+    is never raw user input by the time it reaches here -- every write path
+    (`app/attachments.py`'s `add_room_attachment`/
+    `add_attachment_from_brain_document`) already ran it through
+    `app/room_export.py`'s `safe_filename_component` before storing it,
+    which strips control/format/line-separator characters and restricts to
+    a small ASCII allowlist that excludes both `"` and newlines -- so a
+    filename can never break out of the quotes below or forge a fake extra
+    line in this prompt, the same guarantee the ADR-0012 stage 3 system
+    messages (app/rooms.py) rely on for the identical reason.
+    """
+    a = view.attachment
+    created = a.created_at if a.created_at.tzinfo else a.created_at.replace(tzinfo=UTC)
+    when = created.astimezone(UTC).isoformat()
+    fetch_url = f"{base_url}/v1/rooms/{room_id}/attachments/{a.id}/download"
+    return f'- "{a.filename}" ({view.byte_size} bytes), attached by {a.uploaded_by} at {when} -- fetch: GET {fetch_url}'
+
+
+def _format_max_file_size(max_file_bytes: int) -> str:
+    """Renders `max_file_bytes` as a short, human, never-zero size for the
+    join-prompt policy line. `attachment_max_file_bytes` is only bounded
+    `ge=1024` (app/config.py), so a deployment CAN configure a sub-1-MB
+    cap; integer-dividing straight by 1024*1024 (the bug this fixes) would
+    then render "max 0 MB per file" -- an actively wrong, unusable
+    instruction for the agent reading it, not merely an imprecise one.
+    Below 1 MB, render whole KB (the smallest allowed value, 1024 bytes,
+    is exactly 1 KB, so this can never round down to zero either); at or
+    above 1 MB, render whole MB as before.
+    """
+    if max_file_bytes < 1024 * 1024:
+        return f"{max_file_bytes // 1024} KB"
+    return f"{max_file_bytes // (1024 * 1024)} MB"
+
+
+def _room_attachments_policy_block(
+    *,
+    base_url: str,
+    room_id: str,
+    agent_name: str,
+    agent_uploads_allowed: bool,
+    attachments: list[RoomAttachmentView],
+) -> str:
+    """ADR-0012 decision 9's file-policy paragraph -- see this module's
+    docstring for why it's placed where it is in `generate_room_join_prompt`
+    below. Built fresh per call (never cached) since both the switch state
+    and the attachment list can change mid-room.
+    """
+    settings = get_settings()
+    max_size = _format_max_file_size(settings.attachment_max_file_bytes)
+
+    if agent_uploads_allowed:
+        policy = (
+            f"Files: ON in this room. You may attach a PDF: POST {base_url}/v1/rooms/{room_id}/attachments"
+            f"?filename=<name>&sender={agent_name} with the raw file bytes as the body and the same "
+            "Authorization header (only the file's actual leading bytes are checked -- '%PDF-' -- never the "
+            f"filename or the Content-Type header, and only PDF is accepted). Current caps: max {max_size} "
+            f"per file, {settings.attachment_max_files_per_room} files in this room."
+        )
+    else:
+        policy = (
+            "Files: OFF in this room -- the owner has disabled agent uploads. Do not generate a document to "
+            "attach, do not offer to, and do not plan around attaching one: put the content directly in a "
+            "room message instead."
+        )
+
+    attach_from_brain = (
+        "Either way, you may attach a document already saved in the Brain without creating a new file (this "
+        "creates no new bytes, so it works even while uploads are off): POST "
+        f"{base_url}/v1/rooms/{room_id}/attach-from-brain with the same header and JSON body "
+        f'{{"sender": "{agent_name}", "document_id": "<id>"}}.'
+    )
+
+    if attachments:
+        listing = "Files currently attached to this room:\n" + "\n".join(
+            _attachment_line(base_url, room_id, v) for v in attachments
+        )
+    else:
+        listing = "No files are attached to this room yet."
+
+    cleanup = (
+        "Doctrine (delete local copies when done): once you're finished with a file, delete your local copy. "
+        "A document saved to the Brain is always re-fetchable later. A file merely attached to this room (not "
+        "saved to the Brain) is scratch -- it is deleted once the room closes plus a grace period, so after "
+        "this room closes, only Brain-saved files can still be safely re-fetched."
+    )
+
+    return "\n\n".join([policy, attach_from_brain, listing, cleanup])
+
+
 def generate_room_join_prompt(
     *,
     base_url: str,
@@ -201,6 +310,8 @@ def generate_room_join_prompt(
     topic: str | None = None,
     side: str | None = None,
     deadline: datetime | None = None,
+    agent_uploads_allowed: bool = True,
+    attachments: list[RoomAttachmentView] | None = None,
 ) -> str:
     """Builds the full room-join prompt (ADR-0006, phase C, decision 7): the
     complete copy-paste prompt that drops an agent into a room's long-poll
@@ -226,6 +337,16 @@ def generate_room_join_prompt(
     app/room_modes.py, plus a deadline line if `deadline` is set) is
     inserted between the intro and the poll/reply mechanics below -- the
     mechanics themselves are unchanged by mode.
+
+    ADR-0012 (stage 3): `agent_uploads_allowed` (the room's current
+    `Room.agent_uploads_allowed`) and `attachments` (its current
+    `list_room_attachments` result, oldest-first, or `None`/empty for none)
+    drive `_room_attachments_policy_block`, inserted right after `intro` --
+    ahead of even the session block -- so the file policy is the first thing
+    an agent reads after the identity/safety framing, per decision 9 ("agents
+    are briefed, not just refused"). Defaults (`True`, `None`) match a
+    freshly created room's default (agent uploads allowed, no attachments
+    yet) for callers that don't have a `Room`/attachment list in hand.
     """
     base = base_url.rstrip("/")
 
@@ -269,8 +390,19 @@ def generate_room_join_prompt(
 
     keep_me_informed = "Keep me informed per G9 (notify me when you're blocked or when the room work is done)."
 
+    file_policy_block = _room_attachments_policy_block(
+        base_url=base,
+        room_id=room_id,
+        agent_name=agent_name,
+        agent_uploads_allowed=agent_uploads_allowed,
+        attachments=attachments or [],
+    )
+
     session_block = _room_session_block(mode, topic, side, partner_name, deadline)
-    paragraphs = [intro]
+    # File policy is placed right after intro, ahead of even the session
+    # block -- decision 9 requires the agent to know it BEFORE it does
+    # anything else, so it never generates or plans a file it can't attach.
+    paragraphs = [intro, file_policy_block]
     if session_block is not None:
         paragraphs.append(session_block)
     paragraphs.extend([how_to, keep_me_informed, _MODE_SWITCH_PRIMING])
