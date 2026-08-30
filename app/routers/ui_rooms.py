@@ -151,6 +151,7 @@ from app.room_modes import DEFAULT_MODE, ROOM_MODES
 from app.rooms import assign_group_to_rooms as assign_group_to_rooms_op
 from app.rooms import close_room as close_room_op
 from app.rooms import create_room as create_room_op
+from app.rooms import delete_message as delete_message_op
 from app.rooms import delete_room as delete_room_op
 from app.rooms import get_all_messages
 from app.rooms import get_member_sides, get_members, get_members_for_rooms, get_recent_messages, get_room
@@ -160,6 +161,7 @@ from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_attachment_added_message, post_attachment_removed_message
 from app.rooms import post_message as post_message_op
 from app.rooms import set_agent_uploads_allowed as set_agent_uploads_allowed_op
+from app.rooms import set_requires_owner_open as set_requires_owner_open_op
 from app.rooms import switch_room_mode as switch_room_mode_op
 from app.search import run_search
 from app.templates_env import templates
@@ -313,6 +315,8 @@ def _join_prompts_by_member(
             deadline=room.expires_at,
             agent_uploads_allowed=room.agent_uploads_allowed,
             attachments=attachments,
+            requires_owner_open=room.requires_owner_open,
+            opened_at=room.opened_at,
         )
         for agent_name in members
     }
@@ -553,7 +557,7 @@ async def room_messages_json(
     _session: dict = Depends(require_ui_session),
 ) -> JSONResponse:
     try:
-        room, messages = await poll_messages_op(room_id, since, SHORT_POLL_WAIT)
+        room, messages, _open_gate_notice = await poll_messages_op(room_id, since, SHORT_POLL_WAIT)
     except ApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     return JSONResponse(
@@ -618,6 +622,35 @@ async def room_close(
 ):
     try:
         await close_room_op(db, room_id, "owner")
+    except ApiError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
+
+
+# --- ADR-0015: owner-only tombstone delete of one message ---
+
+
+@router.post("/{room_id}/messages/{message_id}/delete")
+async def room_delete_message(
+    room_id: str,
+    message_id: str,
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner-only tombstone delete from the live room view -- confirmed
+    client-side via the transcript row's own `data-confirm` (existing
+    generic handler, app/static/main.js), same pattern as the attachment
+    delete form above. The whole /ui/rooms surface already requires the
+    owner's cookie session (never a machine bearer token -- app/ui_auth.py's
+    `require_ui_session`), so, same as every other route in this file,
+    there is no separate owner check needed here beyond that dependency.
+    Works on an open or closed room (ADR-0015 decision 4, mirroring
+    `room_delete`'s own posture for whole-room delete above); a 404
+    (unknown room/message id) becomes an ordinary 404 page.
+    """
+    try:
+        await delete_message_op(db, room_id, message_id)
     except ApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
@@ -1036,6 +1069,36 @@ async def room_set_agent_uploads_allowed(
 ):
     try:
         await set_agent_uploads_allowed_op(db, room_id, bool(allowed))
+    except ApiError as exc:
+        ctx = await _room_context(db, request, room_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.") from exc
+        return templates.TemplateResponse(
+            request,
+            "room_view.html",
+            {"csrf_token": session["csrf"], "error": exc.detail, "deposited": False, **ctx},
+            status_code=exc.status_code,
+        )
+    return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
+
+
+@router.post("/{room_id}/open-gate")
+async def room_set_open_gate(
+    room_id: str,
+    request: Request,
+    # ADR-0014 decision 4: same unchecked-checkbox-submits-nothing convention
+    # as `allowed` above -- presence, not value, is what a checked box means.
+    required: str = Form(default=""),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner-only mid-session toggle of the room's owner-open requirement
+    (app/rooms.py's `set_requires_owner_open`) -- same shape as
+    `room_set_agent_uploads_allowed` just above.
+    """
+    try:
+        await set_requires_owner_open_op(db, room_id, bool(required))
     except ApiError as exc:
         ctx = await _room_context(db, request, room_id)
         if ctx is None:

@@ -26,7 +26,7 @@ from app.auth import Principal
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
 from app.models import Room, RoomAttachment, RoomMember, RoomMessage
-from app.notify import notify_room_closed
+from app.notify import notify_owner_open_pending, notify_room_closed
 from app.room_modes import DEFAULT_MODE, ROOM_MODES, role_text_for, validate_mode
 
 logger = logging.getLogger(__name__)
@@ -226,6 +226,22 @@ async def create_room(
     (stored as `Room.group_name` -- 'group' is a SQL reserved word),
     validated by the same `_validate_group` the bulk `assign_group_to_rooms`
     below uses.
+
+    ADR-0014 decision 7: the room timer starts when the room opens, not when
+    it's created. Every new room is created with `requires_owner_open=True`
+    (decision 4 -- same "no create-time parameter, always on, toggled
+    mid-room" posture `agent_uploads_allowed` already has just below), so a
+    *relative* `duration_seconds` deadline is deliberately not resolved into
+    `expires_at` here: it's validated (via `_validate_deadline`, same bounds
+    as always) and the requested seconds are stashed on
+    `Room.pending_duration_seconds` instead, to be resolved into `expires_at`
+    by whichever event counts as "opening" this room (`post_message`'s
+    owner-open commit, or `set_requires_owner_open` turning the requirement
+    off before that happens). An explicit `expires_at`, by contrast, is a
+    wall-clock moment the owner asked for directly and is stored/enforced
+    exactly as before -- never deferred, even though the room may still be
+    waiting when it arrives (decision 7: "an unopened room can still time
+    out -- that's what the owner asked for").
     """
     if not name or not name.strip():
         raise ApiError(422, "invalid_room_name", "`name` must be non-empty. Recovery: resend with a non-empty name.")
@@ -237,7 +253,14 @@ async def create_room(
     cleaned_group = _validate_group(group)
 
     now = datetime.now(UTC)
-    resolved_expires_at = _validate_deadline(now, duration_seconds, expires_at)
+    # Validates both forms identically (bounds, future-ness, mutual
+    # exclusion) and resolves whichever was given into a concrete datetime.
+    # The `duration_seconds` form's result is deliberately NOT what's stored
+    # as `expires_at` below (see docstring) -- only the explicit-`expires_at`
+    # form's resolved value is used as-is; a relative duration is instead
+    # re-derived from `pending_duration_seconds` once the room opens.
+    validated_deadline = _validate_deadline(now, duration_seconds, expires_at)
+    resolved_expires_at = validated_deadline if duration_seconds is None else None
 
     room = Room(
         id=str(ULID()),
@@ -256,6 +279,11 @@ async def create_room(
         topic=cleaned_topic,
         expires_at=resolved_expires_at,
         group_name=cleaned_group,
+        # ADR-0014: every new room is gated by default (decision 4); a
+        # relative duration is deferred (see docstring), an explicit
+        # `expires_at` is not.
+        requires_owner_open=True,
+        pending_duration_seconds=duration_seconds if duration_seconds is not None else None,
     )
     db.add(room)
     await db.flush()  # room.id must exist before the member rows FK to it
@@ -437,6 +465,75 @@ MAX_INSERT_ATTEMPTS = 3
 
 _RECOVERY_MESSAGE_CONFLICT = "resend the same message; the sequence number will be recomputed automatically"
 
+# ADR-0014 decisions 1-3: the owner-open gate's directive wording, shared
+# between `post_message`'s 403 backstop and `poll_messages`'s early-return
+# notice (decision 3: "gets the identical instruction from the transport
+# it's actually reading"). Imperative register, matching
+# `_agent_uploads_announcement`'s "disabled" branch and the join prompt's own
+# anti-injection framing -- a directive to STOP, not a bare status line
+# (decision 2, following ADR-0012 decision 9's "agents are briefed, not just
+# refused" wording discipline).
+_ROOM_NOT_OPENED_DIRECTIVE = (
+    "The owner has not posted in this room yet. Do not begin, do not start on the topic, and do not treat "
+    "the join prompt/topic as a starting gun. Stop and wait -- poll for new messages; you'll be told when to "
+    "check again once the owner posts (or this room's owner-open requirement is turned off). This is not a "
+    "retryable error: retrying the same post now will fail the same way."
+)
+
+
+def _room_not_opened_detail(room: Room) -> str:
+    return f"Room '{room.name}' has not been opened by its owner yet. {_ROOM_NOT_OPENED_DIRECTIVE}"
+
+
+async def _maybe_ping_owner_room_not_opened(room: Room, *, agent_name: str | None) -> None:
+    """ADR-0014 decision 8: best-effort, one-shot owner ntfy ping when an
+    agent parks on a room that isn't open yet. Two triggers share this one
+    function: `post_message`'s rejection (decision 1/2 above, `agent_name` =
+    the claimed `sender` -- known) and `poll_messages`'s early return
+    (decision 3 below, `agent_name` = None -- a read has no sender, see that
+    function's docstring for the honest limitation this records, decision 8
+    paragraph 2 of the ADR).
+
+    Own short-lived session + `SELECT ... FOR UPDATE` + `populate_existing`
+    row lock, same pattern as `post_closing_nudge`'s one-time nudge -- the
+    check-and-set of `owner_open_reminder_sent_at` happens under this lock,
+    which is what actually prevents a double-send if two triggers (or two
+    overlapping requests) race each other, not the unlocked read either
+    caller made to decide whether to call this at all. Re-checks the full
+    gate condition again under the lock (room open, still requires opening,
+    still not opened) since the caller's own read may already be stale by
+    the time this runs.
+
+    Never raises -- same best-effort contract as `notify_room_closed`/
+    `notify_owner_open_pending` (app/notify.py): this must never turn a
+    room's real rejection/poll response into a 500.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            locked_room = await session.scalar(
+                select(Room).where(Room.id == room.id).with_for_update().execution_options(populate_existing=True)
+            )
+            if (
+                locked_room is None
+                or locked_room.status != "open"
+                or not locked_room.requires_owner_open
+                or locked_room.opened_at is not None
+                or locked_room.owner_open_reminder_sent_at is not None
+            ):
+                return
+            locked_room.owner_open_reminder_sent_at = datetime.now(UTC)
+            await session.commit()
+            # Best-effort itself; never raises -- see app/notify.py's module
+            # docstring. Called with the SAME session, after the guard
+            # commit above, same ordering `_apply_close` uses for
+            # `notify_room_closed`.
+            await notify_owner_open_pending(session, locked_room, agent_name)
+    except Exception:
+        logger.exception(
+            "best-effort owner-open-pending notification failed for room %s -- request still handled normally",
+            room.id,
+        )
+
 
 async def _next_seq(db: AsyncSession, room_id: str) -> int:
     max_seq = await db.scalar(select(func.max(RoomMessage.seq)).where(RoomMessage.room_id == room_id))
@@ -464,7 +561,23 @@ async def _insert_message_and_maybe_close(
     acquires the lock next always observes the fully-updated row (message
     inserted, count incremented, and closed if the guardrail fired) as one
     atomic unit.
+
+    ADR-0014 decisions 1/7: also opens the room here (`opened_at`, and
+    resolving a deferred `pending_duration_seconds` into `expires_at`) when
+    `sender == "owner"` and it hasn't opened yet -- inside this same
+    retried-as-a-unit function, not once before `post_message`'s retry loop,
+    so a retry after an IntegrityError-triggered rollback (which undoes this
+    attempt's `room.opened_at` write along with everything else in the
+    transaction) redoes it correctly against the freshly-`db.refresh`d room
+    on the next attempt, exactly like `message_count`/the close guardrails
+    already do.
     """
+    if sender == "owner" and room.opened_at is None:
+        room.opened_at = now
+        if room.pending_duration_seconds is not None:
+            room.expires_at = now + timedelta(seconds=room.pending_duration_seconds)
+            room.pending_duration_seconds = None
+
     seq = await _next_seq(db, room.id)
     message = RoomMessage(id=str(ULID()), room_id=room.id, seq=seq, sender=sender, text=text, kind=kind, created_at=now)
     db.add(message)
@@ -572,6 +685,37 @@ async def post_message(
             "`sender=owner` can only be claimed by a request authenticated with the owner token. Recovery: "
             "authenticate as the owner, or post as this room's own member `agent_name` instead.",
         )
+
+    # ADR-0014 decision 1: the owner-open gate. Checked here -- after the
+    # sender=="owner" identity check just above (so a forged "owner" claim
+    # is rejected as impersonation, not let through as if it could open the
+    # room), before the room's row lock is acquired (an unlocked pre-check
+    # is correct here for the same reason the open/closed pre-check just
+    # above is -- see this function's "Unlocked pre-checks" comment).
+    # `sender == "owner"` never trips this (that's exactly the message that
+    # opens the room, decision 1) regardless of whether it happens to be the
+    # very first message; every other sender is REJECTED outright while
+    # `room.requires_owner_open` is true and `room.opened_at` is still NULL,
+    # regardless of whether that sender is even a real member -- this gate's
+    # rejection runs before the membership check just below, on purpose: a
+    # non-member gets the same "wait for the owner" directive a real member
+    # would, not a confusing "sender_not_room_member" that implies posting
+    # as the right name would have worked right now.
+    #
+    # The owner-facing PING is a different matter (independent review
+    # finding): `_maybe_ping_owner_room_not_opened` pushes `sender` --
+    # untrusted, client-supplied text -- into a notification on the owner's
+    # phone (app/notify.py's `notify_owner_open_pending`). Before this fix
+    # it fired here too, ahead of the membership check, so ANY bearer
+    # machine token could force a push naming an arbitrary string, without
+    # even being a member of this room. Membership is checked FIRST, and
+    # the ping only fires for a genuine member -- the rejection above it
+    # (this 403) still fires for member and non-member alike, unchanged.
+    if sender != "owner" and room.requires_owner_open and room.opened_at is None:
+        if sender in await get_members(db, room_id):
+            await _maybe_ping_owner_room_not_opened(room, agent_name=sender)
+        raise ApiError(403, "room_not_opened", _room_not_opened_detail(room))
+
     if sender != "owner":
         members = await get_members(db, room_id)
         if sender not in members:
@@ -637,6 +781,111 @@ async def post_message(
         # Best-effort, never raises -- see app/notify.py's module docstring.
         await notify_room_closed(db, room)
 
+    return message, room
+
+
+# --- DELETE /v1/rooms/{id}/messages/{message_id} (ADR-0015: owner-only
+# tombstone delete of one message) ---
+
+# The fixed marker a deleted message's `text` is overwritten with (ADR-0015
+# decision 2). Deliberately generic -- it never echoes any part of what was
+# deleted (that would defeat the whole point of the feature).
+DELETED_MESSAGE_MARKER = "[message deleted by owner]"
+
+
+async def delete_message(db: AsyncSession, room_id: str, message_id: str) -> tuple[RoomMessage, Room]:
+    """ADR-0015: owner-only tombstone delete of one message (the route,
+    app/routers/rooms.py, binds this to `require_owner` -- there is no
+    machine-token path to this function at all).
+
+    Tombstone, not erasure (decision 2): overwrites the row's `text` in
+    place with `DELETED_MESSAGE_MARKER` and sets `deleted_at` -- `id`,
+    `seq`, `sender`, `kind`, and `created_at` are all left unchanged, so the
+    long-poll cursor's sequence numbering and the transcript's ordering
+    survive intact. This is a genuine UPDATE of the row's content, not a
+    display-only flag layered over intact text: the motivating case (an
+    accidentally pasted secret) requires the text to stop existing in
+    storage, not merely stop being displayed -- a flag over untouched text
+    would defeat that case entirely. `RoomMessage.text` is a plain (not
+    computed/generated) column and the only place this message's content is
+    ever stored, so overwriting it here is the ONLY copy anywhere in the
+    row -- there is nothing else lingering to scrub.
+
+    Decrements `Room.message_count` by one under the room's row lock -- the
+    identical `SELECT ... FOR UPDATE` + `populate_existing` pattern every
+    other mutator in this file uses (`post_message`, `close_room`,
+    `switch_room_mode`, `set_agent_uploads_allowed`, `set_requires_owner_open`)
+    -- since tombstones remain visible in the transcript but no longer count
+    toward the cap (decision 3): a delete racing a concurrent post on the
+    same room must never read a stale `message_count` and lose one side's
+    update, the mirror image of the increment race those other mutators'
+    own docstrings describe.
+
+    Deliberately never reads or writes `Room.status`/`close_reason`/
+    `closed_at` in either direction (decision 4): a cap-closed room does not
+    reopen just because deleting a message drops `message_count` back under
+    `max_messages` -- closing already fired its notification and is a
+    completed state transition, not something this housekeeping action
+    undoes. Works identically on an open or a closed room; unlike
+    `post_message`, there is no "room_closed" guardrail here at all.
+
+    Idempotent: deleting an already-deleted message returns its current
+    (already-tombstoned) state without decrementing `message_count` again --
+    same "repeat call is a no-op, not an error" posture `close_room` takes
+    for an already-closed room. This is also the actual mechanism that keeps
+    the counter from being decremented twice by two concurrent deletes of
+    the SAME message: the room's row lock serializes them, so whichever
+    caller acquires the lock second always observes the first caller's
+    already-committed `deleted_at` (re-read fresh, under the lock, not from
+    any pre-lock snapshot) and takes this early-return path instead of
+    decrementing a second time. `message_count` is additionally clamped at
+    zero as defense in depth, not the primary guard.
+    """
+    # Unlocked pre-check: existence never needs the row lock to be correct
+    # (mirrors this file's other mutators' own "unlocked pre-checks"
+    # reasoning) -- a 404 for a genuinely nonexistent room doesn't need
+    # serializing on anything.
+    room = await db.get(Room, room_id)
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Serialization point: acquire the room's row lock, same pattern as
+    # every other mutator in this file. `populate_existing` is required for
+    # the identical reason those functions document: `room` may already be
+    # in this Session's identity map from the unlocked `db.get` above, and
+    # without it SQLAlchemy would leave that already-loaded object's
+    # attributes untouched even though the FOR UPDATE SQL below legitimately
+    # re-fetches newer committed data.
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None:
+        # A concurrent delete_room won the race and already committed
+        # between the unlocked pre-check and acquiring this lock.
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Read fresh, under the room's lock -- never from a pre-lock snapshot --
+    # so two concurrent deletes of the same message always serialize on
+    # this: the second to acquire the lock sees the first's committed
+    # deleted_at, not a stale None.
+    message = await db.scalar(
+        select(RoomMessage).where(RoomMessage.id == message_id, RoomMessage.room_id == room_id)
+    )
+    if message is None:
+        raise ApiError(
+            404,
+            "room_message_not_found",
+            f"No message with id '{message_id}' in room '{room_id}'.",
+        )
+
+    if message.deleted_at is not None:
+        return message, room  # idempotent -- see docstring
+
+    message.text = DELETED_MESSAGE_MARKER
+    message.deleted_at = datetime.now(UTC)
+    room.message_count = max(0, room.message_count - 1)
+
+    await db.commit()
     return message, room
 
 
@@ -1010,6 +1259,125 @@ async def set_agent_uploads_allowed(db: AsyncSession, room_id: str, allowed: boo
     return room, announcement_text
 
 
+# --- POST /v1/rooms/{id}/open-gate (ADR-0014 decision 4: owner-only,
+# mid-session toggle of the room's owner-open requirement) ---
+
+
+def _requires_owner_open_announcement(required: bool, opened_by_this_toggle: bool) -> str:
+    """The kind='system' announcement text `set_requires_owner_open` posts
+    (ADR-0014 decision 4), same "agents are briefed, not just refused"
+    posture `_agent_uploads_announcement` above already takes for its own
+    switch. `opened_by_this_toggle` is true only when turning the
+    requirement OFF is what just ended a still-waiting room's wait (decision
+    4: "treated as opening it for the purposes of decisions 3 and 7") -- it
+    changes the OFF branch's wording so agents that were parked mid-poll
+    understand why they can now proceed, without implying the owner
+    themselves ever posted (they didn't; see `set_requires_owner_open`'s
+    docstring).
+    """
+    if required:
+        return (
+            "This room now requires the owner to post before agents may speak. Agents: if the owner hasn't "
+            "posted yet, stop and wait -- do not start on the topic."
+        )
+    if opened_by_this_toggle:
+        return (
+            "The owner-open requirement for this room has been turned off, before the owner posted. Agents "
+            "may begin from the topic now -- you no longer need to wait for a message from 'owner'."
+        )
+    return "The owner-open requirement for this room has been turned off. Agents may begin from the topic without waiting for the owner."
+
+
+async def set_requires_owner_open(db: AsyncSession, room_id: str, required: bool) -> tuple[Room, str]:
+    """ADR-0014 decision 4: owner-only mid-session toggle of
+    `Room.requires_owner_open`. Same `SELECT ... FOR UPDATE` +
+    `populate_existing` row lock, held across the update AND the
+    kind='system' announcement post, in the SAME commit, as
+    `set_agent_uploads_allowed` above -- identical reasoning: no concurrent
+    toggle/post/close can observe a half-applied change or clobber this one.
+    Always posts an announcement, even if `required` already matched the
+    room's current value, same unconditional-post posture as
+    `set_agent_uploads_allowed`/`switch_room_mode`.
+
+    Turning the requirement OFF on a room that's still waiting (`opened_at`
+    is still NULL) is decision 4's "treated as opening it" case: this ends
+    the wait for decisions 3 (poll's early return) and 7 (the timer) without
+    pretending the owner posted a message that never happened --
+    `Room.opened_at` is deliberately left NULL (ADR-0014's
+    alternatives-considered section: `opened_at` tracks only whether the
+    owner has ever posted, nothing else) while `pending_duration_seconds`
+    (a deferred relative deadline from `create_room`, decision 7), if set,
+    is resolved into `expires_at` at THIS toggle's own timestamp -- the same
+    computation `post_message`'s owner-open path performs, just against a
+    different "opening" event. Turning it back ON, or toggling a room that's
+    already open (owner already posted, or the requirement was already
+    off), is a plain flag flip with no side effect on `expires_at`.
+
+    Only an open room may be toggled (self-explaining 'room_closed', same
+    posture as `set_agent_uploads_allowed`) -- a closed room accepts no
+    further messages at all regardless of this switch, so there is nothing
+    left to gate.
+    """
+    if not isinstance(required, bool):
+        raise ApiError(422, "invalid_requires_owner_open", f"`required` must be a boolean, got {required!r}.")
+
+    # Unlocked pre-check: existence never needs the row lock to be correct
+    # (mirrors set_agent_uploads_allowed's/switch_room_mode's own "unlocked
+    # pre-checks" reasoning) -- a 404 for a genuinely nonexistent room
+    # doesn't need serializing on anything.
+    room = await db.get(Room, room_id)
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Serialization point: acquire the room's row lock, same pattern as
+    # every other mutator in this file. `populate_existing` is required for
+    # the identical reason those functions document: `room` may already be
+    # in this Session's identity map from the unlocked `db.get` above, and
+    # without it SQLAlchemy would leave that already-loaded object's
+    # attributes untouched even though the FOR UPDATE SQL below legitimately
+    # re-fetches newer committed data.
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+    if room.status != "open":
+        raise ApiError(
+            409,
+            "room_closed",
+            f"Room '{room.name}' is closed; its owner-open requirement can no longer be changed.",
+        )
+
+    now = datetime.now(UTC)
+    opened_by_this_toggle = not required and room.opened_at is None and room.requires_owner_open
+    if opened_by_this_toggle and room.pending_duration_seconds is not None:
+        room.expires_at = now + timedelta(seconds=room.pending_duration_seconds)
+        room.pending_duration_seconds = None
+
+    room.requires_owner_open = required
+    announcement_text = _requires_owner_open_announcement(required, opened_by_this_toggle)
+
+    seq = await _next_seq(db, room.id)
+    db.add(
+        RoomMessage(
+            id=str(ULID()),
+            room_id=room.id,
+            seq=seq,
+            sender="system",
+            text=announcement_text,
+            kind="system",
+            created_at=now,
+        )
+    )
+    room.message_count += 1
+    # Deliberately no done/cap guardrail check here -- same reasoning
+    # switch_room_mode's own docstring gives: this must never itself trip
+    # the cap and silently close the room it just changed.
+
+    await db.commit()
+    return room, announcement_text
+
+
 # --- ADR-0012 stage 3: kind='system' announcements when an attachment is
 # added to or removed from a room, so an agent long-polling the room learns
 # about the change without a new channel (mirrors the toggle announcement
@@ -1122,10 +1490,43 @@ async def _room_and_messages_since(room_id: str, since: int) -> tuple[Room | Non
         return room, list(rows)
 
 
-async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list[RoomMessage]]:
+# ADR-0014 decision 3: the poll-side twin of `_ROOM_NOT_OPENED_DIRECTIVE`
+# above -- same directive, phrased for a poll response's `open_gate_notice`
+# field rather than an error `detail` string, since a still-gated room is a
+# normal (200) poll outcome, not a rejection.
+_POLL_NOT_OPENED_NOTICE = (
+    "Not open yet -- the owner has not posted in this room. Stop: do not start on the topic. Keep polling "
+    "(this response already returned immediately, without waiting); you'll be told to check again once the "
+    "owner posts, or immediately if this room's owner-open requirement is turned off."
+)
+
+# ADR-0014 decision 10: replaces the bare "No room with id '<id>'" 404 a
+# mechanically-retrying agent can't distinguish from a transient error. Only
+# ever reached mid-poll (an agent that's already polling necessarily had a
+# real room_id at some point), so "gone" reads accurately here even though
+# this function can't itself distinguish "never existed" from "deleted since
+# the last poll" -- both cases mean the same thing to the poller: stop.
+def _room_gone_detail(room_id: str) -> str:
+    return (
+        f"Room '{room_id}' is gone -- it doesn't exist (anymore). Stop polling it: this is not a transient "
+        "error that resolves on retry, the room will never come back."
+    )
+
+
+async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list[RoomMessage], str | None]:
     """Long-poll for messages with seq > `since`. Returns as soon as any
     exist, OR the room is no longer open, OR `wait` seconds have elapsed
-    (capped at MAX_WAIT_SECS) -- whichever comes first.
+    (capped at MAX_WAIT_SECS), OR (ADR-0014 decision 3) the room requires
+    the owner to open it and hasn't yet -- whichever comes first. The last
+    case is checked first and short-circuits even the FIRST iteration: it
+    never enters `asyncio.sleep` below, unlike the other three, which is the
+    whole point (decision 3: a room nobody has started yet must not be what
+    burns an agent's session in 30-second waits). Returns a third element,
+    `open_gate_notice` -- the same stop directive `post_message`'s 403
+    backstop carries (`_ROOM_NOT_OPENED_DIRECTIVE` above), non-None exactly
+    when that early return is why this call returned, None in every other
+    case (including once the room later opens: normal long-polling resumes
+    unchanged, per the ADR).
 
     CRITICAL: this function takes no `db: AsyncSession` -- there is no
     request-scoped session held across the `asyncio.sleep` calls below. Each
@@ -1141,9 +1542,20 @@ async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list
     while True:
         room, messages = await _room_and_messages_since(room_id, since)
         if room is None:
-            raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+            # ADR-0014 decision 10: a clear stop, not a bare "not found" a
+            # mechanically-retrying agent might treat as transient.
+            raise ApiError(404, "room_not_found", _room_gone_detail(room_id))
+
+        not_opened = room.status == "open" and room.requires_owner_open and room.opened_at is None
+        if not_opened:
+            # Best-effort, one-shot (own row lock inside) -- never raises.
+            # `agent_name=None`: a read carries no sender (see docstring's
+            # "honest limitation" note and app/notify.py's own docstring).
+            await _maybe_ping_owner_room_not_opened(room, agent_name=None)
+            return room, messages, _POLL_NOT_OPENED_NOTICE
+
         if messages or room.status != "open" or time.monotonic() >= deadline:
-            return room, messages
+            return room, messages, None
         await asyncio.sleep(POLL_INTERVAL_SECS)
 
 

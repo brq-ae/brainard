@@ -29,6 +29,16 @@
   Room closed{% if room.close_reason %} (reason: <span id="room-close-reason">{{ room.close_reason }}</span>){% endif %}. No further messages are accepted.
 </div>
 
+<!-- ADR-0014: while this is showing, agents cannot post -- only a message
+     from 'owner' (the "Post as owner" box below) opens the room. Purely
+     informational; the real gate is server-enforced in app.rooms.post_message. -->
+{% if room.status == 'open' and room.requires_owner_open and not room.opened_at %}
+<div class="notice" id="room-waiting-banner">
+  Waiting for the owner's first message -- agents cannot post until you send one below (or you turn off "Requires
+  owner to open" further down).
+</div>
+{% endif %}
+
 <!-- Config for app/static/rooms.js, read via data-* attributes only -- no
      inline script, no server-generated JS literals. room.id is a
      server-generated ULID, room.status is one of two fixed strings, and
@@ -151,6 +161,30 @@
   <form method="post" action="/ui/rooms/{{ room.id }}/close" data-confirm="Stop this room? This cannot be undone.">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit" class="btn danger">Stop room</button>
+  </form>
+</div>
+
+<!-- ADR-0014: per-room opt-out for the owner-open gate. Default on (agents
+     wait for your first message); flippable mid-room, and turning it off
+     posts a system announcement to both agents (app.rooms.set_requires_owner_open),
+     same pattern as the "Agent uploads" toggle in the files panel below. -->
+<div class="panel" id="room-open-gate-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>
+  <h2>Owner-open gate</h2>
+  <p class="meta">
+    {% if room.opened_at %}
+    You already posted in this room, so it's open regardless of this setting.
+    {% else %}
+    While on, agents cannot post until you send the first message (via "Post as owner" above). Turning it off
+    lets agents begin from the topic immediately, and posts a system announcement to both agents.
+    {% endif %}
+  </p>
+  <form method="post" action="/ui/rooms/{{ room.id }}/open-gate">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="checkbox-label">
+      <input type="checkbox" name="required" value="1" {% if room.requires_owner_open %}checked{% endif %} {% if room.status != 'open' %}disabled{% endif %}>
+      Requires owner to open (wait for my first message before agents may post)
+    </label>
+    <button type="submit" class="btn" {% if room.status != 'open' %}disabled{% endif %}>Update</button>
   </form>
 </div>
 
@@ -277,8 +311,25 @@
   <ul class="list" id="room-messages">
     {% for m in messages %}
     <li class="row" data-seq="{{ m.seq }}">
-      <span class="row-main"><strong>{{ m.sender }}</strong>: {{ m.text }}</span>
+      <span class="row-main">
+        <strong>{{ m.sender }}</strong>:
+        {% if m.deleted_at %}<em class="msg-deleted">{{ m.text }}</em>{% else %}{{ m.text }}{% endif %}
+      </span>
       <span class="meta">{{ m.created_at|human_ts }}</span>
+      <!-- ADR-0015: owner-only tombstone delete. Same inline-form +
+           data-confirm + hidden csrf_token pattern as the attachment
+           delete form above (Files panel) -- `m.text`/`m.sender` here are
+           untrusted content rendered through ordinary Jinja2 autoescape
+           only (never |safe), same discipline as everywhere else on this
+           page; this form itself carries no user-derived value at all. -->
+      {% if not m.deleted_at %}
+      <span class="row-actions">
+        <form method="post" action="/ui/rooms/{{ room.id }}/messages/{{ m.id }}/delete" class="inline-form" data-confirm="Delete this message? Its text is permanently overwritten and cannot be recovered.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="btn danger">Delete</button>
+        </form>
+      </span>
+      {% endif %}
     </li>
     {% endfor %}
   </ul>

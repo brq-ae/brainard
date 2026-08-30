@@ -579,6 +579,28 @@ class Room(Base):
     # projects (ADR-0008 decision 3) -- owner-supplied, so untrusted content
     # wherever it renders in the UI (must be autoescaped, never |safe).
     group_name: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    # ADR-0014: rooms wait for the owner's first message. `opened_at` is NULL
+    # until the first commit of a `sender == 'owner'` message
+    # (app/rooms.py's `post_message`) -- same nullable-timestamp shape as
+    # `closed_at`/`closing_warned_at` above. `requires_owner_open` is the
+    # per-room opt-out (default True -- the gate is on by default), same
+    # "always-on boolean the owner can flip off" shape as
+    # `agent_uploads_allowed` above, toggled mid-room via
+    # `set_requires_owner_open` (row-lock + system-announcement pattern,
+    # same as `set_agent_uploads_allowed`). `pending_duration_seconds` holds
+    # a relative `duration_seconds` deadline request (create_room) until the
+    # room actually opens (decision 7: the timer starts on open, not
+    # creation) -- resolved into `expires_at` by whichever event counts as
+    # "opening" (an owner message, or the requirement being toggled off
+    # while still unopened); an explicit `expires_at` given at create time is
+    # never deferred through this column. `owner_open_reminder_sent_at` is
+    # the one-shot guard (same shape as `closing_warned_at`) for the
+    # best-effort owner ntfy ping fired when an agent parks on a room that
+    # isn't open yet (app/notify.py's `notify_owner_open_pending`).
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    requires_owner_open: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    pending_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    owner_open_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN ('open', 'closed')", name="ck_rooms_status"),
@@ -621,6 +643,18 @@ class RoomMessage(Base):
     close signal (guardrail 1); 'system' is reserved for server-authored
     messages (never accepted from POST .../messages -- see app/rooms.py's
     VALID_POST_KINDS).
+
+    ADR-0015: `deleted_at` is a nullable timestamp -- same shape
+    `Room.closed_at` already has -- NULL until the owner tombstones this
+    message (app/rooms.py's `delete_message`). Deletion is a genuine
+    UPDATE of `text` in place (overwritten with a fixed marker), not a
+    display-only flag over intact content: the motivating case is an
+    accidentally pasted secret that must stop existing in storage, not
+    merely stop being displayed (see that function's docstring). `id`,
+    `seq`, `sender`, `kind`, and `created_at` are never touched by a
+    delete, so the transcript's sequence numbering, ordering, and "who
+    said something happened here" context all survive intact -- only the
+    row's `text` and this column change.
     """
 
     __tablename__ = "room_messages"
@@ -632,6 +666,7 @@ class RoomMessage(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="message")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN ('message', 'done', 'system')", name="ck_room_messages_kind"),

@@ -115,6 +115,15 @@ async def _post_message_via_api(client, machine_headers, room_id, *, sender="age
     return resp.json()
 
 
+async def _open_room_via_api(client, owner_headers, room_id, *, text="starting now") -> dict:
+    """ADR-0014: rooms default to `requires_owner_open=True`, so most tests
+    that want an agent to be able to post (or that want a deferred
+    `duration_seconds` deadline resolved into `expires_at`) need the owner
+    to post first.
+    """
+    return await _post_message_via_api(client, owner_headers, room_id, sender="owner", text=text)
+
+
 # --- rooms list ---
 
 
@@ -394,11 +403,15 @@ async def test_create_room_form_non_freeform_blank_topic_shows_clean_error(clien
 
 
 async def test_create_room_form_time_preset_maps_to_duration_seconds(client, db_session):
+    """ADR-0014 decision 7: a relative duration is deferred -- `expires_at`
+    stays null at create time (every new room defaults to
+    `requires_owner_open=True`), with the requested seconds parked on
+    `pending_duration_seconds` until the room opens.
+    """
     await _login(client, db_session)
     page = await client.get("/ui/rooms")
     csrf = _extract_csrf(page.text)
 
-    before = datetime.now(UTC)
     resp = await client.post(
         "/ui/rooms",
         data={
@@ -410,22 +423,22 @@ async def test_create_room_form_time_preset_maps_to_duration_seconds(client, db_
         },
         follow_redirects=False,
     )
-    after = datetime.now(UTC)
     assert resp.status_code == 303
     room_id = resp.headers["location"].rsplit("/", 1)[-1]
 
     room = await db_session.get(Room, room_id)
-    assert room.expires_at is not None
-    expires_at = room.expires_at if room.expires_at.tzinfo else room.expires_at.replace(tzinfo=UTC)
-    assert before + timedelta(seconds=3600) <= expires_at <= after + timedelta(seconds=3600)
+    assert room.expires_at is None
+    assert room.pending_duration_seconds == 3600
 
 
 async def test_create_room_form_custom_time_limit_maps_to_duration_seconds(client, db_session):
+    """Same deferred-duration behavior as the preset case above (ADR-0014
+    decision 7) -- 2 hours = 7200 seconds, parked, not resolved yet.
+    """
     await _login(client, db_session)
     page = await client.get("/ui/rooms")
     csrf = _extract_csrf(page.text)
 
-    before = datetime.now(UTC)
     resp = await client.post(
         "/ui/rooms",
         data={
@@ -439,15 +452,12 @@ async def test_create_room_form_custom_time_limit_maps_to_duration_seconds(clien
         },
         follow_redirects=False,
     )
-    after = datetime.now(UTC)
     assert resp.status_code == 303
     room_id = resp.headers["location"].rsplit("/", 1)[-1]
 
     room = await db_session.get(Room, room_id)
-    assert room.expires_at is not None
-    expires_at = room.expires_at if room.expires_at.tzinfo else room.expires_at.replace(tzinfo=UTC)
-    # 2 hours = 7200 seconds
-    assert before + timedelta(seconds=7200) <= expires_at <= after + timedelta(seconds=7200)
+    assert room.expires_at is None
+    assert room.pending_duration_seconds == 7200
 
 
 async def test_create_room_form_no_limit_leaves_expires_at_null(client, db_session):
@@ -480,6 +490,7 @@ async def test_room_view_renders_messages(client, db_session):
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: agents wait for this
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="hello there")
 
     resp = await client.get(f"/ui/rooms/{room['id']}")
@@ -544,6 +555,9 @@ async def test_room_view_header_shows_freeform_mode_label(client, db_session):
 async def test_room_view_countdown_present_when_deadline_set(client, db_session):
     owner_headers = await _owner_headers_and_login(client, db_session)
     room = await _create_room_via_api(client, owner_headers, name="deadline-room", duration_seconds=1800)
+    # ADR-0014 decision 7: a relative duration is deferred until the room
+    # opens -- resolve it so the countdown has something to render.
+    await _open_room_via_api(client, owner_headers, room["id"])
 
     resp = await client.get(f"/ui/rooms/{room['id']}")
     assert resp.status_code == 200
@@ -587,21 +601,22 @@ async def test_room_messages_json_returns_new_since_seq(client, db_session):
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers)
+    opened = await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: opens the room, seq 1
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="first")
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-b", text="second")
 
-    resp = await client.get(f"/ui/rooms/{room['id']}/messages?since=0")
+    resp = await client.get(f"/ui/rooms/{room['id']}/messages?since={opened['seq']}")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "open"
-    assert data["message_count"] == 2
+    assert data["message_count"] == 3  # the opening message + first + second
     assert [m["text"] for m in data["messages"]] == ["first", "second"]
     assert data["messages"][0]["sender"] == "agent-a"
-    assert data["messages"][0]["seq"] == 1
+    assert data["messages"][0]["seq"] == 2
     assert data["messages"][0]["kind"] == "message"
     assert "created_at" in data["messages"][0]
 
-    resp2 = await client.get(f"/ui/rooms/{room['id']}/messages?since=1")
+    resp2 = await client.get(f"/ui/rooms/{room['id']}/messages?since=2")
     assert resp2.status_code == 200
     data2 = resp2.json()
     assert [m["text"] for m in data2["messages"]] == ["second"]
@@ -737,6 +752,100 @@ async def test_close_via_ui_without_csrf_rejected(client, db_session):
     assert db_room.status == "open"
 
 
+# --- ADR-0015: owner-only tombstone delete of one message, via the UI ---
+
+
+async def test_delete_message_via_ui_overwrites_text_and_renders_tombstone(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers)
+    await _open_room_via_api(client, owner_headers, room["id"])
+    secret = "sk-owner-ui-secret-must-not-linger"
+    posted = await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text=secret)
+
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+    assert secret in page.text  # sanity: it really was on the page before deletion
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/messages/{posted['id']}/delete",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == f"/ui/rooms/{room['id']}"
+
+    row = await db_session.get(RoomMessage, posted["id"])
+    assert row.text == "[message deleted by owner]"
+    assert row.deleted_at is not None
+
+    after = await client.get(f"/ui/rooms/{room['id']}")
+    assert after.status_code == 200
+    assert secret not in after.text
+    assert "message deleted by owner" in after.text
+    assert 'class="msg-deleted"' in after.text
+
+
+async def test_delete_message_via_ui_without_csrf_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers)
+    await _open_room_via_api(client, owner_headers, room["id"])
+    posted = await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="untouched")
+
+    resp = await client.post(f"/ui/rooms/{room['id']}/messages/{posted['id']}/delete", data={})
+    assert resp.status_code == 403
+
+    row = await db_session.get(RoomMessage, posted["id"])
+    assert row.text == "untouched"
+    assert row.deleted_at is None
+
+
+async def test_delete_message_via_ui_unauthenticated_redirects_to_login(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room_via_api(client, owner_headers)
+
+    # require_ui_session rejects this before the route body (and thus
+    # message_id) is ever consulted, so a placeholder id is fine here --
+    # same posture as this file's other "*_unauthenticated_redirects" tests.
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/messages/some-message-id/delete", follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+
+async def test_delete_message_via_ui_does_not_reopen_closed_room(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, max_messages=2)
+    await _open_room_via_api(client, owner_headers, room["id"])  # count 1
+    machine_headers = await _machine_headers(db_session)
+    posted = await _post_message_via_api(
+        client, machine_headers, room["id"], sender="agent-a", text="closes it"
+    )  # count 2, hits cap, room closes
+
+    db_room = await db_session.get(Room, room["id"])
+    assert db_room.status == "closed"
+
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/messages/{posted['id']}/delete",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    # A fresh read, not a re-`.get()` of the same session's identity-mapped
+    # `db_room` above -- `.get()` on an object already in the identity map
+    # short-circuits and returns the pre-delete snapshot rather than
+    # re-querying.
+    db_session.expire_all()
+    db_room_after = await db_session.get(Room, room["id"])
+    assert db_room_after.status == "closed"  # never reopened
+    assert db_room_after.message_count == 1  # still decremented
+
+
 # --- XSS: hostile agent message content must render inert ---
 
 
@@ -749,6 +858,7 @@ async def test_xss_message_json_carries_raw_text_as_data(client, db_session):
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers)
+    await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: agents wait for this
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text=XSS_SCRIPT)
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text=XSS_IMG)
 
@@ -768,6 +878,7 @@ async def test_xss_server_rendered_view_escapes_message_content(client, db_sessi
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers)
+    await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: agents wait for this
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text=XSS_SCRIPT)
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text=XSS_IMG)
 
@@ -859,6 +970,9 @@ async def test_room_join_prompt_debate_contains_stance_topic_and_deadline(client
         sides={"alice": "for", "bob": "against"},
         duration_seconds=1800,
     )
+    # ADR-0014 decision 7: a relative duration is deferred until the room
+    # opens -- resolve it so the join prompt has a deadline to render.
+    await _open_room_via_api(client, owner_headers, room["id"])
 
     resp = await client.get(f"/ui/rooms/{room['id']}")
     assert resp.status_code == 200
@@ -1125,6 +1239,7 @@ async def test_room_view_transcript_collapsible_open_by_default_with_live_count(
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: agents wait for this; +1 to the count
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="hi")
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-b", text="there")
 
@@ -1136,8 +1251,8 @@ async def test_room_view_transcript_collapsible_open_by_default_with_live_count(
     assert m, "transcript panel must be rendered as a <details> element"
     assert "open" in m.group(1), "transcript must default to open, not collapsed"
 
-    assert '<span id="room-transcript-count">2</span>' in text
-    assert re.search(r"Transcript \(<span[^>]*>2</span>\s*messages\)", text), (
+    assert '<span id="room-transcript-count">3</span>' in text
+    assert re.search(r"Transcript \(<span[^>]*>3</span>\s*messages\)", text), (
         "transcript header must show a live 'Transcript (N messages)' count"
     )
 
@@ -1153,14 +1268,15 @@ async def test_room_view_transcript_count_element_reused_not_duplicated(client, 
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: agents wait for this; +1 to the count
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="hi")
 
     resp = await client.get(f"/ui/rooms/{room['id']}")
     assert resp.status_code == 200
     text = resp.text
 
-    assert '<span id="room-count">1</span>' in text
-    assert '<span id="room-transcript-count">1</span>' in text
+    assert '<span id="room-count">2</span>' in text
+    assert '<span id="room-transcript-count">2</span>' in text
 
 
 def test_rooms_js_transcript_count_updated_alongside_room_count():
@@ -1442,6 +1558,7 @@ async def test_ui_delete_room_removes_room_and_cascades(client, db_session):
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: agents wait for this
     await _post_message_via_api(client, machine_headers, room["id"], sender="agent-a", text="hello")
 
     page = await client.get("/ui/rooms")
@@ -1469,6 +1586,7 @@ async def test_ui_delete_room_removes_room_and_cascades(client, db_session):
 async def test_ui_delete_room_button_present_with_confirm(client, db_session):
     owner_headers = await _owner_headers_and_login(client, db_session)
     room = await _create_room_via_api(client, owner_headers, name="delete-candidate", members=["agent-a", "agent-b"])
+    await _open_room_via_api(client, owner_headers, room["id"])  # ADR-0014: agents wait for this
     await _post_message_via_api(client, await _machine_headers(db_session), room["id"], sender="agent-a", text="one")
 
     resp = await client.get("/ui/rooms")
@@ -2007,4 +2125,48 @@ async def test_ui_toggle_agent_uploads_without_csrf_rejected(client, db_session)
     owner_headers = await _owner_headers_and_login(client, db_session)
     room = await _create_room_via_api(client, owner_headers, name="ui-toggle-no-csrf")
     resp = await client.post(f"/ui/rooms/{room['id']}/agent-uploads", data={})
+    assert resp.status_code == 403
+
+
+# --- ADR-0014: the owner-open gate's per-room opt-out, UI toggle ---
+
+
+async def test_ui_open_gate_checkbox_reflects_state(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-gate-checkbox-room")
+
+    on = await client.get(f"/ui/rooms/{room['id']}")
+    assert 'name="required" value="1" checked' in on.text
+    assert "Waiting for the owner" in on.text
+
+    off_resp = await client.post(f"/v1/rooms/{room['id']}/open-gate", json={"required": False}, headers=owner_headers)
+    assert off_resp.status_code == 200
+
+    off = await client.get(f"/ui/rooms/{room['id']}")
+    assert 'name="required" value="1" checked' not in off.text
+    assert "Waiting for the owner" not in off.text
+
+
+async def test_ui_toggle_open_gate_via_form(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-gate-toggle-room")
+    page = await client.get(f"/ui/rooms/{room['id']}")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        f"/ui/rooms/{room['id']}/open-gate", data={"csrf_token": csrf}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail.json()["requires_owner_open"] is False
+
+    view = await client.get(f"/ui/rooms/{room['id']}")
+    assert "turned off" in view.text
+
+
+async def test_ui_toggle_open_gate_without_csrf_rejected(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-gate-toggle-no-csrf")
+    resp = await client.post(f"/ui/rooms/{room['id']}/open-gate", data={})
     assert resp.status_code == 403

@@ -4,6 +4,7 @@ endpoints (app/routers/ui_rooms.py's GET .../transcript.md and .json). No
 model is involved anywhere in this file.
 """
 
+import json
 import re
 from datetime import UTC, datetime
 
@@ -302,7 +303,7 @@ async def test_transcript_md_endpoint_returns_full_transcript(client, db_session
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, name="dl-room")
-    await _post_message(client, machine_headers, room["id"], sender="agent-a", text="hello world")
+    await _post_message(client, owner_headers, room["id"], sender="owner", text="hello world")
 
     resp = await client.get(f"/ui/rooms/{room['id']}/transcript.md")
 
@@ -320,7 +321,7 @@ async def test_transcript_json_endpoint_returns_full_transcript(client, db_sessi
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, name="json-dl-room")
-    await _post_message(client, machine_headers, room["id"], sender="agent-a", text="hello json")
+    await _post_message(client, owner_headers, room["id"], sender="owner", text="hello json")
 
     resp = await client.get(f"/ui/rooms/{room['id']}/transcript.json")
 
@@ -517,10 +518,50 @@ async def test_room_view_export_panel_xss_message_text_escaped(client, db_sessio
     owner_headers = await _owner_headers_and_login(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, name="export-xss-room")
-    await _post_message(client, machine_headers, room["id"], text="<script>alert(1)</script>")
+    await _post_message(client, owner_headers, room["id"], sender="owner", text="<script>alert(1)</script>")
 
     resp = await client.get(f"/ui/rooms/{room['id']}")
 
     assert resp.status_code == 200
     assert "<script>alert(1)</script>" not in resp.text
     assert "&lt;script&gt;" in resp.text
+
+
+# --- ADR-0015: deleted messages export as their tombstone, never the
+# original content (decision 7 -- no code change required in either export
+# path; verified here rather than assumed) ---
+
+
+async def test_transcript_md_never_leaks_deleted_message_text(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="deleted-md-room")
+    secret = "sk-live-super-secret-leaked-by-accident"
+    posted = await _post_message(client, owner_headers, room["id"], sender="owner", text=secret)
+
+    del_resp = await client.delete(
+        f"/v1/rooms/{room['id']}/messages/{posted['id']}", headers=owner_headers
+    )
+    assert del_resp.status_code == 200, del_resp.json()
+
+    resp = await client.get(f"/ui/rooms/{room['id']}/transcript.md")
+    assert resp.status_code == 200
+    assert secret not in resp.text
+    assert "[message deleted by owner]" in resp.text
+
+
+async def test_transcript_json_never_leaks_deleted_message_text(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="deleted-json-room")
+    secret = "sk-live-super-secret-leaked-by-accident"
+    posted = await _post_message(client, owner_headers, room["id"], sender="owner", text=secret)
+
+    del_resp = await client.delete(
+        f"/v1/rooms/{room['id']}/messages/{posted['id']}", headers=owner_headers
+    )
+    assert del_resp.status_code == 200, del_resp.json()
+
+    resp = await client.get(f"/ui/rooms/{room['id']}/transcript.json")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert secret not in json.dumps(data)
+    assert data["messages"][0]["text"] == "[message deleted by owner]"

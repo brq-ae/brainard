@@ -25,10 +25,12 @@ from app.rooms import (
 )
 from app.rooms import assign_group_to_rooms as assign_group_to_rooms_op
 from app.rooms import close_room as close_room_op
+from app.rooms import delete_message as delete_message_op
 from app.rooms import delete_room as delete_room_op
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_message as post_message_op
+from app.rooms import set_requires_owner_open as set_requires_owner_open_op
 from app.rooms import switch_room_mode as switch_room_mode_op
 from app.schemas import (
     RoomCloseRequest,
@@ -41,10 +43,13 @@ from app.schemas import (
     RoomGroupAssignResponse,
     RoomListItem,
     RoomListResponse,
+    RoomMessageDeleteResponse,
     RoomMessageOut,
     RoomMessagesPollResponse,
     RoomModeSwitchRequest,
     RoomModeSwitchResponse,
+    RoomOpenGateRequest,
+    RoomOpenGateResponse,
     RoomPostMessageRequest,
     RoomPostMessageResponse,
 )
@@ -172,6 +177,8 @@ async def get_room_endpoint(
         expires_at=room.expires_at,
         sides=sides,
         group=room.group_name,
+        opened_at=room.opened_at,
+        requires_owner_open=room.requires_owner_open,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
     )
 
@@ -190,6 +197,27 @@ async def post_room_message_endpoint(
     return RoomPostMessageResponse(id=message.id, seq=message.seq, room_status=room.status, close_reason=room.close_reason)
 
 
+@router.delete("/{room_id}/messages/{message_id}", response_model=RoomMessageDeleteResponse)
+async def delete_room_message_endpoint(
+    room_id: str,
+    message_id: str,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> RoomMessageDeleteResponse:
+    """ADR-0015: owner-only tombstone delete of one message -- `require_owner`
+    (same dependency guarding `create_room_endpoint`/`close_room_endpoint`/
+    `switch_room_mode_endpoint`/`delete_room_endpoint` above) means there is
+    no machine-token path to this endpoint at all, not even for the room's
+    own members: an agent can never delete a message (decision 1). See
+    app/rooms.py's `delete_message` for the tombstone/counter-decrement
+    logic; this route only wires request/response shapes to it.
+    """
+    message, room = await delete_message_op(db, room_id, message_id)
+    return RoomMessageDeleteResponse(
+        id=message.id, seq=message.seq, deleted_at=message.deleted_at, message_count=room.message_count
+    )
+
+
 @router.post("/{room_id}/close", response_model=RoomCloseResponse)
 async def close_room_endpoint(
     room_id: str,
@@ -200,6 +228,28 @@ async def close_room_endpoint(
     reason = body.reason if body is not None else None
     room = await close_room_op(db, room_id, reason)
     return RoomCloseResponse(id=room.id, status=room.status, close_reason=room.close_reason, closed_at=room.closed_at)
+
+
+@router.post("/{room_id}/open-gate", response_model=RoomOpenGateResponse)
+async def set_room_open_gate_endpoint(
+    room_id: str,
+    body: RoomOpenGateRequest,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> RoomOpenGateResponse:
+    """ADR-0014 decision 4: owner-only mid-session toggle of the room's
+    owner-open requirement -- see app/rooms.py's `set_requires_owner_open`
+    for the validation/locking/announcement logic; this route only wires
+    the request/response shapes to it.
+    """
+    room, announcement = await set_requires_owner_open_op(db, room_id, body.required)
+    return RoomOpenGateResponse(
+        id=room.id,
+        requires_owner_open=room.requires_owner_open,
+        opened_at=room.opened_at,
+        expires_at=room.expires_at,
+        announcement=announcement,
+    )
 
 
 @router.post("/{room_id}/mode", response_model=RoomModeSwitchResponse)
@@ -246,8 +296,9 @@ async def poll_room_messages_endpoint(
     wait: int = Query(default=0, ge=0),
     _principal: Principal = Depends(require_machine_or_owner),
 ) -> RoomMessagesPollResponse:
-    room, messages = await poll_messages_op(room_id, since, wait)
+    room, messages, open_gate_notice = await poll_messages_op(room_id, since, wait)
     return RoomMessagesPollResponse(
         room_status=room.status,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
+        open_gate_notice=open_gate_notice,
     )

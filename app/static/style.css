@@ -262,5 +262,11 @@ form.inline { display: inline; }
 
 .empty { color: var(--text-dimmer); font-style: italic; padding: 12px 0; }
 
+/* ADR-0015: a deleted room message's tombstone marker -- same muted/italic
+   treatment as .empty above, applied inline to just the message text so a
+   deleted row still reads clearly as "something was here, now removed"
+   rather than disappearing from the transcript. */
+.msg-deleted { color: var(--text-dimmer); font-style: italic; }
+
 .breadcrumb { color: var(--text-dim); font-size: 0.9em; margin-bottom: 8px; }
 .breadcrumb a { color: var(--text-dim); }

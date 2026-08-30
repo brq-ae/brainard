@@ -349,6 +349,7 @@ async def test_truncation_kicks_in_on_huge_transcript_and_is_disclosed(client, d
     await _configure_provider(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers)
+    await _post_message(client, owner_headers, room["id"], sender="owner", text="start")  # ADR-0014: opens the room
 
     big_text = "x" * 2000
     for i in range(30):
@@ -470,6 +471,7 @@ async def test_truncation_notice_reports_accurate_head_tail_omitted_counts(clien
     await _configure_provider(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room_via_api(client, owner_headers, max_messages=100)
+    await _post_message(client, owner_headers, room["id"], sender="owner", text="start")  # ADR-0014: opens the room
 
     for i in range(1, 41):
         await _post_message(client, machine_headers, room["id"], sender="agent-a", text=("y" * 2000) + f"-{i}")
@@ -508,6 +510,7 @@ async def test_closing_statement_in_final_message_reaches_the_prompt_for_long_de
         sides={"agent-a": "for", "agent-b": "against"}, max_messages=100,
     )
 
+    await _post_message(client, owner_headers, room["id"], sender="owner", text="start")  # ADR-0014: opens the room
     filler = "x" * 2000
     for i in range(1, 41):
         sender = "agent-a" if i % 2 else "agent-b"
@@ -529,6 +532,36 @@ async def test_closing_statement_in_final_message_reaches_the_prompt_for_long_de
     assert resp.status_code == 200, resp.json()
     assert resp.json()["truncated"] is True  # sanity: this only proves the fix if truncation actually happened
     assert closing_statement in captured_prompts["user_prompt"]
+
+
+# --- ADR-0015: a deleted message's original text must never reach the
+# room-AI prompt (decision 7 -- no code change required; verified here
+# rather than assumed) ---
+
+
+async def test_deleted_message_text_never_reaches_the_ai_prompt(client, db_session, monkeypatch):
+    owner_headers = await _owner_headers(db_session)
+    await _configure_provider(db_session)
+    room = await _create_room_via_api(client, owner_headers, name="deleted-ai-room")
+    secret = "sk-live-super-secret-should-never-reach-the-llm"
+    posted = await _post_message(client, owner_headers, room["id"], sender="owner", text=secret)
+
+    del_resp = await client.delete(f"/v1/rooms/{room['id']}/messages/{posted['id']}", headers=owner_headers)
+    assert del_resp.status_code == 200, del_resp.json()
+
+    captured_prompts = {}
+
+    async def fake_chat_completion_json(effective, *, system_prompt, user_prompt, max_tokens, timeout):
+        captured_prompts["user_prompt"] = user_prompt
+        return _summarize_response()
+
+    monkeypatch.setattr(room_ai_module, "chat_completion_json", fake_chat_completion_json)
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/ai/summarize", headers=owner_headers)
+
+    assert resp.status_code == 200, resp.json()
+    assert secret not in captured_prompts["user_prompt"]
+    assert "[message deleted by owner]" in captured_prompts["user_prompt"]
 
 
 # --- owner-only ---

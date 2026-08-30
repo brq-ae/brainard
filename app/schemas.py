@@ -620,6 +620,11 @@ class RoomMessageOut(BaseModel):
     text: str
     kind: str
     created_at: datetime
+    # ADR-0015: non-null exactly when this message has been tombstoned by
+    # the owner -- lets API/UI consumers distinguish a real deletion from an
+    # ordinary short message without pattern-matching on the marker text
+    # `text` was overwritten with (app/rooms.py's DELETED_MESSAGE_MARKER).
+    deleted_at: datetime | None = None
 
 
 class RoomDetailResponse(BaseModel):
@@ -641,12 +646,28 @@ class RoomDetailResponse(BaseModel):
     expires_at: datetime | None
     sides: dict[str, str | None]
     group: str | None
+    # ADR-0014: the owner-open gate -- same "only in Detail" exposure
+    # `agent_uploads_allowed` above already has. `opened_at` is null while
+    # waiting for the owner's first message (or, if `requires_owner_open` is
+    # false, may be null even on a room agents have always been free to use).
+    opened_at: datetime | None
+    requires_owner_open: bool
     # Most recent N messages, oldest first (chat reading order).
     messages: list[RoomMessageOut]
 
 
 class RoomPostMessageRequest(BaseModel):
-    sender: str = Field(min_length=1)
+    # max_length matches the other bounded identity/name strings in this
+    # module (ProjectCreateRequest.name / default_project above) -- `sender`
+    # is untrusted, client-supplied text (any machine token may claim any
+    # string here, see app/rooms.py's post_message docstring) that can reach
+    # an owner-facing ntfy push (app/notify.py's `notify_owner_open_pending`,
+    # ADR-0014 decision 8): unbounded length was the independent review's
+    # finding -- this caps it at the API boundary, before it ever reaches
+    # that path. app/notify.py additionally sanitises the value it actually
+    # interpolates (control/format characters, whitespace collapse), since a
+    # length cap alone doesn't stop a newline/control-character payload.
+    sender: str = Field(min_length=1, max_length=255)
     text: str = Field(min_length=1)
     # Plain str (not a pydantic Literal), validated in app/rooms.py -- same
     # reasoning as EventIn.kind above: a self-explaining ApiError instead of
@@ -659,6 +680,19 @@ class RoomPostMessageResponse(BaseModel):
     seq: int
     room_status: str
     close_reason: str | None
+
+
+# --- Deleting individual messages (ADR-0015) ---
+
+
+class RoomMessageDeleteResponse(BaseModel):
+    id: str
+    seq: int
+    deleted: bool = True
+    deleted_at: datetime
+    # The room's message_count AFTER the decrement -- lets a caller confirm
+    # the cap slot was actually freed without a second round-trip.
+    message_count: int
 
 
 class RoomCloseRequest(BaseModel):
@@ -675,6 +709,14 @@ class RoomCloseResponse(BaseModel):
 class RoomMessagesPollResponse(BaseModel):
     room_status: str
     messages: list[RoomMessageOut]
+    # ADR-0014 decision 3: non-null exactly when this response returned
+    # immediately because the room requires the owner to post first and
+    # hasn't yet -- carries the same stop directive app/rooms.py's
+    # post_message 403 backstop uses (`room_not_opened`), so an agent
+    # reading the poll transport gets the identical instruction. Null in
+    # every other case, including once the room opens (normal long-polling
+    # resumes unchanged).
+    open_gate_notice: str | None = None
 
 
 # --- Mid-session mode switch (ADR-0009) ---
@@ -793,6 +835,24 @@ class RoomAgentUploadsResponse(BaseModel):
     # The kind='system' announcement text posted into the room's transcript
     # by this toggle (ADR-0012 decision 9) -- same shape as
     # RoomModeSwitchResponse.announcement.
+    announcement: str
+
+
+# --- ADR-0014: owner-open gate, per-room opt-out toggle ---
+
+
+class RoomOpenGateRequest(BaseModel):
+    required: bool
+
+
+class RoomOpenGateResponse(BaseModel):
+    id: str
+    requires_owner_open: bool
+    opened_at: datetime | None
+    expires_at: datetime | None
+    # The kind='system' announcement text posted into the room's transcript
+    # by this toggle (ADR-0014 decision 4) -- same shape as
+    # RoomAgentUploadsResponse.announcement.
     announcement: str
 
 

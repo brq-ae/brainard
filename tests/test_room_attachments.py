@@ -11,7 +11,7 @@ surfacing through the API, and Save-to-Brain leaving the room copy readable.
 
 from ulid import ULID
 
-from app.models import Machine, OwnerToken, RoomAttachment
+from app.models import Machine, OwnerToken, Room, RoomAttachment
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
 
@@ -70,6 +70,35 @@ async def test_upload_agent_member_succeeds(client, db_session):
     resp = await _upload(client, machine_headers, room["id"], sender="agent-a")
     assert resp.status_code == 201, resp.json()
     assert resp.json()["uploaded_by"] == "agent-a"
+
+
+async def test_upload_does_not_open_the_room(client, db_session):
+    """ADR-0014 decision 5: "opened" means the owner posted a MESSAGE --
+    attaching a file (even as the owner) never sets `Room.opened_at`. An
+    agent may still not post a real message afterward until the owner
+    actually does, even though a file now sits in the room.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    upload_resp = await _upload(client, owner_headers, room["id"], sender="owner")
+    assert upload_resp.status_code == 201, upload_resp.json()
+
+    room_row = await db_session.get(Room, room["id"])
+    await db_session.refresh(room_row)
+    assert room_row.opened_at is None
+    assert room_row.requires_owner_open is True
+
+    # The gate is still up: an agent post is still rejected.
+    post_resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert post_resp.status_code == 403
+    assert post_resp.json()["error"]["code"] == "room_not_opened"
+
+    detail_resp = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail_resp.json()["opened_at"] is None
 
 
 async def test_upload_no_auth_rejected(client, db_session):

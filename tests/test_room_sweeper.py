@@ -143,6 +143,65 @@ async def test_sweep_once_leaves_unexpired_room_open(client, db_session):
     assert detail["status"] == "open"
 
 
+# --- ADR-0014 decision 7: the timer starts on open, not creation ---
+
+
+async def test_sweep_never_touches_a_never_opened_room_with_a_deferred_duration(client, db_session):
+    """A relative `duration_seconds` is deferred until the room opens
+    (`Room.expires_at` stays NULL, the seconds sit on
+    `Room.pending_duration_seconds` instead) -- the sweeper's own
+    `Room.expires_at.is_not(None)` filter already means it can never
+    consider, let alone close, a room that has never been opened. No
+    backdating needed here: unlike the older no-deadline case above, this
+    room genuinely asked for a (short) deadline -- it's just not running yet.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, duration_seconds=1)
+    assert room["expires_at"] is None
+
+    room_row = await db_session.get(Room, room["id"])
+    assert room_row.pending_duration_seconds == 1
+
+    result = await sweep_once()
+    assert room["id"] not in result["closed"]
+    assert room["id"] not in result["warned"]
+
+    detail = await _get_room(client, machine_headers, room["id"])
+    assert detail["status"] == "open"
+    assert detail["expires_at"] is None
+    assert detail["opened_at"] is None
+
+
+async def test_sweep_closes_a_room_once_its_deferred_duration_resolves_and_elapses(client, db_session):
+    """Full cycle: create with a deferred duration -> owner opens (resolves
+    `expires_at` from `pending_duration_seconds`) -> backdate that resolved
+    `expires_at` the same way every other sweeper test simulates elapsed
+    time -> the sweeper closes it exactly like any other timed-out room.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, duration_seconds=3600)
+    assert room["expires_at"] is None
+
+    open_resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "owner", "text": "start"}, headers=owner_headers
+    )
+    assert open_resp.status_code == 200
+
+    detail_after_open = await _get_room(client, machine_headers, room["id"])
+    assert detail_after_open["expires_at"] is not None
+
+    await _backdate_expires_at(db_session, room["id"], datetime.now(UTC) - timedelta(seconds=5))
+
+    result = await sweep_once()
+    assert result["closed"] == [room["id"]]
+
+    detail = await _get_room(client, machine_headers, room["id"])
+    assert detail["status"] == "closed"
+    assert detail["close_reason"] == "time"
+
+
 async def test_time_closed_room_rejects_further_posts(client, db_session):
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)

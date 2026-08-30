@@ -11,13 +11,16 @@ from sqlalchemy import select
 from ulid import ULID
 
 import app.notify as notify_module
+import app.rooms as rooms_module
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
 from app.attachments import blob_path
 from app.auth import Principal
 from app.config import get_settings
 from app.models import AttachmentBlob, Machine, OwnerToken, Room, RoomAttachment, RoomMember, RoomMessage
+from app.rooms import _maybe_ping_owner_room_not_opened as maybe_ping_owner_room_not_opened_op
 from app.rooms import close_room as close_room_op
+from app.rooms import delete_message as delete_message_op
 from app.rooms import delete_room as delete_room_op
 from app.rooms import post_closing_nudge as post_closing_nudge_op
 from app.rooms import post_message as post_message_op
@@ -72,6 +75,20 @@ async def _create_room(
         body["group"] = group
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == expect_status, resp.json()
+    return resp.json()
+
+
+async def _open_room(client, owner_headers, room_id: str, *, text="starting now") -> dict:
+    """ADR-0014: rooms default to `requires_owner_open=True`, so most tests
+    that want an agent to be able to post at all need the owner to post
+    first. This is the one, single owner message that opens the room (seq
+    1) -- callers that care about exact seq numbers for their OWN posts
+    account for this one extra message.
+    """
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "owner", "text": text}, headers=owner_headers
+    )
+    assert resp.status_code == 200, resp.json()
     return resp.json()
 
 
@@ -301,15 +318,38 @@ async def test_create_room_rejects_bad_mode(client, db_session):
 # --- create: deadline (duration_seconds / expires_at) ---
 
 
-async def test_create_room_computes_expires_at_from_duration(client, db_session):
+async def test_create_room_duration_is_deferred_until_the_room_opens(client, db_session):
+    """ADR-0014 decision 7: a relative `duration_seconds` is NOT resolved
+    into `expires_at` at create time (every new room defaults to
+    `requires_owner_open=True`, and the timer starts on open, not
+    creation) -- `expires_at` stays null until the owner's first message.
+    """
     owner_headers = await _owner_headers(db_session)
-    before = datetime.now(UTC)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], duration_seconds=1800)
+    assert room["expires_at"] is None
+
+    before = datetime.now(UTC)
+    await _open_room(client, owner_headers, room["id"])
     after = datetime.now(UTC)
 
-    assert room["expires_at"] is not None
-    expires_at = datetime.fromisoformat(room["expires_at"])
+    detail = (await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)).json()
+    assert detail["expires_at"] is not None
+    expires_at = datetime.fromisoformat(detail["expires_at"])
     assert before + timedelta(seconds=1800) <= expires_at <= after + timedelta(seconds=1800)
+    assert detail["opened_at"] is not None
+
+
+async def test_create_room_explicit_expires_at_is_not_deferred(client, db_session):
+    """Unlike `duration_seconds`, an explicit `expires_at` is a wall-clock
+    moment the owner asked for directly -- stored and enforced exactly as
+    given, even though the room may still be waiting for the owner when it
+    arrives (ADR-0014 decision 7).
+    """
+    owner_headers = await _owner_headers(db_session)
+    future = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], expires_at=future)
+    assert room["expires_at"] is not None
+    assert datetime.fromisoformat(room["expires_at"]) == datetime.fromisoformat(future)
 
 
 async def test_create_room_no_deadline_by_default(client, db_session):
@@ -395,12 +435,16 @@ async def test_create_room_rejects_expires_at_too_far_out(client, db_session):
 async def test_cap_and_time_are_independent_cap_still_works_with_a_long_deadline(client, db_session):
     """A room with both a message cap and a (far-future) deadline set is
     closed by whichever guardrail fires first -- here, the cap, long before
-    the deadline is anywhere close."""
+    the deadline is anywhere close. max_messages=2 (not 1): the owner's own
+    opening message (ADR-0014) already counts toward the cap, so the cap is
+    sized to still leave room for one agent post to be the one that trips it.
+    """
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(
-        client, owner_headers, members=["agent-a", "agent-b"], max_messages=1, duration_seconds=30 * 24 * 3600
+        client, owner_headers, members=["agent-a", "agent-b"], max_messages=2, duration_seconds=30 * 24 * 3600
     )
+    await _open_room(client, owner_headers, room["id"])
 
     resp = await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
@@ -434,8 +478,10 @@ async def test_get_room_detail_includes_members_and_messages(client, db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
 
+    # The owner's own opening message doubles as the message under test here
+    # (ADR-0014: a room defaults to requiring one before agents may post).
     await client.post(
-        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hello"}, headers=machine_headers
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "owner", "text": "hello"}, headers=owner_headers
     )
 
     resp = await client.get(f"/v1/rooms/{room['id']}", headers=machine_headers)
@@ -463,13 +509,14 @@ async def test_post_message_as_member_ok(client, db_session):
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])  # ADR-0014: agents wait for this
 
     resp = await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi there"}, headers=machine_headers
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["seq"] == 1
+    assert data["seq"] == 2  # 1 is the owner's opening message
     assert data["room_status"] == "open"
     assert data["close_reason"] is None
 
@@ -489,12 +536,31 @@ async def test_post_message_non_member_rejected(client, db_session):
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])  # else the owner-open gate fires first, not membership
 
     resp = await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "stranger", "text": "hi"}, headers=machine_headers
     )
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "sender_not_room_member"
+
+
+async def test_post_message_non_member_rejected_by_gate_before_room_opens(client, db_session):
+    """ADR-0014 decision 1: the gate runs BEFORE the membership check --
+    a non-member gets the same "wait for the owner" directive a real member
+    would on a room that isn't open yet, not a misleading
+    "sender_not_room_member" that implies posting as the right name would
+    have worked right now.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "stranger", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "room_not_opened"
 
 
 async def test_post_message_machine_token_cannot_claim_owner_sender(client, db_session):
@@ -579,6 +645,7 @@ async def test_seq_monotonic_and_gap_free(client, db_session):
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])  # consumes seq 1
 
     seqs = []
     for i in range(6):
@@ -589,7 +656,7 @@ async def test_seq_monotonic_and_gap_free(client, db_session):
         assert resp.status_code == 200
         seqs.append(resp.json()["seq"])
 
-    assert seqs == [1, 2, 3, 4, 5, 6]
+    assert seqs == [2, 3, 4, 5, 6, 7]
 
 
 # --- guardrails ---
@@ -599,6 +666,7 @@ async def test_done_signal_closes_room(client, db_session):
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
 
     resp = await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "all done", "kind": "done"}, headers=machine_headers
@@ -617,7 +685,11 @@ async def test_done_signal_closes_room(client, db_session):
 async def test_cap_auto_closes_room(client, db_session):
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
-    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], max_messages=2)
+    # max_messages=3: the owner's own opening message (ADR-0014) already
+    # counts toward the cap, leaving 2 more slots for the agent-a/agent-b
+    # exchange this test is actually about.
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], max_messages=3)
+    await _open_room(client, owner_headers, room["id"])
 
     resp1 = await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "one"}, headers=machine_headers
@@ -706,7 +778,11 @@ async def test_notification_fired_on_guardrail_close(client, db_session, monkeyp
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     await _configure_notifications(client, owner_headers)
-    room = await _create_room(client, owner_headers, name="capped-room", members=["agent-a", "agent-b"], max_messages=1)
+    # max_messages=2: the owner's own opening message (ADR-0014) counts
+    # toward the cap, leaving exactly one slot for the agent post that's
+    # meant to be the one that trips it.
+    room = await _create_room(client, owner_headers, name="capped-room", members=["agent-a", "agent-b"], max_messages=2)
+    await _open_room(client, owner_headers, room["id"])
 
     calls = []
 
@@ -761,16 +837,20 @@ async def test_long_poll_returns_immediately_when_messages_exist(client, db_sess
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    opened = await _open_room(client, owner_headers, room["id"])
     await client.post(f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers)
 
     start = time.monotonic()
-    resp = await client.get(f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 10}, headers=machine_headers)
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": opened["seq"], "wait": 10}, headers=machine_headers
+    )
     elapsed = time.monotonic() - start
 
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["messages"]) == 1
     assert data["room_status"] == "open"
+    assert data["open_gate_notice"] is None
     assert elapsed < 2  # must not have waited out any part of the 10s budget
 
 
@@ -778,6 +858,7 @@ async def test_long_poll_returns_nothing_new_when_since_is_current(client, db_se
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
     post_resp = await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
     )
@@ -794,9 +875,12 @@ async def test_long_poll_returns_empty_after_wait_when_no_new_messages(client, d
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    opened = await _open_room(client, owner_headers, room["id"])
 
     start = time.monotonic()
-    resp = await client.get(f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 2}, headers=machine_headers)
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": opened["seq"], "wait": 2}, headers=machine_headers
+    )
     elapsed = time.monotonic() - start
 
     assert resp.status_code == 200
@@ -804,6 +888,28 @@ async def test_long_poll_returns_empty_after_wait_when_no_new_messages(client, d
     assert data["messages"] == []
     assert data["room_status"] == "open"
     assert elapsed >= 1.5  # actually waited out roughly the requested budget
+
+
+async def test_long_poll_returns_immediately_before_the_room_opens(client, db_session):
+    """ADR-0014 decision 3: unlike the "actually waits" case above, a room
+    that still requires the owner to post returns on the very first
+    iteration -- no sleep, no waiting out any part of `wait`.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    start = time.monotonic()
+    resp = await client.get(f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 15}, headers=machine_headers)
+    elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["messages"] == []
+    assert data["room_status"] == "open"
+    assert data["open_gate_notice"] is not None
+    assert "not posted" in data["open_gate_notice"]
+    assert elapsed < 1  # must NOT have entered the sleep loop at all
 
 
 async def test_long_poll_wait_is_capped_at_30(client, db_session):
@@ -816,6 +922,7 @@ async def test_long_poll_returns_promptly_when_message_posted_during_wait(client
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    opened = await _open_room(client, owner_headers, room["id"])
 
     async def poster():
         await asyncio.sleep(1.2)
@@ -826,7 +933,9 @@ async def test_long_poll_returns_promptly_when_message_posted_during_wait(client
 
     start = time.monotonic()
     poll_result, _ = await asyncio.gather(
-        client.get(f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 15}, headers=machine_headers),
+        client.get(
+            f"/v1/rooms/{room['id']}/messages", params={"since": opened["seq"], "wait": 15}, headers=machine_headers
+        ),
         poster(),
     )
     elapsed = time.monotonic() - start
@@ -844,6 +953,7 @@ async def test_long_poll_returns_when_room_closes_during_wait(client, db_session
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    opened = await _open_room(client, owner_headers, room["id"])
 
     async def closer():
         await asyncio.sleep(1.2)
@@ -852,7 +962,9 @@ async def test_long_poll_returns_when_room_closes_during_wait(client, db_session
 
     start = time.monotonic()
     poll_result, _ = await asyncio.gather(
-        client.get(f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 15}, headers=machine_headers),
+        client.get(
+            f"/v1/rooms/{room['id']}/messages", params={"since": opened["seq"], "wait": 15}, headers=machine_headers
+        ),
         closer(),
     )
     elapsed = time.monotonic() - start
@@ -916,6 +1028,7 @@ async def test_post_message_accepts_machine_and_owner(client, db_session):
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
 
     resp1 = await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "via machine"}, headers=machine_headers
@@ -1160,6 +1273,7 @@ async def test_delete_room_owner_hard_deletes_room_and_cascades(client, db_sessi
     owner_headers = await _owner_headers(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
     await client.post(
         f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
     )
@@ -1172,7 +1286,7 @@ async def test_delete_room_owner_hard_deletes_room_and_cascades(client, db_sessi
     data = resp.json()
     assert data["id"] == room["id"]
     assert data["deleted"] is True
-    assert data["deleted_messages"] == 2
+    assert data["deleted_messages"] == 3  # the owner's opening message + the two agent replies
     assert data["deleted_members"] == 2
 
     # Gone via the API too.
@@ -1249,6 +1363,7 @@ async def test_delete_room_does_not_affect_other_rooms(client, db_session):
     machine_headers = await _machine_headers(db_session)
     room1 = await _create_room(client, owner_headers, name="keep-me", members=["a1", "a2"])
     room2 = await _create_room(client, owner_headers, name="delete-me", members=["b1", "b2"])
+    await _open_room(client, owner_headers, room1["id"])
     await client.post(
         f"/v1/rooms/{room1['id']}/messages", json={"sender": "a1", "text": "still here"}, headers=machine_headers
     )
@@ -1258,7 +1373,7 @@ async def test_delete_room_does_not_affect_other_rooms(client, db_session):
 
     still_there = await client.get(f"/v1/rooms/{room1['id']}", headers=machine_headers)
     assert still_there.status_code == 200
-    assert still_there.json()["message_count"] == 1
+    assert still_there.json()["message_count"] == 2  # the owner's opening message + "still here"
 
 
 # --- ADR-0012 stage 2: delete_room's attachment blob-reclaim fix ---
@@ -1402,6 +1517,19 @@ RACE_TRIALS = 3
 # invariant under test here is unrelated to that identity check, so a
 # single fixed machine principal is reused across all of them.
 _RACE_MACHINE_PRINCIPAL = Principal(kind="machine", machine=Machine(id=str(ULID())))
+_RACE_OWNER_PRINCIPAL = Principal(kind="owner")
+
+
+async def _open_room_direct(room_id: str) -> None:
+    """ADR-0014: these lock-contention races are about post_message/
+    delete_room/post_closing_nudge/switch_room_mode interleaving, not about
+    the owner-open gate -- so every room used in a race below is opened
+    first (a real owner post, on its own throwaway session/commit) so the
+    later agent-sender post under test actually reaches the row lock
+    instead of being rejected by the gate before it ever gets there.
+    """
+    async with AsyncSessionLocal() as session:
+        await post_message_op(session, room_id, "owner", "starting now", "message", principal=_RACE_OWNER_PRINCIPAL)
 
 
 def _delayed_commit_session(delay: float):
@@ -1433,6 +1561,7 @@ async def test_delete_room_race_delete_wins_against_post_message_done(client, db
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
         room_id = room["id"]
+        await _open_room_direct(room_id)
 
         winner_session = _delayed_commit_session(COMMIT_DELAY)
         loser_session = AsyncSessionLocal()
@@ -1458,7 +1587,7 @@ async def test_delete_room_race_delete_wins_against_post_message_done(client, db
         assert elapsed >= COMMIT_DELAY
 
         messages_deleted, members_deleted = delete_result
-        assert messages_deleted == 0
+        assert messages_deleted == 1  # the owner's opening message from _open_room_direct
         assert members_deleted == 2
         assert isinstance(post_result, ApiError)
         assert post_result.code == "room_not_found"
@@ -1485,6 +1614,7 @@ async def test_delete_room_race_post_message_done_wins_against_delete(client, db
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
         room_id = room["id"]
+        await _open_room_direct(room_id)
 
         winner_session = _delayed_commit_session(COMMIT_DELAY)
         loser_session = AsyncSessionLocal()
@@ -1507,11 +1637,11 @@ async def test_delete_room_race_post_message_done_wins_against_delete(client, db
         # post_message really landed (message inserted, room closed by the
         # done-signal) before delete swept it up.
         message, room_after_post = post_result
-        assert message.seq == 1
+        assert message.seq == 2  # 1 is the owner's opening message from _open_room_direct
         assert room_after_post.status == "closed"
 
         messages_deleted, members_deleted = delete_result
-        assert messages_deleted == 1  # the raced-in 'done' message, cleanly swept up -- no FK violation
+        assert messages_deleted == 2  # the owner's opening message + the raced-in 'done', no FK violation
         assert members_deleted == 2
 
         assert await db_session.get(Room, room_id) is None
@@ -1855,6 +1985,7 @@ async def test_switch_mode_race_switch_wins_against_post_message(client, db_sess
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
         room_id = room["id"]
+        await _open_room_direct(room_id)  # seq 1; the room must be open before agent-a may post
 
         winner_session = _delayed_commit_session(COMMIT_DELAY)
         loser_session = AsyncSessionLocal()
@@ -1881,15 +2012,15 @@ async def test_switch_mode_race_switch_wins_against_post_message(client, db_sess
         assert room_after_switch.mode == "debate"
         message, room_after_post = post_result
         assert room_after_post.status == "open"
-        # The post landed strictly after the switch's announcement (seq 1),
-        # so it must be seq 2 -- proving the lock serialized the two writes
-        # rather than letting them interleave.
-        assert message.seq == 2
+        # seq 1 is the opening message, seq 2 the switch's announcement --
+        # the post landed strictly after both, so it must be seq 3, proving
+        # the lock serialized the writes rather than letting them interleave.
+        assert message.seq == 3
 
         async with AsyncSessionLocal() as check_session:
             final_room = await check_session.get(Room, room_id)
             assert final_room.mode == "debate"
-            assert final_room.message_count == 2
+            assert final_room.message_count == 3
 
 
 async def test_switch_mode_race_post_message_wins_against_switch(client, db_session):
@@ -1903,6 +2034,7 @@ async def test_switch_mode_race_post_message_wins_against_switch(client, db_sess
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
         room_id = room["id"]
+        await _open_room_direct(room_id)  # seq 1; the room must be open before agent-a may post
 
         winner_session = _delayed_commit_session(COMMIT_DELAY)
         loser_session = AsyncSessionLocal()
@@ -1925,14 +2057,14 @@ async def test_switch_mode_race_post_message_wins_against_switch(client, db_sess
         assert elapsed >= COMMIT_DELAY
 
         message, room_after_post = post_result
-        assert message.seq == 1
+        assert message.seq == 2  # 1 is the opening message from _open_room_direct
         room_after_switch, announcement = switch_result
         assert room_after_switch.mode == "debate"
 
         async with AsyncSessionLocal() as check_session:
             final_room = await check_session.get(Room, room_id)
             assert final_room.mode == "debate"
-            assert final_room.message_count == 2  # the post + the switch's announcement, no lost update
+            assert final_room.message_count == 3  # open + the post + the switch's announcement, no lost update
 
 
 async def test_switch_mode_race_switch_wins_against_close(client, db_session):
@@ -2200,3 +2332,839 @@ async def test_switch_mode_race_delete_room_wins_against_switch(client, db_sessi
         assert switch_result.status_code == 404
 
         assert await db_session.get(Room, room_id) is None
+
+
+# --- ADR-0014: rooms wait for the owner's first message ---
+
+
+async def test_owner_post_opens_the_room_and_sets_opened_at(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    detail_before = (await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)).json()
+    assert detail_before["opened_at"] is None
+    assert detail_before["requires_owner_open"] is True
+
+    before = datetime.now(UTC)
+    opened = await _open_room(client, owner_headers, room["id"])
+    after = datetime.now(UTC)
+    assert opened["seq"] == 1
+
+    detail_after = (await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)).json()
+    assert detail_after["opened_at"] is not None
+    opened_at = datetime.fromisoformat(detail_after["opened_at"])
+    assert before <= opened_at <= after
+
+
+async def test_agent_post_rejected_before_open_carries_directive_message(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "let's begin"}, headers=machine_headers
+    )
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["error"]["code"] == "room_not_opened"
+    detail = body["error"]["detail"].lower()
+    # A directive to stop, not a bare/retryable rejection (ADR-0014 decision 2).
+    assert "has not posted" in detail
+    assert "do not begin" in detail
+    assert "not start on the topic" in detail
+    assert "stop and wait" in detail
+    assert "not a retryable error" in detail
+
+
+async def test_agent_post_accepted_after_owner_opens(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "let's begin"}, headers=machine_headers
+    )
+    assert resp.status_code == 200, resp.json()
+
+
+async def test_opt_out_lets_agents_start_immediately(client, db_session):
+    """ADR-0014 decision 4: turning `requires_owner_open` off before the
+    owner ever posts lets agents begin right away -- without pretending the
+    owner posted a message that never happened (`opened_at` stays null).
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    gate_resp = await client.post(
+        f"/v1/rooms/{room['id']}/open-gate", json={"required": False}, headers=owner_headers
+    )
+    assert gate_resp.status_code == 200, gate_resp.json()
+    gate_data = gate_resp.json()
+    assert gate_data["requires_owner_open"] is False
+    assert gate_data["opened_at"] is None
+    assert "may begin from the topic" in gate_data["announcement"]
+
+    post_resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "starting now"}, headers=machine_headers
+    )
+    assert post_resp.status_code == 200, post_resp.json()
+    assert post_resp.json()["seq"] == 2  # seq 1 is the toggle's own system announcement
+
+    detail = (await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)).json()
+    assert detail["opened_at"] is None  # the owner still never posted
+    assert detail["requires_owner_open"] is False
+
+
+async def test_opt_out_requires_owner_token(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/open-gate", json={"required": False}, headers=machine_headers
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "owner_token_required"
+
+
+async def test_mid_room_toggle_both_directions_post_system_messages(client, db_session):
+    """ADR-0014 decision 4, mirroring `set_agent_uploads_allowed`: flipping
+    the switch mid-room (after the room already opened normally) posts a
+    system announcement each time, in both directions, and never re-gates
+    agents already mid-conversation once toggled back on.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])  # seq 1 -- the room is genuinely open already
+
+    off_resp = await client.post(
+        f"/v1/rooms/{room['id']}/open-gate", json={"required": False}, headers=owner_headers
+    )
+    assert off_resp.status_code == 200, off_resp.json()
+    off_data = off_resp.json()
+    assert off_data["requires_owner_open"] is False
+    assert "turned off" in off_data["announcement"]
+
+    on_resp = await client.post(
+        f"/v1/rooms/{room['id']}/open-gate", json={"required": True}, headers=owner_headers
+    )
+    assert on_resp.status_code == 200, on_resp.json()
+    on_data = on_resp.json()
+    assert on_data["requires_owner_open"] is True
+    assert "now requires the owner" in on_data["announcement"]
+
+    detail = (await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)).json()
+    system_messages = [m for m in detail["messages"] if m["kind"] == "system"]
+    assert [m["text"] for m in system_messages] == [off_data["announcement"], on_data["announcement"]]
+
+    # Toggling back ON doesn't re-gate a room that already genuinely opened.
+    post_resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "still going"}, headers=machine_headers
+    )
+    assert post_resp.status_code == 200, post_resp.json()
+
+
+async def test_toggle_off_on_a_never_opened_room_resolves_pending_duration(client, db_session):
+    """ADR-0014 decisions 4/7: turning the requirement off on a room that
+    never received an owner message is itself decision 4's "treated as
+    opening it" case -- `opened_at` stays null (the owner never posted) but
+    a deferred `pending_duration_seconds` resolves into `expires_at` at the
+    toggle's own timestamp, not the owner's.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client, owner_headers, members=["agent-a", "agent-b"], duration_seconds=1800
+    )
+    assert room["expires_at"] is None
+
+    before = datetime.now(UTC)
+    gate_resp = await client.post(
+        f"/v1/rooms/{room['id']}/open-gate", json={"required": False}, headers=owner_headers
+    )
+    after = datetime.now(UTC)
+    assert gate_resp.status_code == 200, gate_resp.json()
+    gate_data = gate_resp.json()
+    assert gate_data["opened_at"] is None
+    assert gate_data["expires_at"] is not None
+    expires_at = datetime.fromisoformat(gate_data["expires_at"])
+    assert before + timedelta(seconds=1800) <= expires_at <= after + timedelta(seconds=1800)
+
+
+async def test_poll_returns_immediately_before_the_room_opens_and_does_not_block(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+
+    start = time.monotonic()
+    resp = await client.get(f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 20}, headers=machine_headers)
+    elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["messages"] == []
+    assert data["room_status"] == "open"
+    assert data["open_gate_notice"] is not None
+    assert elapsed < 1  # never entered the sleep loop, regardless of the 20s `wait` requested
+
+
+async def test_poll_on_deleted_room_returns_clear_stop_not_bare_404(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
+
+    delete_resp = await client.delete(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert delete_resp.status_code == 200
+
+    poll_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert poll_resp.status_code == 404
+    body = poll_resp.json()
+    assert body["error"]["code"] == "room_not_found"
+    detail = body["error"]["detail"].lower()
+    assert "gone" in detail
+    assert "stop polling" in detail
+
+
+async def test_park_ping_fires_once_under_repeated_polling(client, db_session, monkeypatch):
+    """ADR-0014 decision 8, and the ADR's rejected alternative "notify on
+    every poll cycle": four straight polls of a still-unopened room must
+    fire exactly ONE ntfy ping, not one per poll.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-room", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    for _ in range(4):
+        resp = await client.get(
+            f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+        )
+        assert resp.status_code == 200
+        assert resp.json()["open_gate_notice"] is not None
+
+    assert len(calls) == 1
+    _, title, body = calls[0]
+    assert title == "Brain room waiting: parked-room"
+    # The poll path carries no sender -- honestly names the room, not an agent.
+    assert "an agent" in body.lower()
+    assert "parked-room" in body
+
+
+async def test_park_ping_names_the_agent_when_triggered_by_a_rejected_post(client, db_session, monkeypatch):
+    """The other trigger (decision 8): post_message's rejection knows the
+    claimed sender and names it, unlike the poll trigger above.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-room-named", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 403
+
+    assert len(calls) == 1
+    _, _, body = calls[0]
+    assert "agent-a" in body
+
+
+async def test_park_ping_one_shot_across_both_poll_and_post_triggers(client, db_session, monkeypatch):
+    """Decision 8's one-shot guard is per-room, not per-trigger-kind: once
+    either trigger has fired, the other is a silent no-op.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-room-both", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    poll_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert poll_resp.status_code == 200
+
+    post_resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert post_resp.status_code == 403
+
+    assert len(calls) == 1  # the poll's ping already fired; the post's own trigger is a silent no-op
+
+
+async def test_park_ping_does_not_fire_for_a_non_member_sender(client, db_session, monkeypatch):
+    """Independent review finding: before the fix, the ping fired BEFORE the
+    membership check, so any bearer machine token could force a push by
+    naming an arbitrary, non-member `sender` -- it never had to actually be
+    one of this room's two members. `sender in await get_members(...)` now
+    gates the ping (app/rooms.py's `post_message`); the 403 rejection itself
+    is unchanged and still fires for a non-member exactly as it does for a
+    real member (ADR-0014 decision 1's own documented reasoning: a
+    non-member gets the same "wait for the owner" directive, not a
+    confusing `sender_not_room_member`).
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-room-nonmember", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages",
+        json={"sender": "not-a-member-at-all", "text": "hi"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "room_not_opened"
+
+    assert calls == []  # no ping -- the claimed sender is not a real member of this room
+
+
+async def test_park_ping_overlong_sender_is_rejected_before_it_ever_reaches_the_ping(client, db_session, monkeypatch):
+    """Independent review finding: `sender` had no `max_length`
+    (app/schemas.py's RoomPostMessageRequest). An arbitrarily long client-
+    supplied string reaching the ping/notification path is now stopped at
+    the API boundary -- pydantic's 422 fires before `post_message` (and
+    therefore before any ping) ever runs.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-room-overlong", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    overlong_sender = "agent-a" + "x" * 300  # well past the 255-char cap, still prefixed with a real member name
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages",
+        json={"sender": overlong_sender, "text": "hi"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 422
+
+    assert calls == []  # rejected before post_message (and the ping) ever ran
+
+
+async def test_park_ping_sanitises_newlines_and_control_characters_in_the_notified_name(
+    client, db_session, monkeypatch
+):
+    """Independent review finding: `agent_name` (the claimed `sender`) is
+    interpolated unescaped into the ntfy title/body (app/notify.py). A
+    member whose `agent_name` itself carries a newline/control character --
+    `app/rooms.py`'s `_validate_members` only trims leading/trailing
+    whitespace, it does not reject interior control characters -- must not
+    be able to forge structure (e.g. inject a fake extra line, or break the
+    ntfy `Title` HTTP header) in what the owner reads.
+    `_sanitize_agent_name_for_notification` (app/notify.py) strips every
+    Unicode Cc/Cf/Zl/Zp-category character and collapses whitespace before
+    the name is ever interpolated.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    hostile_name = "agent-a\r\nTitle: FAKE OWNER ALERT\r\n\ncall me at 555-0100 --agent-b"
+    room = await _create_room(
+        client, owner_headers, name="parked-room-hostile-name", members=[hostile_name, "agent-b"]
+    )
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": hostile_name, "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 403
+
+    assert len(calls) == 1
+    _, title, body = calls[0]
+    # No raw control character/newline survives into either the header
+    # value or the body -- the injected "\r\nTitle: ...\r\n\n" sequence is
+    # deleted outright (same technique app/room_export.py's
+    # `safe_filename_component` already uses for this same forbidden-
+    # category set), collapsing what would have been a forged second HTTP
+    # header / blank-line break into ordinary, contiguous, single-line text.
+    for forbidden in ("\r", "\n"):
+        assert forbidden not in title
+        assert forbidden not in body
+    assert "agent-aTitle: FAKE OWNER ALERTcall me at 555-0100 --agent-b" in body
+    assert "parked-room-hostile-name" in body
+
+
+async def test_park_ping_race_two_concurrent_triggers_send_exactly_one_ping(client, db_session, monkeypatch):
+    """Fix 3 (independent review): `_maybe_ping_owner_room_not_opened`
+    (app/rooms.py:488-535) looks atomic by inspection -- its own short-lived
+    session, `SELECT ... FOR UPDATE` + `populate_existing`, a re-check of
+    the full gate condition under the lock, then set-and-commit -- and the
+    sequential tests above (`test_park_ping_fires_once_under_repeated_polling`,
+    `test_park_ping_one_shot_across_both_poll_and_post_triggers`) only prove
+    correctness when one trigger completes before the next starts. Neither
+    proves the one-shot guard actually holds when two triggers are
+    GENUINELY concurrent, i.e. both already inside the function, one
+    blocked on the other's row lock.
+
+    This forces that race directly at the function under test rather than
+    through two HTTP requests (which can't be made to interleave on
+    demand): same `_delayed_commit_session` + `asyncio.gather` +
+    elapsed-time-assertion shape this file's other race tests already use
+    (`test_delete_message_race_...`, `test_concurrent_owner_posts_...`), but
+    since this function opens its OWN `AsyncSessionLocal()` internally
+    (it takes no `db` parameter -- see its own docstring's "CRITICAL"-style
+    reasoning for `poll_messages`' equivalent, and this function's "own
+    short-lived session" note), the delayed session is injected by
+    monkeypatching `app.rooms.AsyncSessionLocal` itself to hand out two
+    specific, pre-built sessions (one delayed-commit, one plain) in a fixed
+    order -- the first call gets the delayed one, the second gets the plain
+    one, mirroring exactly which call is the lock's first holder.
+    """
+    owner_headers = await _owner_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-room-race", members=["agent-a", "agent-b"])
+    room_row = await db_session.get(Room, room["id"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    winner_session = _delayed_commit_session(COMMIT_DELAY)
+    loser_session = AsyncSessionLocal()
+    sessions_in_call_order = [winner_session, loser_session]
+
+    def fake_session_local():
+        return sessions_in_call_order.pop(0)
+
+    monkeypatch.setattr(rooms_module, "AsyncSessionLocal", fake_session_local)
+
+    async def run_first():
+        # No head start: reaches `AsyncSessionLocal()` (and so acquires the
+        # row lock) first, then holds it for COMMIT_DELAY via the delayed
+        # commit -- same "winner goes first, unstarted" shape the other
+        # race tests use.
+        await maybe_ping_owner_room_not_opened_op(room_row, agent_name="agent-a")
+
+    async def run_second():
+        await asyncio.sleep(HEAD_START)
+        await maybe_ping_owner_room_not_opened_op(room_row, agent_name="agent-b")
+
+    start = time.monotonic()
+    await asyncio.gather(run_first(), run_second())
+    elapsed = time.monotonic() - start
+
+    # Genuine blocking, not decoupled timing luck: the second call could not
+    # have finished before the first released its row lock.
+    assert elapsed >= COMMIT_DELAY
+
+    # Exactly one ping, from the trigger that actually won the row lock --
+    # not one per trigger, regardless of how many arrive concurrently.
+    assert len(calls) == 1
+    _, _, body = calls[0]
+    assert "agent-a" in body
+    assert "agent-b" not in body
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room["id"])
+        assert final_room.owner_open_reminder_sent_at is not None
+
+
+async def test_concurrent_owner_posts_cannot_double_open_or_corrupt_state(client, db_session):
+    """ADR-0014 decisions 1/7 concurrency: two racing owner posts both land
+    as real messages (the owner may legitimately post twice), but only the
+    FIRST to acquire the room's row lock may open the room --
+    `opened_at`/`expires_at` must reflect that one winner only, never a
+    double-open or a second, later resolution of `pending_duration_seconds`
+    that would silently push the deadline out further.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], duration_seconds=1800)
+    room_id = room["id"]
+    assert room["expires_at"] is None
+
+    winner_session = _delayed_commit_session(COMMIT_DELAY)
+    loser_session = AsyncSessionLocal()
+
+    async def run_first():
+        async with winner_session:
+            return await post_message_op(
+                winner_session, room_id, "owner", "first", "message", principal=_RACE_OWNER_PRINCIPAL
+            )
+
+    async def run_second():
+        await asyncio.sleep(HEAD_START)
+        async with loser_session:
+            return await post_message_op(
+                loser_session, room_id, "owner", "second", "message", principal=_RACE_OWNER_PRINCIPAL
+            )
+
+    before = datetime.now(UTC)
+    start = time.monotonic()
+    first_result, second_result = await asyncio.gather(run_first(), run_second())
+    elapsed = time.monotonic() - start
+    after = datetime.now(UTC)
+
+    # Genuine blocking, not decoupled timing luck: the loser could not have
+    # finished before the winner released the lock.
+    assert elapsed >= COMMIT_DELAY
+
+    first_message, first_room_after = first_result
+    second_message, second_room_after = second_result
+    assert first_message.seq == 1
+    assert second_message.seq == 2
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room_id)
+        assert final_room.message_count == 2
+
+        assert final_room.opened_at is not None
+        final_opened_at = final_room.opened_at
+        if final_opened_at.tzinfo is None:
+            final_opened_at = final_opened_at.replace(tzinfo=UTC)
+        assert before <= final_opened_at <= after
+
+        # Resolved exactly once, from the WINNER's timestamp -- never
+        # re-resolved (and never pushed later) by the second post.
+        assert final_room.pending_duration_seconds is None
+        assert final_room.expires_at is not None
+        final_expires_at = final_room.expires_at
+        if final_expires_at.tzinfo is None:
+            final_expires_at = final_expires_at.replace(tzinfo=UTC)
+        expected = final_opened_at + timedelta(seconds=1800)
+        assert abs((final_expires_at - expected).total_seconds()) < 1
+
+    # Both posts genuinely landed and both observed the room as open
+    # throughout -- no corruption, no spurious close.
+    assert first_room_after.status == "open"
+    assert second_room_after.status == "open"
+
+
+# --- ADR-0015: deleting individual messages ---
+
+
+async def test_delete_message_overwrites_text_and_leaves_everything_else_intact(client, db_session):
+    """The crux of the ADR: `text` is genuinely overwritten in the database
+    row (not just hidden behind a flag), while id/seq/sender/kind/created_at
+    survive unchanged.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)
+
+    secret = "sk-super-secret-token-should-not-persist-12345"
+    posted = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": secret}, headers=machine_headers
+    )
+    assert posted.status_code == 200, posted.json()
+    message_id = posted.json()["id"]
+    original_seq = posted.json()["seq"]
+
+    resp = await client.delete(f"/v1/rooms/{room_id}/messages/{message_id}", headers=owner_headers)
+    assert resp.status_code == 200, resp.json()
+    body = resp.json()
+    assert body["id"] == message_id
+    assert body["seq"] == original_seq
+    assert body["deleted"] is True
+    assert body["deleted_at"] is not None
+
+    row = await db_session.get(RoomMessage, message_id)
+    assert row.text == "[message deleted by owner]"
+    assert row.deleted_at is not None
+    assert row.seq == original_seq
+    assert row.sender == "agent-a"
+    assert row.kind == "message"
+    assert row.room_id == room_id
+
+    # No copy of the secret lingers anywhere in the row -- every string
+    # column, not just `text`.
+    for column in RoomMessage.__table__.columns:
+        value = getattr(row, column.name)
+        if isinstance(value, str):
+            assert secret not in value
+
+
+async def test_delete_message_owner_only_machine_token_forbidden(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)
+    posted = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "keep me intact"}, headers=machine_headers
+    )
+    message_id = posted.json()["id"]
+
+    resp = await client.delete(f"/v1/rooms/{room_id}/messages/{message_id}", headers=machine_headers)
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "owner_token_required"
+
+    row = await db_session.get(RoomMessage, message_id)
+    assert row.text == "keep me intact"
+    assert row.deleted_at is None
+
+
+async def test_delete_message_ui_route_machine_token_cannot_reach_it(client, db_session):
+    """Confirms there is no machine-token path through the UI surface
+    either -- app/ui_auth.py's require_ui_session never accepts a bearer
+    token at all (cookie-only), so a machine token here just gets the same
+    redirect-to-login every other UI route gives it.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)
+    posted = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "still here"}, headers=machine_headers
+    )
+    message_id = posted.json()["id"]
+
+    resp = await client.post(
+        f"/ui/rooms/{room_id}/messages/{message_id}/delete", headers=machine_headers, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+    row = await db_session.get(RoomMessage, message_id)
+    assert row.text == "still here"
+    assert row.deleted_at is None
+
+
+async def test_delete_message_unknown_message_is_clean_404(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+
+    resp = await client.delete(f"/v1/rooms/{room['id']}/messages/not-a-real-message-id", headers=owner_headers)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "room_message_not_found"
+
+
+async def test_delete_message_unknown_room_is_clean_404(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.delete("/v1/rooms/not-a-real-room/messages/not-a-real-message-id", headers=owner_headers)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "room_not_found"
+
+
+async def test_delete_message_idempotent_repeat_delete_does_not_double_decrement(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, max_messages=10)
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)  # message_count == 1
+    posted = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "x"}, headers=machine_headers
+    )
+    message_id = posted.json()["id"]  # message_count == 2
+
+    first = await client.delete(f"/v1/rooms/{room_id}/messages/{message_id}", headers=owner_headers)
+    assert first.status_code == 200, first.json()
+    assert first.json()["message_count"] == 1
+
+    second = await client.delete(f"/v1/rooms/{room_id}/messages/{message_id}", headers=owner_headers)
+    assert second.status_code == 200, second.json()
+    assert second.json()["message_count"] == 1  # unchanged -- not decremented a second time
+    assert second.json()["deleted_at"] == first.json()["deleted_at"]
+
+
+async def test_delete_message_frees_cap_slot_and_lets_room_outlive_its_nominal_cap(client, db_session):
+    """ADR-0015 decision 3's own worked example: delete one message before
+    the cap trips, and the room accepts one more real message than
+    `max_messages` would otherwise have allowed.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, max_messages=3)
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)  # seq 1, count 1, open (1 < 3)
+
+    msg2 = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "will be deleted"}, headers=machine_headers
+    )
+    assert msg2.status_code == 200, msg2.json()
+    assert msg2.json()["room_status"] == "open"  # count 2, 2 < 3
+    message_id = msg2.json()["id"]
+
+    del_resp = await client.delete(f"/v1/rooms/{room_id}/messages/{message_id}", headers=owner_headers)
+    assert del_resp.status_code == 200, del_resp.json()
+    assert del_resp.json()["message_count"] == 1
+
+    detail = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail["message_count"] == 1
+    assert detail["status"] == "open"  # never closed/reopened by the delete
+
+    msg3 = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "third, real"}, headers=machine_headers
+    )
+    assert msg3.status_code == 200, msg3.json()
+    assert msg3.json()["room_status"] == "open"  # count 2, 2 < 3
+
+    # A 4th real message -- more than max_messages=3 would ordinarily allow
+    # -- still gets in, because the deleted one freed a slot; this is the
+    # one that finally trips the cap.
+    msg4 = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-b", "text": "fourth, trips the cap"}, headers=machine_headers
+    )
+    assert msg4.status_code == 200, msg4.json()
+    assert msg4.json()["room_status"] == "closed"
+    assert msg4.json()["close_reason"] == "cap"
+
+
+async def test_delete_message_on_closed_room_works_but_never_reopens_it(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, max_messages=2)
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)  # count 1, open
+    msg2 = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "closes the room"}, headers=machine_headers
+    )
+    assert msg2.json()["room_status"] == "closed"
+    assert msg2.json()["close_reason"] == "cap"
+    message_id = msg2.json()["id"]
+
+    del_resp = await client.delete(f"/v1/rooms/{room_id}/messages/{message_id}", headers=owner_headers)
+    assert del_resp.status_code == 200, del_resp.json()
+    assert del_resp.json()["message_count"] == 1  # decremented even though the room is closed
+
+    detail = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail["status"] == "closed"  # NOT reopened
+    assert detail["close_reason"] == "cap"
+    assert detail["message_count"] == 1
+
+    # Still closed to new posts -- deletion is housekeeping, not resurrection.
+    post_after = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "too late"}, headers=machine_headers
+    )
+    assert post_after.status_code == 409
+    assert post_after.json()["error"]["code"] == "room_closed"
+
+
+async def test_delete_owner_opening_message_leaves_room_open_gate_intact(client, db_session):
+    """ADR-0014's `opened_at` records a FACT (the owner posted once), not a
+    live count -- deleting the very message that opened the room must not
+    un-open it or re-trip the owner-open gate for agents.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    room_id = room["id"]
+    opened = await _open_room(client, owner_headers, room_id)
+    message_id = opened["id"]
+
+    detail_before = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail_before["opened_at"] is not None
+    opened_at_before = detail_before["opened_at"]
+    assert detail_before["requires_owner_open"] is True
+
+    del_resp = await client.delete(f"/v1/rooms/{room_id}/messages/{message_id}", headers=owner_headers)
+    assert del_resp.status_code == 200, del_resp.json()
+
+    detail_after = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail_after["opened_at"] == opened_at_before  # untouched -- never re-nulled
+    assert detail_after["status"] == "open"
+    assert detail_after["requires_owner_open"] is True
+
+    # The gate is still satisfied -- an agent can still post.
+    post_resp = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": "agent-a", "text": "still allowed"}, headers=machine_headers
+    )
+    assert post_resp.status_code == 200, post_resp.json()
+
+
+async def test_delete_message_race_concurrent_deletes_of_same_message_never_double_decrement(client, db_session):
+    """Same forced-interleaving technique as this file's other row-lock
+    race tests (_delayed_commit_session + asyncio.gather): two genuinely
+    concurrent deletes of the SAME message must serialize on the room's row
+    lock, so exactly one decrement happens, never two -- and the counter
+    never goes negative (ADR-0015 decision 8).
+    """
+    owner_headers = await _owner_headers(db_session)
+
+    for _ in range(RACE_TRIALS):
+        room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], max_messages=10)
+        room_id = room["id"]
+        await _open_room_direct(room_id)  # count 1
+
+        async with AsyncSessionLocal() as setup_session:
+            target_message, _room = await post_message_op(
+                setup_session, room_id, "agent-a", "delete me twice", "message", principal=_RACE_MACHINE_PRINCIPAL
+            )
+            message_id = target_message.id  # count 2
+
+        winner_session = _delayed_commit_session(COMMIT_DELAY)
+        loser_session = AsyncSessionLocal()
+
+        async def run_delete_a():
+            async with winner_session:
+                return await delete_message_op(winner_session, room_id, message_id)
+
+        async def run_delete_b():
+            await asyncio.sleep(HEAD_START)
+            async with loser_session:
+                return await delete_message_op(loser_session, room_id, message_id)
+
+        start = time.monotonic()
+        result_a, result_b = await asyncio.gather(run_delete_a(), run_delete_b())
+        elapsed = time.monotonic() - start
+
+        # Genuine blocking, not decoupled timing luck.
+        assert elapsed >= COMMIT_DELAY
+
+        message_a, _room_a = result_a
+        message_b, _room_b = result_b
+        assert message_a.deleted_at is not None
+        # The loser observed the winner's already-committed tombstone
+        # (re-read fresh under the lock), not a stale pre-lock snapshot.
+        assert message_b.deleted_at == message_a.deleted_at
+
+        async with AsyncSessionLocal() as check_session:
+            room_row = await check_session.get(Room, room_id)
+            # Exactly one decrement from the two starting posts (count 2),
+            # never two -- and never negative.
+            assert room_row.message_count == 1
+            assert room_row.message_count >= 0
+
+            message_row = await check_session.get(RoomMessage, message_id)
+            assert message_row.text == "[message deleted by owner]"

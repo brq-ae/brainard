@@ -46,6 +46,13 @@ always states decision 13's cleanup doctrine (delete local copies when
 done; Brain-saved files are always re-fetchable, scratch files die with the
 room). The API's own 403 (`app/attachments.py`'s `agent_uploads_disabled`)
 remains a backstop -- reaching it means this briefing failed.
+
+ADR-0014 (decision 2) further extends `generate_room_join_prompt` with the
+owner-open-gate paragraph (`_room_open_gate_policy_block`), inserted right
+after `intro` -- AHEAD OF EVEN the file-policy block above, becoming the
+first thing a joining agent reads: it governs whether the agent may act on
+anything else in the prompt yet. A compliant agent that reads it should
+never reach `post_message`'s `room_not_opened` 403 backstop.
 """
 
 from datetime import UTC, datetime
@@ -244,6 +251,44 @@ def _format_max_file_size(max_file_bytes: int) -> str:
     return f"{max_file_bytes // (1024 * 1024)} MB"
 
 
+def _room_open_gate_policy_block(*, requires_owner_open: bool, opened_at: datetime | None) -> str:
+    """ADR-0014 decision 2's owner-open-gate paragraph -- placed immediately
+    after `intro` and AHEAD of even `_room_attachments_policy_block` (see
+    `generate_room_join_prompt` below): it governs whether anything else in
+    the prompt may be acted on yet, so it's the first thing a joining agent
+    reads. Same imperative-directive register `_agent_uploads_announcement`'s
+    "disabled" branch already uses (STOP, don't start, wait) -- decision 2's
+    own wording discipline, following ADR-0012 decision 9's "agents are
+    briefed, not just refused": a compliant agent should never reach the
+    403 backstop (app/rooms.py's `post_message`, code `room_not_opened`) at
+    all.
+
+    Three states, not two, since a join prompt is generated fresh against
+    the room's CURRENT state (unlike the static paragraph text ADR-0014
+    quotes, which only covers the two the ADR's return contract cares
+    about): the requirement is off (agents may begin from the topic); it's
+    on and the owner hasn't posted yet (wait); or it's on and the owner
+    already has (state it plainly so the agent doesn't wait needlessly).
+    """
+    if not requires_owner_open:
+        return (
+            "This room does not require the owner to post before agents begin (the owner has turned that "
+            "requirement off for this room): you may begin from the topic now, without waiting for a message "
+            "from 'owner'."
+        )
+    if opened_at is None:
+        return (
+            "This room requires the owner to post before agents may speak. The owner has not posted in this "
+            "room yet. Do not begin, do not start on the topic -- treat the rest of this prompt as background, "
+            "not a starting gun. Poll and wait; you'll be told when to begin once the owner posts (or this "
+            "requirement is turned off)."
+        )
+    return (
+        "This room requires the owner to post before agents may speak, and the owner already has -- proceed "
+        "with the rest of this prompt."
+    )
+
+
 def _room_attachments_policy_block(
     *,
     base_url: str,
@@ -312,6 +357,8 @@ def generate_room_join_prompt(
     deadline: datetime | None = None,
     agent_uploads_allowed: bool = True,
     attachments: list[RoomAttachmentView] | None = None,
+    requires_owner_open: bool = True,
+    opened_at: datetime | None = None,
 ) -> str:
     """Builds the full room-join prompt (ADR-0006, phase C, decision 7): the
     complete copy-paste prompt that drops an agent into a room's long-poll
@@ -347,6 +394,16 @@ def generate_room_join_prompt(
     are briefed, not just refused"). Defaults (`True`, `None`) match a
     freshly created room's default (agent uploads allowed, no attachments
     yet) for callers that don't have a `Room`/attachment list in hand.
+
+    ADR-0014 decision 2: `requires_owner_open`/`opened_at` (the room's
+    current `Room.requires_owner_open`/`Room.opened_at`) drive
+    `_room_open_gate_policy_block`, inserted right after `intro` and AHEAD OF
+    EVEN the file-policy block above -- this is now the very first thing a
+    joining agent reads, since it governs whether anything else in the
+    prompt (including the file policy) may be acted on yet. Defaults (`True`,
+    `None`) match a freshly created room's real defaults (gate on, not yet
+    opened), the same posture ADR-0012's own additions to this function
+    already took for their own defaults.
     """
     base = base_url.rstrip("/")
 
@@ -390,6 +447,8 @@ def generate_room_join_prompt(
 
     keep_me_informed = "Keep me informed per G9 (notify me when you're blocked or when the room work is done)."
 
+    open_gate_block = _room_open_gate_policy_block(requires_owner_open=requires_owner_open, opened_at=opened_at)
+
     file_policy_block = _room_attachments_policy_block(
         base_url=base,
         room_id=room_id,
@@ -399,10 +458,10 @@ def generate_room_join_prompt(
     )
 
     session_block = _room_session_block(mode, topic, side, partner_name, deadline)
-    # File policy is placed right after intro, ahead of even the session
-    # block -- decision 9 requires the agent to know it BEFORE it does
-    # anything else, so it never generates or plans a file it can't attach.
-    paragraphs = [intro, file_policy_block]
+    # ADR-0014 decision 2: the open-gate paragraph is placed right after
+    # intro, AHEAD OF EVEN the file policy block -- it governs whether
+    # anything else here (including the file policy) may be acted on yet.
+    paragraphs = [intro, open_gate_block, file_policy_block]
     if session_block is not None:
         paragraphs.append(session_block)
     paragraphs.extend([how_to, keep_me_informed, _MODE_SWITCH_PRIMING])
