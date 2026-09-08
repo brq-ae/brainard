@@ -307,11 +307,14 @@ def _room_attachments_policy_block(
 
     if agent_uploads_allowed:
         policy = (
-            f"Files: ON in this room. You may attach a PDF: POST {base_url}/v1/rooms/{room_id}/attachments"
-            f"?filename=<name>&sender={agent_name} with the raw file bytes as the body and the same "
-            "Authorization header (only the file's actual leading bytes are checked -- '%PDF-' -- never the "
-            f"filename or the Content-Type header, and only PDF is accepted). Current caps: max {max_size} "
-            f"per file, {settings.attachment_max_files_per_room} files in this room."
+            f"Files: ON in this room. You may attach a PDF or a Markdown (.md) file -- nothing else is "
+            f"accepted: POST {base_url}/v1/rooms/{room_id}/attachments?filename=<name>&sender={agent_name} "
+            "with the raw file bytes as the body and the same Authorization header. Type is decided from the "
+            "actual content, never the filename or the Content-Type header: a PDF is recognized by its "
+            "leading bytes ('%PDF-'); a Markdown file is recognized by being valid UTF-8 text with no "
+            "disallowed control characters (a much weaker check than PDF's -- see the room's file list for "
+            f"what actually got stored). Current caps: max {max_size} per file, "
+            f"{settings.attachment_max_files_per_room} files in this room."
         )
     else:
         policy = (

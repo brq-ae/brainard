@@ -158,11 +158,13 @@ def test_room_join_prompt_verbatim_structure():
         "room yet. Do not begin, do not start on the topic -- treat the rest of this prompt as background, "
         "not a starting gun. Poll and wait; you'll be told when to begin once the owner posts (or this "
         "requirement is turned off).\n\n"
-        "Files: ON in this room. You may attach a PDF: POST https://brain.example.com/v1/rooms/01ROOM123"
-        "/attachments?filename=<name>&sender=Builder-A with the raw file bytes as the body and the same "
-        "Authorization header (only the file's actual leading bytes are checked -- '%PDF-' -- never the "
-        "filename or the Content-Type header, and only PDF is accepted). Current caps: max 10 MB per file, "
-        "10 files in this room.\n\n"
+        "Files: ON in this room. You may attach a PDF or a Markdown (.md) file -- nothing else is accepted: "
+        "POST https://brain.example.com/v1/rooms/01ROOM123/attachments?filename=<name>&sender=Builder-A "
+        "with the raw file bytes as the body and the same Authorization header. Type is decided from the "
+        "actual content, never the filename or the Content-Type header: a PDF is recognized by its leading "
+        "bytes ('%PDF-'); a Markdown file is recognized by being valid UTF-8 text with no disallowed control "
+        "characters (a much weaker check than PDF's -- see the room's file list for what actually got "
+        "stored). Current caps: max 10 MB per file, 10 files in this room.\n\n"
         "Either way, you may attach a document already saved in the Brain without creating a new file (this "
         "creates no new bytes, so it works even while uploads are off): POST "
         "https://brain.example.com/v1/rooms/01ROOM123/attach-from-brain with the same header and JSON body "
@@ -411,9 +413,9 @@ def _attachment_view(
 def test_room_join_prompt_files_allowed_states_policy_and_how_to_attach():
     text = _join_prompt(agent_uploads_allowed=True)
     assert "Files: ON in this room" in text
-    assert "You may attach a PDF" in text
+    assert "You may attach a PDF or a Markdown (.md) file" in text
     assert "POST https://brain.example.com/v1/rooms/01ROOM123/attachments?filename=<name>&sender=Builder-A" in text
-    assert "only PDF is accepted" in text
+    assert "nothing else is accepted" in text
     assert "Current caps: max 10 MB per file, 10 files in this room." in text
     # The disabled-state directive must NOT appear when uploads are allowed.
     assert "Do not generate a document to attach" not in text
@@ -449,7 +451,7 @@ def test_room_join_prompt_files_disabled_states_do_not_generate_directive():
     assert "do not plan around attaching one" in text
     assert "put the content directly in a room message instead" in text
     # It must NOT still invite the agent to upload.
-    assert "you may attach a PDF: POST" not in text
+    assert "You may attach a PDF or a Markdown (.md) file" not in text
 
 
 def test_room_join_prompt_disabled_still_states_brain_attach_exception():

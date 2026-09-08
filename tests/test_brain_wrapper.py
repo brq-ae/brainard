@@ -47,6 +47,7 @@ import pytest
 WRAPPER = Path(__file__).resolve().parent.parent / "scripts" / "brain-wrapper.sh"
 
 PDF_BODY = b"%PDF-1.4\n" + b"A" * 500 + b"\n%%EOF"
+MD_BODY = b"# Some Markdown\n\nplain text content, deliberately not PDF-shaped.\n"
 
 BAD_ROOM_IDS = [
     "..",
@@ -80,6 +81,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _route(self, token):
         if token == "okplain":
             self._send_ok(PDF_BODY)
+            return
+
+        if token == "okmd":
+            self._send_ok(MD_BODY, content_type="text/markdown")
             return
 
         if token.startswith("hostile"):
@@ -155,9 +160,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
-    def _send_ok(self, body: bytes) -> None:
+    def _send_ok(self, body: bytes, content_type: str = "application/pdf") -> None:
         self.send_response(200)
-        self.send_header("Content-Type", "application/pdf")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -272,6 +277,77 @@ def test_fetch_writes_file_at_expected_path_inside_room_dir(wrapper_env):
 
     base = Path(wrapper_env["BRAINARD_ATTACHMENTS_DIR"])
     assert [p.name for p in base.iterdir()] == [room]  # no stray entries at the base level
+
+
+# --- ADR-0016: two accepted extensions now, not one -- the sanitizer must
+# preserve either of them from the caller-supplied display name, and still
+# refuse to let an arbitrary attacker-chosen extension survive. ---
+
+
+def test_fetch_preserves_md_extension_in_display_filename(wrapper_env):
+    room = "mdextroom"
+    result = _run("fetch", room, "okplain", "notes.md", env=wrapper_env)
+    expected = _room_dir(wrapper_env, room) / "notes.md"
+
+    assert result.returncode == 0, result.stderr
+    assert expected.is_file()
+    # Never double-suffixed to "notes.md.pdf" -- .md is now a recognized,
+    # preserved extension, not just an unrecognized one falling back to pdf.
+    assert not (_room_dir(wrapper_env, room) / "notes.md.pdf").exists()
+
+
+def test_fetch_preserves_md_extension_case_insensitively(wrapper_env):
+    room = "mdextroomcase"
+    result = _run("fetch", room, "okplain", "NOTES.MD", env=wrapper_env)
+    assert result.returncode == 0, result.stderr
+    found = list(_room_dir(wrapper_env, room).glob("*"))
+    assert len(found) == 1
+    assert found[0].name.lower() == "notes.md"
+
+
+def test_fetch_forces_pdf_extension_for_an_arbitrary_unrecognized_extension(wrapper_env):
+    """Neither of the two accepted extensions -- an attacker-chosen (or
+    just mistaken) `.exe` must not survive as-is; the sanitizer still
+    constrains to the fixed two-item allowlist, defaulting to .pdf, exactly
+    as it always defaulted to .pdf for anything unrecognized before
+    ADR-0016 widened the allowlist from one item to two.
+    """
+    room = "arbitraryextroom"
+    result = _run("fetch", room, "okplain", "payload.exe", env=wrapper_env)
+    assert result.returncode == 0, result.stderr
+    found = list(_room_dir(wrapper_env, room).glob("*"))
+    assert len(found) == 1
+    assert found[0].name == "payload.exe.pdf"
+
+
+# --- omitted display filename: the previously-untested default-name path.
+# Every test above passes an explicit filename; these cover the documented
+# short form `fetch <room-id> <attachment-id>` with none. The default must
+# get its extension from the DOWNLOADED BYTES' own leading magic bytes
+# (mirroring the server's own '%PDF-' classification check), never
+# hardcoded to ".pdf" -- that was the bug: a Markdown attachment fetched
+# with no display name used to land on disk named "<id>.pdf" (correct
+# bytes, wrong label, no warning). ---
+
+
+def test_fetch_omitted_filename_defaults_to_pdf_extension_for_pdf_bytes(wrapper_env):
+    room = "omittedpdfroom"
+    result = _run("fetch", room, "okplain", env=wrapper_env)
+    assert result.returncode == 0, result.stderr
+    found = list(_room_dir(wrapper_env, room).glob("*"))
+    assert len(found) == 1
+    assert found[0].name == "okplain.pdf"
+    assert found[0].read_bytes() == PDF_BODY
+
+
+def test_fetch_omitted_filename_defaults_to_md_extension_for_markdown_bytes(wrapper_env):
+    room = "omittedmdroom"
+    result = _run("fetch", room, "okmd", env=wrapper_env)
+    assert result.returncode == 0, result.stderr
+    found = list(_room_dir(wrapper_env, room).glob("*"))
+    assert len(found) == 1
+    assert found[0].name == "okmd.md"
+    assert found[0].read_bytes() == MD_BODY
 
 
 # --- 3. hostile Content-Disposition is never read, so it can never place a

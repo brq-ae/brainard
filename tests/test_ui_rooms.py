@@ -1978,6 +1978,28 @@ async def test_ui_download_attachment_headers(client, db_session):
     assert resp.headers["content-disposition"] == 'attachment; filename="ui-report.pdf"'
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert resp.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert resp.headers["content-type"].startswith("application/pdf")
+    assert resp.content == payload
+
+
+async def test_ui_download_md_attachment_headers_and_media_type(client, db_session):
+    """ADR-0016: the owner-UI download endpoint (app/routers/ui_rooms.py's
+    `room_download_attachment`, separate code path from the v1 API's) must
+    apply the identical header discipline AND report the correct
+    Content-Type for a Markdown attachment, not the PDF-hardcoded type it
+    used before this ADR.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="ui-download-md-room")
+    payload = b"# UI markdown download\n\nSome body text.\n"
+    uploaded = await _api_upload(client, owner_headers, room["id"], filename="ui-notes.md", content=payload)
+
+    resp = await client.get(f"/ui/rooms/{room['id']}/attachments/{uploaded['id']}/download")
+    assert resp.status_code == 200
+    assert resp.headers["content-disposition"] == 'attachment; filename="ui-notes.md"'
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert resp.headers["content-type"].startswith("text/markdown")
     assert resp.content == payload
 
 

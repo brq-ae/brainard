@@ -39,9 +39,25 @@ Three ADR-0012 decisions shape almost everything below:
     acceptance, sanitized text (via app/room_export.py's
     `safe_filename_component`) decides what gets displayed, and neither
     ever influences the storage path.
+
+    ADR-0016 extends this, not replaces it: two formats are now accepted
+    (PDF and Markdown, `.md`) and BOTH are decided by content alone, never
+    by filename or Content-Type. PDF keeps its unchanged magic-byte check.
+    Markdown has no signature -- ADR-0016 decision 2's replacement is
+    "decodes as valid UTF-8 and contains no control character outside a
+    small whitespace allowlist" (`MARKDOWN_ALLOWED_CONTROL_CHARS` below), a
+    weaker guarantee ("this is text", not "this is Markdown") that is safe
+    only because ADR-0012 decision 14's serving posture (download-only,
+    `nosniff`, restrictive CSP) is unchanged and does the real work of
+    keeping anything that slips through from ever executing in the owner's
+    browser. `receive_attachment_upload` is where the two checks live and
+    where the dispatch between them happens -- see its docstring for
+    exactly how a caller's `.md`-vs-`.pdf` claim is prevented from ever
+    influencing which validator runs.
 """
 
 import asyncio
+import codecs
 import hashlib
 import os
 import re
@@ -75,9 +91,58 @@ from app.room_export import safe_filename_component
 from app.routers.deposits import create_deposit as apply_deposit
 from app.schemas import DepositRequest
 
-# Only these leading bytes are ever accepted (ADR-0012 decision 16) --
-# never the filename extension, never the client's Content-Type header.
+# Only these leading bytes are ever accepted as PDF (ADR-0012 decision 16)
+# -- never the filename extension, never the client's Content-Type header.
 PDF_MAGIC = b"%PDF-"
+
+# The two accepted attachment formats (ADR-0012 decision 1, extended by
+# ADR-0016 decision 1 -- "PDF plus Markdown, nothing else"), and the order
+# `blob_path` probes them in when resolving an EXISTING blob from its hash
+# alone (see `blob_path` below): PDF first, because every blob written
+# before ADR-0016 shipped is a `.pdf` file, and probing existence order
+# never matters for hashes that only ever have one real match on disk --
+# it only matters for choosing a default when caller passes no format,
+# which correctly never happens for a NEW blob (see `blob_path`'s
+# docstring: creating one always passes `fmt=` explicitly).
+ATTACHMENT_FORMATS = ("pdf", "md")
+
+# The Content-Type served on download, keyed by the SAME suffix
+# `blob_path` resolves from disk -- never from the display filename or any
+# client claim (ADR-0016 downstream checklist: app/routers/room_attachments
+# .py and app/routers/ui_rooms.py's download endpoints both hardcoded
+# `application/pdf` before this ADR).
+ATTACHMENT_MEDIA_TYPES = {
+    "pdf": "application/pdf",
+    "md": "text/markdown; charset=utf-8",
+}
+
+# ADR-0016 decision 2: the ONLY control characters an accepted Markdown
+# upload may contain -- tab, LF, CR (0x09, 0x0A, 0x0D), the whitespace and
+# line-structure characters ordinary prose and Markdown legitimately use.
+# Every other C0 control character (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F,
+# 0x7F -- NUL included) and every C1 control character (U+0080-U+009F) is
+# rejected. This allowlist is checked against DECODED Unicode text, not raw
+# bytes: the C1 range is only ever representable in UTF-8 as a two-byte
+# sequence (0xC2 0x80 .. 0xC2 0x9F) -- its bytes are never themselves in
+# the 0x80-0x9F range -- so a raw-byte scan could never see it; only a
+# UTF-8-aware check, run on the decoded characters, can.
+MARKDOWN_ALLOWED_CONTROL_CHARS = frozenset({"\t", "\n", "\r"})
+
+
+def _first_disallowed_control_char(text: str) -> str | None:
+    """The first character in `text` that is a control character (C0 or
+    C1) outside `MARKDOWN_ALLOWED_CONTROL_CHARS`, or None if `text`
+    contains no such character. `text` must already be decoded Unicode
+    (see the module-level note above on why C1 can't be checked on raw
+    bytes).
+    """
+    for ch in text:
+        if ch in MARKDOWN_ALLOWED_CONTROL_CHARS:
+            continue
+        cp = ord(ch)
+        if cp <= 0x1F or cp == 0x7F or 0x80 <= cp <= 0x9F:
+            return ch
+    return None
 
 # A sha256 hex digest is always exactly 64 lowercase hex characters.
 # `blob_path` refuses anything else, which is what makes "the path comes
@@ -99,7 +164,15 @@ STATS_SINGLETON_ID = "singleton"
 # "rollback and redo the whole locked attempt" shape, not a new pattern.
 MAX_ATTACHMENT_ATTEMPTS = 3
 
-_ATTACHMENT_FILENAME_FALLBACK = "attachment.pdf"
+# Format-aware fallback display names, used when sanitizing a caller-supplied
+# filename produces an empty string (app/room_export.py's
+# safe_filename_component's own fallback posture). ADR-0016 downstream
+# checklist: a Markdown upload with an unsanitizable name must not fall
+# back to a name claiming ".pdf", and vice versa.
+_ATTACHMENT_FILENAME_FALLBACK = {
+    "pdf": "attachment.pdf",
+    "md": "attachment.md",
+}
 
 # --- Fix 2 (independent review): the free-disk floor made atomic across
 # concurrent uploads ---
@@ -168,17 +241,74 @@ async def _release_upload_budget(amount: int) -> None:
         _reserved_bytes = max(0, _reserved_bytes - amount)
 
 
-def blob_path(storage_dir: str | Path, sha256_hex: str) -> Path:
+def blob_path(storage_dir: str | Path, sha256_hex: str, *, fmt: str | None = None) -> Path:
     """The on-disk path for a blob -- derived from the validated hex hash
-    ONLY. Never accepts, and never even looks at, a filename. Raises
-    ValueError (a programming-error signal, not a user-facing rejection --
-    every caller in this module only ever passes a hash it just computed or
-    read back from the DB) if given anything that isn't exactly 64 lowercase
-    hex characters.
+    ONLY, plus (see below) a format suffix. Never accepts, and never even
+    looks at, a filename. Raises ValueError (a programming-error signal,
+    not a user-facing rejection -- every caller in this module only ever
+    passes a hash it just computed or read back from the DB) if given
+    anything that isn't exactly 64 lowercase hex characters, or an unknown
+    `fmt`.
+
+    Two modes (ADR-0016 -- before this ADR, every blob was unconditionally
+    `f"{sha256_hex}.pdf"`, and every blob written before this ADR shipped
+    is STILL exactly that on disk; this function's job is to keep resolving
+    those existing files correctly while also supporting a second format,
+    without a migration and without ever renaming anything already on
+    disk):
+
+      - `fmt` given explicitly (the WRITE path -- `_get_or_create_blob`
+        calls this with the format `receive_attachment_upload` just
+        validated): returns `f"{sha256_hex}.{fmt}"` directly, no I/O. This
+        is the only path that ever DECIDES a new blob's suffix, and it
+        always does so from a format that was just validated from content,
+        never guessed.
+
+      - `fmt` omitted (every READ path -- download, sweep/reclaim,
+        looking up an existing blob): PROBES the filesystem for
+        `f"{sha256_hex}.{f}"` for each `f` in `ATTACHMENT_FORMATS` (pdf
+        first) and returns whichever exists. Content-addressing guarantees
+        at most one can ever exist for a given hash (the hash IS the
+        content's identity), so this never has to choose between two real
+        files -- it just finds the one real file without needing a DB
+        column to remember which suffix it got, which is what lets this
+        ADR ship with no migration. If neither exists yet (the blob hasn't
+        been written, or a caller is checking non-existence after a
+        rejected upload), defaults to `.pdf` -- this function's exact
+        pre-ADR-0016 behavior, preserved so a caller checking "does
+        anything exist at this hash yet" via the 2-argument call never
+        needs to change.
+
+    This dual mode is what proves a pre-existing `{sha256}.pdf` blob from
+    before this ADR is still found: nothing about it ever changed name or
+    location, and the no-`fmt` probe finds it exactly the same way it
+    always did (`.pdf` was already first in probe order, and remains the
+    only file that exists at that hash).
     """
     if not _HEX64_RE.match(sha256_hex):
         raise ValueError(f"not a valid sha256 hex digest: {sha256_hex!r}")
-    return Path(storage_dir) / f"{sha256_hex}.pdf"
+    base = Path(storage_dir)
+    if fmt is not None:
+        if fmt not in ATTACHMENT_FORMATS:
+            raise ValueError(f"unknown attachment format: {fmt!r}")
+        return base / f"{sha256_hex}.{fmt}"
+    for candidate_fmt in ATTACHMENT_FORMATS:
+        candidate = base / f"{sha256_hex}.{candidate_fmt}"
+        if candidate.exists():
+            return candidate
+    return base / f"{sha256_hex}.pdf"
+
+
+def attachment_media_type(path: Path) -> str:
+    """The Content-Type to serve for a blob at `path` (as returned by
+    `blob_path`) -- keyed off the path's OWN suffix, i.e. whichever format
+    actually validated and got written to disk, never off the display
+    filename or any client claim. Falls back to a generic binary type for
+    a suffix this module doesn't recognize (defensive only -- every path
+    this module itself ever produces via `blob_path` has one of
+    `ATTACHMENT_FORMATS`' suffixes).
+    """
+    return ATTACHMENT_MEDIA_TYPES.get(path.suffix.lstrip("."), "application/octet-stream")
 
 
 async def _assert_disk_headroom(storage_dir: Path, about_to_write: int, floor_bytes: int, *, own_reserved: int) -> None:
@@ -249,11 +379,218 @@ async def _write_chunk(
     return new_total, reserved - len(data)
 
 
+_BOTH_FORMATS_RECOVERY = (
+    "Only PDF (checked by leading magic bytes -- '%PDF-') and Markdown (.md; checked by requiring the entire "
+    "upload to be valid UTF-8 text with no disallowed control characters) are accepted. Neither the filename "
+    "extension nor the Content-Type header is ever consulted for either format."
+)
+
+
+async def receive_attachment_upload(
+    stream: AsyncIterable[bytes], *, settings: Settings | None = None
+) -> tuple[Path, str, int, str]:
+    """Streams `stream` (an async iterable of byte chunks -- e.g. a
+    router's `request.stream()`) into a temp file inside the configured
+    storage directory. Returns `(temp_path, sha256_hex, byte_size, fmt)` on
+    success, where `fmt` is `"pdf"` or `"md"` -- whichever validator
+    actually accepted the content. This is the entry point every upload
+    endpoint calls (ADR-0016); `receive_pdf_upload` below is kept separate,
+    unchanged, as the narrower "this must specifically be a PDF" building
+    block this function's PDF branch reuses.
+
+    How the format is chosen (ADR-0016 decision 2/3) -- and why a caller
+    cannot smuggle one format as the other:
+
+      Exactly like ADR-0012 decision 16 already established for PDF alone,
+      format is decided ENTIRELY by content, never by filename or
+      Content-Type -- neither ever reaches this function, so there is
+      nothing for a claim to influence. The first `len(PDF_MAGIC)` bytes
+      are checked against `PDF_MAGIC`, buffered in memory, before any file
+      is opened -- identical to `receive_pdf_upload`'s own first step:
+
+        - A match commits the ENTIRE rest of the stream to the PDF branch,
+          unconditionally -- no further content validation ever runs (PDF
+          has only ever been a magic-byte check, ADR-0012 decision 16;
+          ADR-0016 does not add any new PDF-side check). A real PDF
+          uploaded under a name claiming `.md` is still detected as PDF
+          by its bytes and stored/served as PDF -- the `.md` claim never
+          overrides what the content-based check actually finds.
+
+        - A mismatch -- including a stream that ends before even 5 bytes
+          ever arrive -- commits the ENTIRE stream, including those first
+          bytes, to the Markdown branch instead: every byte (buffered
+          prefix included) must decode as valid UTF-8 and contain no
+          control character outside `MARKDOWN_ALLOWED_CONTROL_CHARS`
+          (ADR-0016 decision 2). Content that is genuinely UTF-8-safe text
+          uploaded under a name claiming `.pdf` is still detected as
+          Markdown by its bytes and stored/served as Markdown -- the
+          `.pdf` claim never overrides that either. Content that matches
+          NEITHER branch (not PDF-shaped, and not valid UTF-8-safe text)
+          is rejected outright.
+
+      Because the claim never reaches this function at all, there is no
+      code path by which a `.md` claim could cause PDF-validated bytes to
+      be treated as Markdown, or vice versa -- the two branches are
+      mutually exclusive and content alone selects between them.
+
+    Streaming discipline (identical shape to `receive_pdf_upload`, just
+    with a second branch): the buffered prefix decides which branch is
+    live; from then on every subsequent chunk is validated (in the
+    Markdown branch, via an incremental UTF-8 decoder -- see below -- plus
+    the control-character scan; the PDF branch runs no further content
+    check) and passed through `_write_chunk`, which enforces the size cap
+    and free-disk floor before each write. On ANY failure (wrong/no
+    format, invalid UTF-8, a disallowed control character, size cap, disk
+    floor, a mid-stream client disconnect surfacing as an exception from
+    `stream`), the temp file -- if one was even opened -- is deleted
+    before the exception propagates. Nothing at a trusted hash path is
+    ever created from a partial or rejected upload.
+
+    Chunk-boundary UTF-8 (a correctness hazard called out explicitly by
+    ADR-0016): a multi-byte UTF-8 character split across two chunks must
+    not be falsely rejected. This uses `codecs.getincrementaldecoder`,
+    stdlib machinery built for exactly this -- fed one chunk at a time with
+    `final=False`, it buffers an incomplete trailing byte sequence
+    internally across calls and only emits a character once enough bytes
+    have arrived, rather than either misreading a split sequence as
+    invalid or emitting mojibake. The final call (`final=True`, an empty
+    chunk if the stream ended in the PDF-branch-never-taken sense, or on
+    real end-of-stream in the Markdown branch) flushes the decoder, which
+    is what catches a stream that ends mid-sequence (a truncated multi-byte
+    character at genuine EOF, as opposed to a merely-not-yet-complete one
+    mid-stream) as the invalid UTF-8 it actually is.
+
+    Does not touch the database -- purely I/O, so a caller can run this
+    entirely before opening any DB transaction (and therefore before
+    holding any row lock).
+
+    Fix 2 (independent review, concurrent free-disk floor), unchanged from
+    `receive_pdf_upload`: as soon as a format is chosen and this function
+    commits to actually streaming, it pledges its full `max_bytes` budget
+    via `_reserve_upload_budget`. That pledge is released incrementally as
+    real bytes land (inside `_write_chunk`) and, on ANY exit, whatever is
+    still outstanding is released in the `finally` block below.
+    """
+    settings = settings or get_settings()
+    storage_dir = Path(settings.attachment_storage_dir)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    max_bytes = settings.attachment_max_file_bytes
+    floor_bytes = settings.attachment_free_disk_floor_bytes
+
+    hasher = hashlib.sha256()
+    total = 0
+    prefix = bytearray()
+    fmt: str | None = None
+    f = None
+    tmp_path: Path | None = None
+    reserved = 0  # this upload's own outstanding pledge; grows to max_bytes once a format is chosen
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+
+    def _open_tmp() -> None:
+        nonlocal f, tmp_path
+        fd, tmp_name = tempfile.mkstemp(dir=storage_dir, prefix=".upload-", suffix=".part")
+        tmp_path = Path(tmp_name)
+        f = os.fdopen(fd, "wb")
+
+    async def _validate_and_write(data: bytes, *, final: bool) -> None:
+        nonlocal total, reserved
+        if fmt == "md":
+            try:
+                text = decoder.decode(data, final)
+            except UnicodeDecodeError:
+                raise ApiError(
+                    415,
+                    "attachment_invalid_type",
+                    "The upload's leading bytes are not the PDF signature ('%PDF-'), and its content is not "
+                    f"valid UTF-8 text either. {_BOTH_FORMATS_RECOVERY}",
+                ) from None
+            bad = _first_disallowed_control_char(text)
+            if bad is not None:
+                raise ApiError(
+                    415,
+                    "attachment_invalid_type",
+                    "The upload's leading bytes are not the PDF signature ('%PDF-'), and its content, while "
+                    f"valid UTF-8, contains a disallowed control character (0x{ord(bad):02X}) outside the "
+                    "small allowlist Markdown uploads are permitted (tab, LF, CR). "
+                    f"{_BOTH_FORMATS_RECOVERY}",
+                )
+        total, reserved = await _write_chunk(
+            f, hasher, data, total, max_bytes=max_bytes, storage_dir=storage_dir, floor_bytes=floor_bytes, reserved=reserved
+        )
+
+    try:
+        async for chunk in stream:
+            if not chunk:
+                continue
+            if fmt is None:
+                prefix.extend(chunk)
+                if len(prefix) < len(PDF_MAGIC):
+                    continue
+                fmt = "pdf" if bytes(prefix[: len(PDF_MAGIC)]) == PDF_MAGIC else "md"
+                _open_tmp()
+                await _reserve_upload_budget(max_bytes)
+                reserved = max_bytes
+                await _validate_and_write(bytes(prefix), final=False)
+                continue
+
+            await _validate_and_write(chunk, final=False)
+
+        if fmt is None:
+            # Stream ended before even 5 bytes ever accumulated -- can never
+            # match the 5-byte PDF signature, so this is a Markdown
+            # candidate (ADR-0016: short valid text must not be rejected
+            # merely for being shorter than PDF's magic-byte length). An
+            # entirely empty upload has nothing to validate as either
+            # format and is rejected outright.
+            if len(prefix) == 0:
+                raise ApiError(415, "attachment_invalid_type", f"Upload was empty. {_BOTH_FORMATS_RECOVERY}")
+            fmt = "md"
+            _open_tmp()
+            await _reserve_upload_budget(max_bytes)
+            reserved = max_bytes
+            await _validate_and_write(bytes(prefix), final=True)
+        elif fmt == "md":
+            # Flush the incremental decoder against real end-of-stream --
+            # this is what catches a truncated trailing multi-byte
+            # sequence as invalid, as opposed to merely-not-yet-complete
+            # mid-stream (see this function's own docstring above).
+            await _validate_and_write(b"", final=True)
+    except BaseException:
+        if f is not None:
+            f.close()
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+    else:
+        f.close()
+        return tmp_path, hasher.hexdigest(), total, fmt
+    finally:
+        # Release whatever pledge is still outstanding, no matter which of
+        # the two branches above ran -- success (reserved is normally 0 by
+        # now, since every actually-written byte released its own share
+        # already, but the total content length can be smaller than
+        # max_bytes, leaving the unused remainder still pledged) or a raise
+        # partway through (reserved holds everything not yet written).
+        if reserved:
+            await _release_upload_budget(reserved)
+
+
 async def receive_pdf_upload(stream: AsyncIterable[bytes], *, settings: Settings | None = None) -> tuple[Path, str, int]:
     """Streams `stream` (an async iterable of byte chunks -- e.g. a future
     router's `request.stream()`) into a temp file inside the configured
     storage directory. Returns `(temp_path, sha256_hex, byte_size)` on
     success.
+
+    Kept unchanged and separate from `receive_attachment_upload` above
+    (ADR-0016): this is the narrower "this must specifically be a PDF, full
+    stop" contract -- content that would validate as Markdown under
+    ADR-0016 decision 2 is still rejected here, because this function never
+    even attempts the Markdown check. No production upload path calls this
+    any more (`upload_attachment`/the v1 and UI endpoints call
+    `receive_attachment_upload`, which supports both formats); this stays
+    as the direct, minimal PDF-only building block for anything that
+    genuinely wants "PDF or reject", and as the historic contract this
+    module's own oldest tests pin.
 
     Ordering, all per ADR-0012 decision 16 and the streaming requirement:
       1. Buffer only the first `len(PDF_MAGIC)` bytes, in memory, and check
@@ -372,12 +709,21 @@ async def receive_pdf_upload(stream: AsyncIterable[bytes], *, settings: Settings
 
 
 async def _get_or_create_blob(
-    db: AsyncSession, *, sha256_hex: str, byte_size: int, tmp_path: Path, settings: Settings
+    db: AsyncSession, *, sha256_hex: str, byte_size: int, tmp_path: Path, fmt: str, settings: Settings
 ) -> AttachmentBlob:
     """Dedup-or-create for one content hash, called with the caller's outer
     transaction already open (no commit here -- the caller commits once,
     after also inserting its `RoomAttachment` row, so the whole operation
     lands atomically or not at all).
+
+    `fmt` (ADR-0016) is the format `receive_attachment_upload` just
+    validated this content as ("pdf" or "md") -- the ONLY place in this
+    module that ever decides a NEW blob's on-disk suffix (`blob_path`'s
+    `fmt=` argument below). If a blob already exists at this hash (the
+    dedup branch just below), `fmt` is not consulted at all: the existing
+    file's suffix is whatever its own original upload validated it as, and
+    is left untouched -- see this function's own dedup-across-formats note
+    where that branch is.
 
     Locking (ADR-0012 decision 4/6): the existing-blob lookup takes
     `SELECT ... FOR UPDATE` on that row so a concurrent `sweep_expired_blobs`
@@ -401,7 +747,18 @@ async def _get_or_create_blob(
         # hash. Discard the just-streamed temp file -- or no-op via
         # missing_ok if an earlier attempt in this same retry loop already
         # consumed it (see add_room_attachment's docstring) -- and reuse
-        # the existing row.
+        # the existing row. `fmt` (this call's freshly-validated format) is
+        # irrelevant here: content-addressing means identical bytes always
+        # dedupe to the SAME existing file regardless of which validator
+        # this particular upload happened to run. This is not a race and
+        # has no "whichever format won first" ambiguity to resolve: format
+        # classification (PDF magic-byte check vs. Markdown's UTF-8-text
+        # check, both above) is a pure function of the bytes alone, so
+        # identical content classifies identically on every upload, past
+        # or future -- the stored suffix from the first upload is always
+        # the same suffix any later duplicate upload would independently
+        # validate as, not an arbitrary outcome of who happened to go
+        # first.
         tmp_path.unlink(missing_ok=True)
         return existing
 
@@ -437,7 +794,7 @@ async def _get_or_create_blob(
             "(ATTACHMENT_GLOBAL_CEILING_BYTES). Recovery: delete an existing attachment, or raise the ceiling.",
         )
 
-    final_path = blob_path(settings.attachment_storage_dir, sha256_hex)
+    final_path = blob_path(settings.attachment_storage_dir, sha256_hex, fmt=fmt)
     final_path.parent.mkdir(parents=True, exist_ok=True)
     if final_path.exists():
         # Content-addressed: a file already at this exact hash path is, by
@@ -534,6 +891,7 @@ async def add_room_attachment(
     tmp_path: Path,
     sha256_hex: str,
     byte_size: int,
+    fmt: str = "pdf",
     settings: Settings | None = None,
 ) -> RoomAttachment:
     """The DB-side half of adding an attachment: locks the room, enforces
@@ -542,9 +900,19 @@ async def add_room_attachment(
     same shape as app/rooms.py's `post_message`.
 
     `tmp_path` must already hold the fully-streamed, hash-validated
-    content (see `receive_pdf_upload`) -- this function owns it from here:
-    every exit path either consumes it (renamed into place) or deletes it,
-    so a caller never needs its own cleanup.
+    content (see `receive_attachment_upload`) -- this function owns it
+    from here: every exit path either consumes it (renamed into place) or
+    deletes it, so a caller never needs its own cleanup.
+
+    `fmt` (ADR-0016) is the format that content validated as ("pdf" or
+    "md") -- threaded to `_get_or_create_blob` so a brand-new blob is
+    written under the right suffix, and used to pick the format-aware
+    fallback display name (`_ATTACHMENT_FILENAME_FALLBACK`) when sanitizing
+    `display_filename` produces an empty string. Defaults to "pdf" for
+    backward compatibility with callers that predate ADR-0016 (this
+    module's own PDF-only tests call this directly without ever passing
+    it) -- `upload_attachment` below always passes it explicitly, using
+    whatever `receive_attachment_upload` just validated.
 
     Retries the WHOLE locked attempt (room lock, count check, blob
     resolution, insert) up to `MAX_ATTACHMENT_ATTEMPTS` times on
@@ -559,7 +927,8 @@ async def add_room_attachment(
     in place and simply reuses it.
     """
     settings = settings or get_settings()
-    filename = safe_filename_component(display_filename, fallback=_ATTACHMENT_FILENAME_FALLBACK)
+    fallback = _ATTACHMENT_FILENAME_FALLBACK.get(fmt, _ATTACHMENT_FILENAME_FALLBACK["pdf"])
+    filename = safe_filename_component(display_filename, fallback=fallback)
 
     # Unlocked pre-check: existence/open-status never need the row lock to
     # be correct here either (mirrors post_message's own reasoning) -- it
@@ -631,7 +1000,7 @@ async def add_room_attachment(
 
         try:
             blob = await _get_or_create_blob(
-                db, sha256_hex=sha256_hex, byte_size=byte_size, tmp_path=tmp_path, settings=settings
+                db, sha256_hex=sha256_hex, byte_size=byte_size, tmp_path=tmp_path, fmt=fmt, settings=settings
             )
             attachment = RoomAttachment(
                 id=str(ULID()),
@@ -673,19 +1042,31 @@ async def upload_pdf_attachment(
     display_filename: str,
     settings: Settings | None = None,
 ) -> RoomAttachment:
-    """Convenience wrapper combining `receive_pdf_upload` (streaming
-    validation, no DB) and `add_room_attachment` (locked DB bookkeeping) --
-    the full upload path a future router would call. Kept separate above
-    so tests (and any caller with its own reasons to control the two
-    phases, e.g. wanting to open the DB transaction only after I/O is done)
-    can drive them independently.
+    """Convenience wrapper combining `receive_attachment_upload` (streaming,
+    dual-format validation, no DB) and `add_room_attachment` (locked DB
+    bookkeeping) -- the full upload path every upload endpoint calls
+    (`app/routers/room_attachments.py`'s v1 API, `app/routers/ui_rooms.py`'s
+    owner UI). Kept separate above so tests (and any caller with its own
+    reasons to control the two phases, e.g. wanting to open the DB
+    transaction only after I/O is done) can drive them independently.
+
+    Despite the name (kept, not renamed lightly, per ADR-0016's own
+    downstream-changes note -- three call sites reference it by name:
+    `app/routers/room_attachments.py`, `app/routers/ui_rooms.py`), this
+    function is format-aware since ADR-0016: it accepts PDF exactly as
+    before AND Markdown (`.md`), because `receive_attachment_upload`
+    determines which of the two validated the content and this function
+    threads that format straight through to `add_room_attachment` (which
+    needs it for the blob's on-disk suffix and its filename fallback) --
+    no separate "upload_markdown_attachment" sibling, one endpoint, one
+    code path, for both accepted formats.
 
     `principal` is required and threaded straight through to
     `add_room_attachment` -- see `_clean_sender` for why: it's the only
     thing that makes the `sender=owner` claim trustworthy.
     """
     settings = settings or get_settings()
-    tmp_path, sha256_hex, byte_size = await receive_pdf_upload(stream, settings=settings)
+    tmp_path, sha256_hex, byte_size, fmt = await receive_attachment_upload(stream, settings=settings)
     return await add_room_attachment(
         db,
         room_id=room_id,
@@ -695,6 +1076,7 @@ async def upload_pdf_attachment(
         tmp_path=tmp_path,
         sha256_hex=sha256_hex,
         byte_size=byte_size,
+        fmt=fmt,
         settings=settings,
     )
 
@@ -954,12 +1336,21 @@ async def add_attachment_from_brain_document(
             "document_not_attachable",
             f"Brain document '{document.title}' (id '{document_id}') has no associated file -- it was not "
             "created by saving a room attachment, so there is nothing to attach. Recovery: pick a different "
-            "document, or upload a new PDF directly to this room.",
+            "document, or upload a new PDF or Markdown file directly to this room.",
         )
 
-    filename = safe_filename_component(document.title, fallback=_ATTACHMENT_FILENAME_FALLBACK)
-    if not filename.lower().endswith(".pdf"):
-        filename = f"{filename}.pdf"
+    # ADR-0016: format-aware fallback/suffix, resolved from the ACTUAL
+    # stored blob (blob_path's no-`fmt` probe -- see its docstring) rather
+    # than guessed or hardcoded to ".pdf". This blob was written by some
+    # earlier upload that already validated its format; this call never
+    # re-validates content, it just needs to name the file consistently
+    # with what is really on disk.
+    existing_path = blob_path(settings.attachment_storage_dir, document.blob_sha256)
+    fmt = existing_path.suffix.lstrip(".")
+    fallback = _ATTACHMENT_FILENAME_FALLBACK.get(fmt, _ATTACHMENT_FILENAME_FALLBACK["pdf"])
+    filename = safe_filename_component(document.title, fallback=fallback)
+    if not filename.lower().endswith(f".{fmt}"):
+        filename = f"{filename}.{fmt}"
 
     for attempt in range(1, MAX_ATTACHMENT_ATTEMPTS + 1):
         room = await db.scalar(
@@ -1103,6 +1494,7 @@ async def save_attachment_to_brain(
     attachment_id: str,
     project: str,
     session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal,
+    settings: Settings | None = None,
 ) -> SavedAttachment:
     """Promotes a room attachment to a Brain `documents` deposit (decision
     3), linked back to the SAME blob via `MirroredDocument.blob_sha256` --
@@ -1117,9 +1509,11 @@ async def save_attachment_to_brain(
     remains readable in its original room; nothing moves, only the
     guarantee of its lifetime changes").
 
-    No PDF content is extracted (decision 1, v1 scope) -- the deposit's
-    `content` field is a fixed, honest placeholder describing the file,
-    never fabricated PDF text.
+    No file content is extracted (decision 1, v1 scope -- unchanged by
+    ADR-0016) -- the deposit's `content` field is a fixed, honest
+    placeholder describing the file and naming its actual format (resolved
+    from the blob's on-disk suffix, `blob_path`'s no-`fmt` probe -- never
+    fabricated file text.
 
     `blob_sha256` isn't part of the shared documents[] deposit shape (only
     path/kind/title/content are -- app/routers/deposits.py's
@@ -1129,6 +1523,7 @@ async def save_attachment_to_brain(
     document" step, just two statements because the shared path can't be
     handed a field it doesn't know about.
     """
+    settings = settings or get_settings()
     attachment = await _get_attachment_or_404(db, room_id, attachment_id)
 
     if not isinstance(project, str) or not project.strip():
@@ -1140,6 +1535,8 @@ async def save_attachment_to_brain(
         raise ApiError(
             500, "attachment_storage_inconsistent", "The attachment's blob record is missing; cannot save."
         )
+    fmt = blob_path(settings.attachment_storage_dir, blob.sha256).suffix.lstrip(".")
+    format_label = {"pdf": "PDF", "md": "Markdown"}.get(fmt, fmt.upper())
 
     machine = await _ensure_room_attachments_machine(session_factory)
     if machine.status == "revoked":
@@ -1151,9 +1548,10 @@ async def save_attachment_to_brain(
         )
 
     content = (
-        f"(PDF attachment saved from a room -- ADR-0012 v1 serves bytes only, no text is extracted. Original "
-        f"filename: {attachment.filename}; {blob.byte_size} bytes; sha256 {blob.sha256}. Download the "
-        "original bytes via the room or this Brain document.)"
+        f"({format_label} attachment saved from a room -- ADR-0012 v1 serves bytes only, no text is extracted "
+        f"(unchanged by ADR-0016's addition of Markdown). Original filename: {attachment.filename}; "
+        f"{blob.byte_size} bytes; sha256 {blob.sha256}. Download the original bytes via the room or this Brain "
+        "document.)"
     )
     deposit_body = DepositRequest(
         deposit_id=str(ULID()),

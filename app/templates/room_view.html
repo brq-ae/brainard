@@ -262,10 +262,15 @@
   <p class="empty" id="room-attachments-empty">No attachments yet.</p>
   {% endif %}
 
-  <h3>Upload a PDF</h3>
+  <h3>Upload a PDF or Markdown file</h3>
   {% if room.status == 'open' %}
   <div id="room-attachment-upload">
-    <input type="file" id="attachment-file-input" accept="application/pdf">
+    <!-- .md has no single universally-agreed MIME type, so this `accept`
+         attribute is a UX hint only, never the actual gate -- the server
+         validates content (magic bytes for PDF, UTF-8/control-character
+         check for Markdown, ADR-0016 decision 2) regardless of what the
+         browser's file picker was told to filter for. -->
+    <input type="file" id="attachment-file-input" accept="application/pdf,.md,text/markdown">
     <button type="button" class="btn primary" id="attachment-upload-btn">Upload</button>
     <div id="attachment-upload-error" class="notice danger" style="display:none"></div>
   </div>

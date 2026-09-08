@@ -141,11 +141,21 @@ _sanitize_filename() {
   if [[ -z "$cleaned" ]]; then
     cleaned="attachment"
   fi
-  # v1 is PDF-only (ADR-0012 decision 1/16); force the extension
-  # regardless of what survived sanitizing, so the file on disk is always
-  # unambiguously named as what the server contract guarantees it to be.
+  # ADR-0016: two accepted formats now (PDF and Markdown), not one --
+  # preserve whichever of the two the caller-supplied name already ends
+  # in, checked against a fixed two-item allowlist, never an arbitrary
+  # attacker-chosen suffix. A name ending in neither recognized extension
+  # falls back to .pdf, this sanitizer's original (and still safe)
+  # default -- this script never inspects the fetched bytes, so it has no
+  # way to independently confirm which format a given attachment id
+  # actually is; the caller (the agent driving `fetch`) is expected to
+  # pass a display name carrying the correct extension when it matters
+  # (e.g. taken straight from the room's own attachment listing, which
+  # already carries the server-validated name). Either way this is purely
+  # a LOCAL naming convenience: the bytes written to disk are exactly what
+  # the server sent, unchanged by which branch below fires.
   case "$cleaned" in
-    *.[Pp][Dd][Ff]) ;;
+    *.[Pp][Dd][Ff]|*.[Mm][Dd]) ;;
     *) cleaned="${cleaned}.pdf" ;;
   esac
   printf '%s' "$cleaned"
@@ -230,10 +240,20 @@ case "$1" in
     #   6. only after the download is verified complete and within the cap
     #      is the temp file renamed (same directory, so the rename is
     #      atomic) to its final, freshly-sanitized name.
+    #   7. if the caller omitted a display filename, its extension is
+    #      decided only AFTER the download completes, from the downloaded
+    #      bytes' own leading magic bytes -- never hardcoded to one format,
+    #      which used to mislabel every extension-omitted Markdown fetch as
+    #      ".pdf" despite correct bytes. See the sniff just above FINAL_PATH
+    #      below.
     [[ $# -eq 3 || $# -eq 4 ]] || usage
     ROOM_ID="$2"
     ATTACHMENT_ID="$3"
-    DISPLAY_NAME="${4:-${ATTACHMENT_ID}.pdf}"
+    # Left empty (not defaulted to a hardcoded extension) when the caller
+    # supplies no display filename -- the default extension is instead
+    # decided after the download completes, from the bytes themselves; see
+    # below.
+    DISPLAY_NAME="${4:-}"
 
     _valid_bare_id "$ROOM_ID" \
       || { echo "error: room id must be a bare alphanumeric id, 1-64 characters (no path, no punctuation, no whitespace)" >&2; exit 1; }
@@ -261,9 +281,6 @@ case "$1" in
         exit 1
         ;;
     esac
-
-    SAFE_NAME="$(_sanitize_filename "$DISPLAY_NAME")"
-    FINAL_PATH="$ROOM_DIR_RESOLVED/$SAFE_NAME"
 
     TMPFILE="$(mktemp "$ROOM_DIR_RESOLVED/.fetch.XXXXXX")"
     HEADER_FILE="$(mktemp "$ROOM_DIR_RESOLVED/.fetch-headers.XXXXXX")"
@@ -303,6 +320,35 @@ case "$1" in
       echo "error: response body was empty; aborted, nothing written" >&2
       exit 1
     fi
+
+    if [[ -n "$DISPLAY_NAME" ]]; then
+      SAFE_NAME="$(_sanitize_filename "$DISPLAY_NAME")"
+    else
+      # No caller-supplied name: pick the default extension from the
+      # downloaded bytes' own leading magic bytes, never from any string
+      # the server or caller provided. This mirrors, client-side, exactly
+      # the check the server itself uses to classify a PDF (ADR-0012
+      # decision 16; app/attachments.py's PDF_MAGIC = b"%PDF-"): the fixed
+      # 5-byte literal "%PDF-". Anything else defaults to ".md" -- the
+      # only other member of the fixed two-item allowlist
+      # `_sanitize_filename` accepts, matching the server's own fallback
+      # classification (not PDF-shaped -> Markdown). Both branches feed a
+      # literal ".pdf"/".md" string constant into `_sanitize_filename`,
+      # never a substring pulled out of the response -- so this can never
+      # become a vector for an arbitrary extension, same guarantee as the
+      # explicit-filename path. This is purely a local naming convenience
+      # (same posture as the rest of this function's filename handling):
+      # the BYTES already written to TMPFILE are exactly what the server
+      # sent, unchanged by this check -- only the on-disk file's name is
+      # decided here, after the fact.
+      if [[ "$(head -c 5 -- "$TMPFILE" 2>/dev/null)" == '%PDF-' ]]; then
+        DEFAULT_EXT="pdf"
+      else
+        DEFAULT_EXT="md"
+      fi
+      SAFE_NAME="$(_sanitize_filename "${ATTACHMENT_ID}.${DEFAULT_EXT}")"
+    fi
+    FINAL_PATH="$ROOM_DIR_RESOLVED/$SAFE_NAME"
 
     mv -f -- "$TMPFILE" "$FINAL_PATH"
     echo "fetched: $FINAL_PATH (${ACTUAL_SIZE} bytes)"

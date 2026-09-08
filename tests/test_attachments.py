@@ -22,9 +22,13 @@ from ulid import ULID
 
 import app.attachments as attachments_module
 from app.attachments import (
+    ATTACHMENT_FORMATS,
+    MARKDOWN_ALLOWED_CONTROL_CHARS,
     PDF_MAGIC,
     add_room_attachment,
+    attachment_media_type,
     blob_path,
+    receive_attachment_upload,
     receive_pdf_upload,
     sweep_expired_blobs,
     upload_pdf_attachment,
@@ -183,6 +187,181 @@ async def test_too_short_to_contain_magic_bytes_rejected(fake_settings):
     with pytest.raises(ApiError) as exc_info:
         await receive_pdf_upload(_agen([b"%PD"]), settings=settings)
     assert exc_info.value.code == "attachment_invalid_type"
+
+
+# --- ADR-0016: receive_attachment_upload -- the dual-format entry point
+# every upload endpoint actually calls. receive_pdf_upload above is kept
+# unchanged as the narrower "must specifically be PDF" building block
+# (still exercised directly by every test above); everything below drives
+# the format-agnostic dispatcher on top of it. ---
+
+
+async def test_dispatcher_accepts_pdf_exactly_like_receive_pdf_upload(fake_settings):
+    settings = fake_settings()
+    tmp_path, sha256_hex, size, fmt = await receive_attachment_upload(_agen(_chunked(_pdf_bytes())), settings=settings)
+    assert fmt == "pdf"
+    assert tmp_path.exists()
+    assert size == len(_pdf_bytes())
+    assert len(sha256_hex) == 64
+    tmp_path.unlink()
+
+
+async def test_dispatcher_accepts_utf8_markdown_with_tabs_and_crlf(fake_settings):
+    """ADR-0016 decision 2: tab, LF, CR are explicitly the whitespace/line-
+    structure control characters Markdown legitimately uses -- they must be
+    PERMITTED, not merely tolerated by accident.
+    """
+    settings = fake_settings()
+    md = "# Title\r\n\r\nSome\ttabbed\ttext.\r\n- item one\r\n- item two\r\n".encode()
+    tmp_path, _sha, size, fmt = await receive_attachment_upload(_agen(_chunked(md)), settings=settings)
+    assert fmt == "md"
+    assert size == len(md)
+    assert tmp_path.read_bytes() == md
+    tmp_path.unlink()
+
+
+async def test_dispatcher_accepts_html_content_as_text(fake_settings):
+    """ADR-0016 decision 2, stated plainly in the ADR itself: an HTML file
+    that happens to be valid UTF-8 with only ordinary whitespace control
+    characters WILL pass this check -- this confirms "text", not
+    "Markdown", and this module accepts that documented gap. It is not a
+    PDF (no magic bytes), so it is accepted as Markdown; decision 3's
+    serving posture (download-only, nosniff, CSP -- proven at the HTTP
+    layer in tests/test_room_attachments.py) is what keeps this safe.
+    """
+    settings = fake_settings()
+    html = b"<html><body><script>alert(1)</script></body></html>"
+    tmp_path, _sha, size, fmt = await receive_attachment_upload(_agen(_chunked(html)), settings=settings)
+    assert fmt == "md"
+    assert size == len(html)
+    tmp_path.unlink()
+
+
+async def test_dispatcher_rejects_invalid_utf8(fake_settings):
+    settings = fake_settings()
+    # 0xFF is never valid anywhere in UTF-8 (not a valid leading byte, not a
+    # valid continuation byte) -- and this content also doesn't start with
+    # the PDF signature, so it must fall through to (and fail) the
+    # Markdown branch.
+    garbage = b"not a pdf \xff\xfe more garbage"
+    with pytest.raises(ApiError) as exc_info:
+        await receive_attachment_upload(_agen(_chunked(garbage)), settings=settings)
+    assert exc_info.value.code == "attachment_invalid_type"
+    assert "not valid UTF-8" in exc_info.value.detail
+    assert list(Path(settings.attachment_storage_dir).iterdir()) == []
+
+
+async def test_dispatcher_rejects_nul_byte(fake_settings):
+    settings = fake_settings()
+    content = b"hello\x00world"  # valid UTF-8 (NUL is a valid single-byte codepoint) but disallowed by the allowlist
+    with pytest.raises(ApiError) as exc_info:
+        await receive_attachment_upload(_agen(_chunked(content)), settings=settings)
+    assert exc_info.value.code == "attachment_invalid_type"
+    assert "0x00" in exc_info.value.detail
+    assert list(Path(settings.attachment_storage_dir).iterdir()) == []
+
+
+async def test_dispatcher_rejects_disallowed_control_character(fake_settings):
+    settings = fake_settings()
+    content = b"hello\x0bworld"  # 0x0B, vertical tab -- valid UTF-8, not in the allowlist
+    with pytest.raises(ApiError) as exc_info:
+        await receive_attachment_upload(_agen(_chunked(content)), settings=settings)
+    assert exc_info.value.code == "attachment_invalid_type"
+    assert "0x0B" in exc_info.value.detail
+    assert list(Path(settings.attachment_storage_dir).iterdir()) == []
+
+
+@pytest.mark.parametrize("allowed_char", ["\t", "\n", "\r"])
+async def test_dispatcher_allows_every_char_in_the_allowlist(allowed_char, fake_settings):
+    settings = fake_settings()
+    content = f"hello{allowed_char}world".encode()
+    tmp_path, _sha, _size, fmt = await receive_attachment_upload(_agen(_chunked(content)), settings=settings)
+    assert fmt == "md"
+    tmp_path.unlink()
+
+
+def test_markdown_allowed_control_chars_is_exactly_tab_lf_cr():
+    assert MARKDOWN_ALLOWED_CONTROL_CHARS == {"\t", "\n", "\r"}
+    assert {ord(c) for c in MARKDOWN_ALLOWED_CONTROL_CHARS} == {0x09, 0x0A, 0x0D}
+
+
+async def test_dispatcher_rejects_empty_upload(fake_settings):
+    settings = fake_settings()
+    with pytest.raises(ApiError) as exc_info:
+        await receive_attachment_upload(_agen([]), settings=settings)
+    assert exc_info.value.code == "attachment_invalid_type"
+
+
+async def test_dispatcher_accepts_valid_text_shorter_than_pdf_magic_length(fake_settings):
+    """Unlike receive_pdf_upload (which rejects anything shorter than the
+    5-byte PDF signature outright), the dual-format dispatcher must not
+    reject short content just for being short -- a 2-byte Markdown file is
+    entirely plausible and must be accepted.
+    """
+    settings = fake_settings()
+    content = b"hi"
+    tmp_path, _sha, size, fmt = await receive_attachment_upload(_agen([content]), settings=settings)
+    assert fmt == "md"
+    assert size == 2
+    tmp_path.unlink()
+
+
+async def test_dispatcher_multibyte_utf8_character_split_across_chunk_boundary_accepted(fake_settings):
+    """The chunk-boundary hazard ADR-0016 calls out explicitly: a
+    multi-byte UTF-8 character split across two separate stream chunks
+    must not be falsely rejected. This is only a genuine test of that
+    hazard if the split actually reaches the incremental decoder as TWO
+    separate `.decode()` calls -- so the split is placed AFTER the initial
+    >=5-byte prefix that decides pdf-vs-md (that whole prefix is always
+    flushed to the decoder in a single call, however many raw chunks
+    contributed to accumulating it, so a split hiding inside those first
+    few bytes would never actually exercise the decoder's cross-call state
+    at all). Constructs three literal multi-byte characters and splits by
+    hand exactly one byte into the first one's 2-byte encoding, so the
+    leading byte lands in one chunk and its continuation byte lands in the
+    next -- proving the decoder correctly buffers the incomplete sequence
+    across the `receive_attachment_upload` loop iteration boundary rather
+    than misreading it as invalid or as mojibake.
+    """
+    settings = fake_settings()
+    prefix = b"Hello world, "  # >= 5 bytes, establishes the md branch, no multi-byte content
+    accented_chars = ["\u00e9", "\u00e8", "\u00ea"]  # e-acute, e-grave, e-circumflex -- 2 UTF-8 bytes each
+    accented = "".join(accented_chars)
+    payload = prefix + accented.encode("utf-8")
+    # Split so the first chunk ends exactly one byte into the first
+    # accented character's 2-byte encoding (the leading byte alone, 0xC3
+    # for every one of these three characters).
+    split_at = len(prefix) + 1
+    assert payload[split_at - 1] == 0xC3  # sanity: this really is mid-sequence
+    chunks = [payload[:split_at], payload[split_at:]]
+
+    tmp_path, _sha, size, fmt = await receive_attachment_upload(_agen(chunks), settings=settings)
+    assert fmt == "md"
+    assert size == len(payload)
+    assert tmp_path.read_bytes() == payload
+    assert tmp_path.read_bytes().decode("utf-8") == prefix.decode() + accented
+    tmp_path.unlink()
+
+
+async def test_dispatcher_a_pdf_named_md_is_still_stored_and_reported_as_pdf(fake_settings):
+    """ADR-0016 decision 3: the caller's claimed extension never reaches
+    this function at all (no filename parameter exists here), so genuine
+    PDF bytes are detected and accepted as PDF regardless of anything a
+    caller might claim about the name elsewhere in the stack.
+    """
+    settings = fake_settings()
+    tmp_path, _sha, _size, fmt = await receive_attachment_upload(_agen(_chunked(_pdf_bytes())), settings=settings)
+    assert fmt == "pdf"
+    tmp_path.unlink()
+
+
+def test_attachment_formats_is_exactly_pdf_and_md():
+    assert ATTACHMENT_FORMATS == ("pdf", "md")
+
+
+def test_attachment_media_type_maps_suffix_to_content_type(tmp_path):
+    assert attachment_media_type(tmp_path / "x.pdf") == "application/pdf"
+    assert attachment_media_type(tmp_path / "x.md") == "text/markdown; charset=utf-8"
 
 
 # --- streaming size cap ---
@@ -394,6 +573,119 @@ async def test_disk_floor_reservation_prevents_concurrent_receive_pdf_uploads_fr
     # No leaked pledge either way -- the process-wide counter this test
     # started with (0, per _clean_attachment_state-adjacent isolation) is
     # back to 0 once both tasks have fully exited.
+    assert attachments_module._reserved_bytes == 0
+
+
+# --- Fix 2 (independent review nit): every size-cap / free-disk-floor /
+# reservation test above drives `receive_pdf_upload` directly, never the
+# live `receive_attachment_upload` dispatcher a Markdown upload actually
+# goes through in production. By inspection the Markdown branch shares the
+# exact same, unmodified `_write_chunk` (size cap + disk-floor check on
+# every write) as the PDF branch -- these three tests PROVE that instead of
+# merely asserting it by inspection, mirroring the PDF-specific tests above
+# one-for-one with Markdown content through the dispatcher. ---
+
+
+def _md_bytes(body: bytes = b"hello world") -> bytes:
+    return b"# doc\n\n" + body + b"\n"
+
+
+async def test_dispatcher_streaming_size_cap_rejects_mid_stream_markdown(fake_settings):
+    """Markdown counterpart of
+    test_streaming_size_cap_rejects_mid_stream_without_buffering_everything
+    above, through `receive_attachment_upload` instead of `receive_pdf_upload`.
+    """
+    settings = fake_settings(attachment_max_file_bytes=32)
+    payload = _md_bytes(b"x" * 500)  # comfortably over the 32-byte cap; well-formed UTF-8 text, not PDF-shaped
+    chunks = _chunked(payload, size=8)
+    yielded = []
+
+    async def _tracking_gen():
+        for c in chunks:
+            yielded.append(c)
+            yield c
+
+    with pytest.raises(ApiError) as exc_info:
+        await receive_attachment_upload(_tracking_gen(), settings=settings)
+
+    assert exc_info.value.code == "attachment_too_large"
+    # Aborted partway through -- never asked the generator for every chunk,
+    # proving this is a genuine mid-stream rejection, not read-then-check.
+    assert len(yielded) < len(chunks)
+    assert list(Path(settings.attachment_storage_dir).iterdir()) == []  # no partial file left behind
+
+
+async def test_dispatcher_free_disk_floor_refuses_upload_markdown(fake_settings, monkeypatch):
+    """Markdown counterpart of test_free_disk_floor_refuses_upload above,
+    through `receive_attachment_upload` instead of `receive_pdf_upload`.
+    """
+    floor_bytes = 2 * 1024 * 1024 * 1024  # 2 GiB floor
+    settings = fake_settings(attachment_free_disk_floor_bytes=floor_bytes)
+
+    class _FakeUsage:
+        # Only 5 bytes of headroom above the floor -- the very first write
+        # (the buffered pdf-vs-md-deciding prefix, >= 5 bytes) already
+        # breaches it.
+        free = floor_bytes + 5
+
+    monkeypatch.setattr(attachments_module.shutil, "disk_usage", lambda _path: _FakeUsage())
+
+    with pytest.raises(ApiError) as exc_info:
+        await receive_attachment_upload(_agen(_chunked(_md_bytes(b"y" * 1000))), settings=settings)
+
+    assert exc_info.value.code == "attachment_disk_floor_exceeded"
+    assert list(Path(settings.attachment_storage_dir).iterdir()) == []
+
+
+async def test_dispatcher_disk_floor_reservation_blocks_concurrent_markdown_uploads(fake_settings, monkeypatch):
+    """Markdown counterpart of
+    test_disk_floor_reservation_prevents_concurrent_receive_pdf_uploads_from_both_succeeding
+    above: two concurrent `receive_attachment_upload` calls, both streaming
+    Markdown content, proving the reservation counter that makes the
+    free-disk floor atomic across concurrent uploads applies identically
+    regardless of which format branch is live -- not just when both
+    concurrent uploads happen to be PDFs.
+    """
+    floor_bytes = 2_200
+    free_bytes = 3_500
+    max_bytes = 1_500
+    settings = fake_settings(attachment_max_file_bytes=max_bytes, attachment_free_disk_floor_bytes=floor_bytes)
+
+    class _FakeUsage:
+        free = free_bytes
+
+    monkeypatch.setattr(attachments_module.shutil, "disk_usage", lambda _path: _FakeUsage())
+
+    payload = _md_bytes(b"x" * 200)
+    barrier = asyncio.Barrier(2)
+
+    async def _gated_stream():
+        first = True
+        for c in _chunked(payload, size=16):
+            if first:
+                await barrier.wait()  # both streams start consuming together
+                first = False
+            else:
+                await asyncio.sleep(0)  # keep yielding control between chunks
+            yield c
+
+    async def _one():
+        try:
+            tmp_path, _sha, _size, fmt = await receive_attachment_upload(_gated_stream(), settings=settings)
+            assert fmt == "md"
+            tmp_path.unlink()
+            return "ok"
+        except ApiError as exc:
+            return exc.code
+
+    results = await asyncio.gather(_one(), _one())
+
+    # Same arithmetic as the PDF end-to-end reservation test above: at least
+    # one of the two concurrent uploads must be refused, proving the floor
+    # holds where, under independent shutil.disk_usage() checks alone, both
+    # would have been admitted.
+    assert "attachment_disk_floor_exceeded" in results
+    assert all(r in ("ok", "attachment_disk_floor_exceeded") for r in results)
     assert attachments_module._reserved_bytes == 0
 
 
@@ -974,3 +1266,99 @@ def test_blob_path_accepts_a_genuine_hash(tmp_path):
 
 def test_pdf_magic_constant():
     assert PDF_MAGIC == b"%PDF-"
+
+
+# --- ADR-0016: blob_path must keep resolving every blob written before
+# this ADR shipped, unchanged on disk, while also supporting the new
+# Markdown suffix for blobs written after it -- the load-bearing proof
+# that this change is safe for the live deployment's real, already-stored
+# PDF attachments (never renamed, never migrated). ---
+
+
+def test_blob_path_resolves_a_pre_existing_pdf_blob_never_touched_by_this_module(tmp_path):
+    """Simulates exactly what's already sitting in the live attachment
+    volume: a file named `{sha256}.pdf`, written before ADR-0016 existed,
+    by code that only ever knew one format. This test never calls
+    `receive_attachment_upload` or `_get_or_create_blob` at all -- it
+    writes the file directly, the way it already exists on disk today --
+    and then proves the plain 2-argument `blob_path(dir, hash)` call (used
+    throughout this module's read paths: download, sweep, reclaim) still
+    finds it, byte for byte, with no rename and no migration.
+    """
+    sha256_hex = "b" * 64
+    pre_existing = tmp_path / f"{sha256_hex}.pdf"
+    pre_existing.write_bytes(_pdf_bytes(b"already on disk before ADR-0016"))
+
+    resolved = blob_path(tmp_path, sha256_hex)
+
+    assert resolved == pre_existing
+    assert resolved.exists()
+    assert resolved.read_bytes() == pre_existing.read_bytes()
+
+
+def test_blob_path_resolves_an_md_blob_when_only_the_md_file_exists(tmp_path):
+    sha256_hex = "c" * 64
+    (tmp_path / f"{sha256_hex}.md").write_bytes(b"# hello\n")
+
+    resolved = blob_path(tmp_path, sha256_hex)
+
+    assert resolved == tmp_path / f"{sha256_hex}.md"
+    assert resolved.exists()
+
+
+def test_blob_path_prefers_pdf_over_md_if_somehow_both_existed(tmp_path):
+    """Cannot happen through this module's own write path (one hash, one
+    file, chosen once at creation) -- but `blob_path`'s no-`fmt` probe
+    order is deterministic (pdf first, matching every blob written before
+    ADR-0016), not a coincidence of dict/filesystem ordering, so this pins
+    that determinism explicitly.
+    """
+    sha256_hex = "d" * 64
+    (tmp_path / f"{sha256_hex}.pdf").write_bytes(b"pdf-content")
+    (tmp_path / f"{sha256_hex}.md").write_bytes(b"md-content")
+
+    assert blob_path(tmp_path, sha256_hex) == tmp_path / f"{sha256_hex}.pdf"
+
+
+def test_blob_path_with_explicit_fmt_never_touches_the_filesystem(tmp_path):
+    good = "e" * 64
+    assert blob_path(tmp_path, good, fmt="pdf") == tmp_path / f"{good}.pdf"
+    assert blob_path(tmp_path, good, fmt="md") == tmp_path / f"{good}.md"
+    # Neither file exists on disk -- explicit fmt never probes, it just
+    # constructs the path deterministically.
+    assert not (tmp_path / f"{good}.pdf").exists()
+    assert not (tmp_path / f"{good}.md").exists()
+
+
+def test_blob_path_rejects_unknown_explicit_fmt(tmp_path):
+    with pytest.raises(ValueError):
+        blob_path(tmp_path, "f" * 64, fmt="exe")
+
+
+async def test_full_upload_path_writes_an_md_blob_under_the_md_suffix_end_to_end(fake_settings, db_session):
+    """The end-to-end proof (not just the streaming layer) that a Markdown
+    upload lands on disk under `.md`, dedups, and counts against the same
+    caps/ceiling exactly like a PDF upload always has.
+    """
+    settings = fake_settings()
+    room = await _make_room(db_session)
+    md_bytes = b"# Notes\n\nSome *markdown* content.\n"
+
+    attachment = await upload_pdf_attachment(
+        db_session,
+        _agen(_chunked(md_bytes)),
+        room_id=room.id,
+        sender="owner",
+        principal=_OWNER,
+        display_filename="notes.md",
+        settings=settings,
+    )
+
+    on_disk = blob_path(settings.attachment_storage_dir, attachment.blob_sha256)
+    assert on_disk.name.endswith(".md")
+    assert on_disk.exists()
+    assert on_disk.read_bytes() == md_bytes
+    assert attachment.filename == "notes.md"
+
+    stats = await db_session.get(AttachmentStorageStats, attachments_module.STATS_SINGLETON_ID)
+    assert stats.total_bytes == len(md_bytes)

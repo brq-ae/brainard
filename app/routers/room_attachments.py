@@ -11,11 +11,15 @@ owner curation decisions, same trust posture as app/room_ai.py's
 `deposit_result` and app/routers/rooms.py's `close_room_endpoint`).
 
 Upload streams the request body directly (`request.stream()`) into
-app/attachments.py's `receive_pdf_upload` -- never FastAPI's `UploadFile`/
-multipart form parsing, which would buffer each part into Starlette's own
-spooled temp file before this router even sees a byte. `filename`/`sender`
-travel as query parameters instead of multipart fields, precisely so the
-body can stay a single raw byte stream with nothing to demultiplex.
+app/attachments.py's `receive_attachment_upload` (via `upload_pdf_attachment`,
+kept its pre-ADR-0016 name -- see that function's own docstring -- but
+format-aware since ADR-0016: PDF and Markdown `.md` are both accepted, and
+which validator ran is decided from content alone, never from `filename`
+or Content-Type) -- never FastAPI's `UploadFile`/multipart form parsing,
+which would buffer each part into Starlette's own spooled temp file before
+this router even sees a byte. `filename`/`sender` travel as query
+parameters instead of multipart fields, precisely so the body can stay a
+single raw byte stream with nothing to demultiplex.
 """
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -30,6 +34,7 @@ from app.attachments import (
     save_attachment_to_brain,
     upload_pdf_attachment,
 )
+from app.attachments import attachment_media_type
 from app.attachments import blob_path as attachment_blob_path
 from app.auth import Principal, require_machine_or_owner, require_owner
 from app.config import get_settings
@@ -80,9 +85,10 @@ async def upload_room_attachment_endpoint(
 ) -> RoomAttachmentOut:
     """Owner and agents (ADR-0012 decision 7). `request.stream()` is passed
     straight through to `upload_pdf_attachment` -- the request body is
-    never buffered whole, in memory or otherwise, before the magic-byte
-    check and the per-chunk size/disk-floor checks run (app/attachments.py's
-    `receive_pdf_upload`).
+    never buffered whole, in memory or otherwise, before the content checks
+    (magic bytes for PDF, UTF-8/control-character for Markdown -- ADR-0016
+    decision 2) and the per-chunk size/disk-floor checks run
+    (app/attachments.py's `receive_attachment_upload`).
 
     `principal` (the authenticated identity FastAPI resolved from the
     bearer token) is threaded straight through to `upload_pdf_attachment` --
@@ -139,7 +145,7 @@ async def download_room_attachment_endpoint(
     attachment, blob = await get_room_attachment_for_download(db, room_id=room_id, attachment_id=attachment_id)
     settings = get_settings()
     path = attachment_blob_path(settings.attachment_storage_dir, blob.sha256)
-    return FileResponse(path=path, media_type="application/pdf", headers=_download_headers(attachment.filename))
+    return FileResponse(path=path, media_type=attachment_media_type(path), headers=_download_headers(attachment.filename))
 
 
 @router.delete("/{room_id}/attachments/{attachment_id}")

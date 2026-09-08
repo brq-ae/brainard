@@ -539,6 +539,41 @@ async def test_closing_statement_in_final_message_reaches_the_prompt_for_long_de
 # rather than assumed) ---
 
 
+async def test_md_attachment_content_never_reaches_the_ai_prompt(client, db_session, monkeypatch):
+    """ADR-0016 decision 4: Markdown IS plain text, unlike PDF, so this is
+    no longer a free consequence of the format being unreadable -- it's a
+    deliberate choice this test pins. An attachment's `.md` bytes must
+    never be fed into any room-AI prompt (summarize/verdict/decisions/
+    lessons); Brainard's own LLM still sees only the transcript.
+    """
+    owner_headers = await _owner_headers(db_session)
+    await _configure_provider(db_session)
+    room = await _create_room_via_api(client, owner_headers, name="md-attachment-ai-room")
+    secret = "the-secret-markdown-body-must-never-reach-the-llm-prompt"
+    upload_resp = await client.post(
+        f"/v1/rooms/{room['id']}/attachments",
+        params={"filename": "notes.md", "sender": "owner"},
+        content=f"# Secret notes\n\n{secret}\n".encode(),
+        headers=owner_headers,
+    )
+    assert upload_resp.status_code == 201, upload_resp.json()
+
+    captured_prompts = {}
+
+    async def fake_chat_completion_json(effective, *, system_prompt, user_prompt, max_tokens, timeout):
+        captured_prompts["system_prompt"] = system_prompt
+        captured_prompts["user_prompt"] = user_prompt
+        return _summarize_response()
+
+    monkeypatch.setattr(room_ai_module, "chat_completion_json", fake_chat_completion_json)
+
+    resp = await client.post(f"/v1/rooms/{room['id']}/ai/summarize", headers=owner_headers)
+
+    assert resp.status_code == 200, resp.json()
+    assert secret not in captured_prompts["user_prompt"]
+    assert secret not in captured_prompts["system_prompt"]
+
+
 async def test_deleted_message_text_never_reaches_the_ai_prompt(client, db_session, monkeypatch):
     owner_headers = await _owner_headers(db_session)
     await _configure_provider(db_session)

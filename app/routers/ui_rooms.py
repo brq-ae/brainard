@@ -125,6 +125,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 from app.attachments import add_attachment_from_brain_document
+from app.attachments import attachment_media_type
 from app.attachments import blob_path as attachment_blob_path
 from app.attachments import (
     delete_room_attachment as delete_room_attachment_op,
@@ -894,12 +895,14 @@ async def room_ai_action(
     )
 
 
-# --- ADR-0012: room file attachments -- owner UI ---
+# --- ADR-0012 (extended by ADR-0016: PDF and Markdown `.md`, format
+# decided from content alone): room file attachments -- owner UI ---
 #
 # Upload is the one action here that is NOT an ordinary HTML form post: the
 # request body is the file's raw bytes (app/static/room_attachments.js does
 # a JS `fetch(url, {body: file})`), streamed straight into
-# `upload_pdf_attachment_op` -- never buffered whole, and never routed
+# `upload_pdf_attachment_op` (kept its pre-ADR-0016 name, format-aware
+# since) -- never buffered whole, and never routed
 # through FastAPI's multipart/UploadFile machinery, which would spool the
 # whole part to a temp file before this handler even runs. Because the body
 # isn't form-encoded, CSRF here travels in an `X-CSRF-Token` header instead
@@ -953,7 +956,9 @@ async def room_download_attachment(
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     settings = get_settings()
     path = attachment_blob_path(settings.attachment_storage_dir, blob.sha256)
-    return FileResponse(path=path, media_type="application/pdf", headers=_attachment_download_headers(attachment.filename))
+    return FileResponse(
+        path=path, media_type=attachment_media_type(path), headers=_attachment_download_headers(attachment.filename)
+    )
 
 
 @router.post("/{room_id}/attachments/{attachment_id}/delete")

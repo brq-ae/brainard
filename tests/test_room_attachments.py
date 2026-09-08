@@ -224,14 +224,124 @@ async def test_attach_from_brain_owner_token_can_still_claim_owner_sender(client
 # --- upload rejection causes: distinct codes, actionable messages ---
 
 
-async def test_upload_not_a_pdf_rejected(client, db_session):
+async def test_upload_neither_pdf_nor_valid_text_rejected(client, db_session):
+    """ADR-0016: content that matches NEITHER accepted format -- not the
+    PDF signature, and not valid UTF-8 either -- is still rejected, exactly
+    as any non-PDF content always was pre-ADR-0016. (Plain HTML text, which
+    USED to be the classic rejection case here, is now accepted as
+    Markdown -- see test_upload_html_content_accepted_as_text_via_md_check
+    below; this test uses genuinely invalid-UTF-8 binary content instead,
+    to keep exercising an upload that is rejected under both formats.)
+    """
     owner_headers = await _owner_headers(db_session)
     room = await _create_room(client, owner_headers)
-    resp = await _upload(client, owner_headers, room["id"], content=b"<html>not a pdf</html>")
+    resp = await _upload(client, owner_headers, room["id"], content=b"\x89PNG\r\n\x1a\n\xff\xfeGARBAGE")
     assert resp.status_code == 415
     body = resp.json()["error"]
     assert body["code"] == "attachment_invalid_type"
     assert "PDF" in body["detail"]
+    assert "UTF-8" in body["detail"]
+
+
+async def test_upload_nul_byte_rejected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    resp = await _upload(client, owner_headers, room["id"], filename="doc.md", content=b"hello\x00world")
+    assert resp.status_code == 415
+    assert resp.json()["error"]["code"] == "attachment_invalid_type"
+
+
+async def test_upload_disallowed_control_character_rejected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    resp = await _upload(client, owner_headers, room["id"], filename="doc.md", content=b"hello\x0bworld")
+    assert resp.status_code == 415
+    assert resp.json()["error"]["code"] == "attachment_invalid_type"
+
+
+# --- ADR-0016: Markdown accepted alongside PDF; format decided by content,
+# never by the claimed filename extension -- so a claim in either direction
+# never smuggles one format as the other. ---
+
+
+async def test_upload_md_file_accepted(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    md = b"# Notes\r\n\r\nSome\ttabbed\ttext with CRLF line endings.\r\n"
+    resp = await _upload(client, owner_headers, room["id"], filename="notes.md", content=md)
+    assert resp.status_code == 201, resp.json()
+    body = resp.json()
+    assert body["filename"] == "notes.md"
+    assert body["byte_size"] == len(md)
+
+
+async def test_upload_html_content_accepted_as_text_via_md_check(client, db_session):
+    """ADR-0016 decision 2, stated plainly in the ADR: an HTML file that
+    happens to be valid UTF-8 with no disallowed control characters WILL
+    pass the Markdown check -- this confirms "text", not "Markdown", and
+    the gap is accepted because decision 3's serving posture (download
+    only, never rendered inline) makes it inert. Proven inert below by
+    downloading it and asserting the exact same defense-in-depth headers
+    ADR-0012 decision 14 already requires for PDF.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    html = b"<html><body><script>alert(1)</script></body></html>"
+    upload_resp = await _upload(client, owner_headers, room["id"], filename="page.md", content=html)
+    assert upload_resp.status_code == 201, upload_resp.json()
+    attachment_id = upload_resp.json()["id"]
+
+    download_resp = await client.get(
+        f"/v1/rooms/{room['id']}/attachments/{attachment_id}/download", headers=owner_headers
+    )
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-disposition"] == 'attachment; filename="page.md"'
+    assert download_resp.headers["x-content-type-options"] == "nosniff"
+    assert download_resp.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert download_resp.headers["content-type"].startswith("text/markdown")
+    # Served byte-for-byte, unexecuted, unrendered -- the raw HTML text
+    # itself, not stripped/escaped/interpreted in any way.
+    assert download_resp.content == html
+
+
+async def test_upload_pdf_content_named_md_is_still_served_as_pdf(client, db_session):
+    """The 'vice versa' case: a genuine PDF uploaded under a name claiming
+    `.md`. Content alone decides -- the claim never reaches the validator
+    -- so this is detected and served as PDF regardless.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    payload = _pdf_bytes(b"actually a pdf")
+    upload_resp = await _upload(client, owner_headers, room["id"], filename="secret.md", content=payload)
+    assert upload_resp.status_code == 201, upload_resp.json()
+    attachment_id = upload_resp.json()["id"]
+
+    download_resp = await client.get(
+        f"/v1/rooms/{room['id']}/attachments/{attachment_id}/download", headers=owner_headers
+    )
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"].startswith("application/pdf")
+    assert download_resp.content == payload
+
+
+async def test_upload_text_content_named_pdf_is_served_as_markdown(client, db_session):
+    """The other direction: genuinely UTF-8-safe text uploaded under a name
+    claiming `.pdf`. Still detected and served as Markdown -- the `.pdf`
+    claim never overrides what the content-based check actually finds.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    text = b"just plain text, not a pdf at all"
+    upload_resp = await _upload(client, owner_headers, room["id"], filename="doc.pdf", content=text)
+    assert upload_resp.status_code == 201, upload_resp.json()
+    attachment_id = upload_resp.json()["id"]
+
+    download_resp = await client.get(
+        f"/v1/rooms/{room['id']}/attachments/{attachment_id}/download", headers=owner_headers
+    )
+    assert download_resp.status_code == 200
+    assert download_resp.headers["content-type"].startswith("text/markdown")
+    assert download_resp.content == text
 
 
 # --- the agent-upload switch (decisions 7/9) ---
