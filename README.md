@@ -241,6 +241,8 @@ contract for implementing the role in any language.
   API contract for implementing it yourself.
 - [`docs/dev.md`](docs/dev.md) — developer notes: running the stack,
   running tests, tearing down.
+- [`docs/backlog.md`](docs/backlog.md) — known gaps not yet scheduled:
+  what's missing, the evidence, why it matters.
 
 ## Development & testing
 
