@@ -33,7 +33,7 @@ def test_freeform_is_symmetric_with_no_sides_and_no_role_text():
     assert mode_def.role_text is None
     assert mode_def.closing_instruction is None
     assert role_text_for("freeform", None, "anything", "partner") is None
-    assert closing_instruction_for("freeform", None) is None
+    assert closing_instruction_for("freeform", None, 20) is None
 
 
 def test_debate_is_asymmetric_with_for_against_sides():
@@ -87,11 +87,31 @@ def test_critique_role_text_proposer_vs_critic_differ():
 
 
 def test_critique_closing_instruction_differs_by_side():
-    proposer_closing = closing_instruction_for("critique", "proposer")
-    critic_closing = closing_instruction_for("critique", "critic")
+    proposer_closing = closing_instruction_for("critique", "proposer", 20)
+    critic_closing = closing_instruction_for("critique", "critic", 20)
     assert "revised proposal" in proposer_closing
     assert "remaining concerns" in critic_closing
     assert proposer_closing != critic_closing
+
+
+def test_debate_closing_instruction_states_the_consensus_floor_and_objection_requirement():
+    closing = closing_instruction_for("debate", "for", 37)
+    assert "37" in closing
+    assert '"kind": "objection"' in closing
+
+
+def test_critique_closing_instruction_states_the_consensus_floor_and_objection_requirement():
+    closing = closing_instruction_for("critique", "critic", 15)
+    assert "15" in closing
+    assert '"kind": "objection"' in closing
+
+
+def test_collaborate_and_brainstorm_closing_instructions_ignore_consensus_floor():
+    # ADR-0017 decision 3: scope is debate/critique only -- these two
+    # symmetric modes accept the new parameter (uniform Callable signature)
+    # but their closing text is unaffected by it.
+    for mode, side in (("collaborate", None), ("brainstorm", None)):
+        assert closing_instruction_for(mode, side, 5) == closing_instruction_for(mode, side, 500)
 
 
 def test_collaborate_role_text_mentions_partner_and_topic():

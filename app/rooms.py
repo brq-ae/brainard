@@ -38,6 +38,21 @@ MAX_MESSAGES_MAX = 10000
 DEFAULT_MAX_MESSAGES = 100
 REQUIRED_MEMBER_COUNT = 2
 
+# ADR-0017: the minimum message count a debate/critique room must reach
+# before an agent's kind="done" post can close it as agreed. Same
+# bounds-checked-at-create-time shape as max_messages just above --
+# CONSENSUS_FLOOR_MAX deliberately equals MAX_MESSAGES_MAX so the two
+# fields share one upper bound.
+CONSENSUS_FLOOR_MIN = 1
+CONSENSUS_FLOOR_MAX = MAX_MESSAGES_MAX
+DEFAULT_CONSENSUS_FLOOR = 20
+
+# ADR-0017 decision 3: scope is debate/critique only -- the two asymmetric,
+# adversarial modes. freeform/collaborate/brainstorm are unaffected by the
+# consensus-floor/objection gate below, even though every room (regardless
+# of mode) stores a `consensus_floor` value.
+_CONSENSUS_GATED_MODES = frozenset({"debate", "critique"})
+
 # ADR-0007: optional wall-clock deadline. Either `duration_seconds` or an
 # explicit `expires_at` may be given (not both); 30 days is a sane upper
 # bound on how long an unattended room may run for.
@@ -84,6 +99,30 @@ def _validate_max_messages(max_messages: int | None) -> int:
             f"({DEFAULT_MAX_MESSAGES}).",
         )
     return max_messages
+
+
+def _validate_consensus_floor(consensus_floor: int | None) -> int:
+    """ADR-0017 decision 2: same shape as `_validate_max_messages` just
+    above -- an out-of-range or non-int value is rejected with a
+    self-explaining ApiError, not clamped. `None` (omitted) resolves to
+    `DEFAULT_CONSENSUS_FLOOR`. Accepted and stored for every room
+    regardless of mode (like `topic`); the create-time cross-field check
+    against `max_messages` (`create_room`, "consensus_floor_unreachable")
+    only applies for debate/critique.
+    """
+    if consensus_floor is None:
+        return DEFAULT_CONSENSUS_FLOOR
+    if not isinstance(consensus_floor, int) or isinstance(consensus_floor, bool) or not (
+        CONSENSUS_FLOOR_MIN <= consensus_floor <= CONSENSUS_FLOOR_MAX
+    ):
+        raise ApiError(
+            422,
+            "invalid_consensus_floor",
+            f"`consensus_floor` must be an integer between {CONSENSUS_FLOOR_MIN} and {CONSENSUS_FLOOR_MAX}, got "
+            f"{consensus_floor!r}. Recovery: resend within range, or omit it to use the default "
+            f"({DEFAULT_CONSENSUS_FLOOR}).",
+        )
+    return consensus_floor
 
 
 def _validate_topic(mode: str, topic: str | None) -> str | None:
@@ -213,6 +252,7 @@ async def create_room(
     duration_seconds: int | None = None,
     expires_at: datetime | None = None,
     group: str | None = None,
+    consensus_floor: int | None = None,
 ) -> Room:
     """ADR-0007 extends room creation with an optional mode+topic (shapes
     the join prompt's injected role text, app/onboarding.py) and an
@@ -242,6 +282,18 @@ async def create_room(
     exactly as before -- never deferred, even though the room may still be
     waiting when it arrives (decision 7: "an unopened room can still time
     out -- that's what the owner asked for").
+
+    ADR-0017 decision 2: `consensus_floor` (default `DEFAULT_CONSENSUS_FLOOR`
+    20, bounds-checked by `_validate_consensus_floor` the same shape as
+    `max_messages`) is accepted and stored for every room regardless of
+    mode, but cross-validated against `max_messages` only for debate/
+    critique (decision 3): `consensus_floor >= max_messages` is rejected
+    (`ApiError(422, "consensus_floor_unreachable", ...)`), not clamped --
+    the same "reject, don't silently substitute" posture every other
+    cross-field validator here already takes (`_validate_sides` below).
+    Rejecting the whole `>=` range (not just `>`) avoids the room's
+    ordinary message cap (decision 1, `_insert_message_and_maybe_close`)
+    ever being able to fire before an agreed "done" could pass the gate.
     """
     if not name or not name.strip():
         raise ApiError(422, "invalid_room_name", "`name` must be non-empty. Recovery: resend with a non-empty name.")
@@ -251,6 +303,16 @@ async def create_room(
     cleaned_topic = _validate_topic(mode, topic)
     member_sides = _validate_sides(mode, cleaned_members, sides)
     cleaned_group = _validate_group(group)
+    resolved_consensus_floor = _validate_consensus_floor(consensus_floor)
+    if mode in _CONSENSUS_GATED_MODES and resolved_consensus_floor >= resolved_max:
+        raise ApiError(
+            422,
+            "consensus_floor_unreachable",
+            f"`consensus_floor` ({resolved_consensus_floor}) must be less than `max_messages` ({resolved_max}) "
+            f"for mode {mode!r} -- otherwise the message cap could close the room before an agreed \"done\" "
+            "ever gets a chance to pass the gate. Recovery: raise `max_messages`, lower `consensus_floor`, or "
+            f"omit both to use the defaults ({DEFAULT_CONSENSUS_FLOOR}/{DEFAULT_MAX_MESSAGES}).",
+        )
 
     now = datetime.now(UTC)
     # Validates both forms identically (bounds, future-ness, mutual
@@ -284,6 +346,9 @@ async def create_room(
         # `expires_at` is not.
         requires_owner_open=True,
         pending_duration_seconds=duration_seconds if duration_seconds is not None else None,
+        # ADR-0017: stored for every room regardless of mode (see docstring
+        # above) -- only ever read by the gate for debate/critique.
+        consensus_floor=resolved_consensus_floor,
     )
     db.add(room)
     await db.flush()  # room.id must exist before the member rows FK to it
@@ -460,7 +525,11 @@ async def list_room_groups(db: AsyncSession) -> list[str]:
 # --- POST /v1/rooms/{id}/messages ---
 
 MAX_TEXT_BYTES = 32 * 1024
-VALID_POST_KINDS = frozenset({"message", "done"})
+# ADR-0017 decision 4: 'objection' joins 'message'/'done' as a third
+# agent-postable kind -- text is freeform, exactly like every other kind
+# (the server never judges whether a stated objection is substantive, the
+# same posture already taken toward 'done').
+VALID_POST_KINDS = frozenset({"message", "done", "objection"})
 MAX_INSERT_ATTEMPTS = 3
 
 _RECOVERY_MESSAGE_CONFLICT = "resend the same message; the sequence number will be recomputed automatically"
@@ -483,6 +552,118 @@ _ROOM_NOT_OPENED_DIRECTIVE = (
 
 def _room_not_opened_detail(room: Room) -> str:
     return f"Room '{room.name}' has not been opened by its owner yet. {_ROOM_NOT_OPENED_DIRECTIVE}"
+
+
+# ADR-0017 decisions 1/4/5: the consensus-floor-and-objections gate on an
+# AGENT's kind="done" post in a debate/critique room. Directive wording,
+# same register as `_ROOM_NOT_OPENED_DIRECTIVE` above (ADR-0014's
+# precedent, "agents are briefed, not just refused"): names precisely
+# what's missing and tells the agent what to do instead, never a bare
+# retryable 409.
+_CLOSE_AS_AGREED_DIRECTIVE = (
+    "Do not stop -- keep debating/critiquing. If you have not yet posted an objection in this room, post one "
+    'now with an added "kind": "objection" field: state your strongest remaining objection, or explicitly '
+    "state that you have none (e.g. \"No objection -- I'm satisfied with the current position\"). The server "
+    "does not judge whether it's substantive -- it only requires that you go on record. Once the message floor "
+    'is met and both room members have each posted an objection, post "kind": "done" again to close as agreed. '
+    "This is not a retryable error as-is: retrying the identical 'done' post right now will fail the same way."
+)
+
+
+def _close_as_agreed_not_permitted_detail(room: Room, messages_needed: int, missing_objectors: list[str]) -> str:
+    """Names precisely what's missing -- messages still needed to reach the
+    floor, and/or which member(s) haven't posted an objection -- before the
+    directive telling the agent what to do instead (`_CLOSE_AS_AGREED_DIRECTIVE`).
+    """
+    missing_parts = []
+    if messages_needed > 0:
+        missing_parts.append(
+            f"this room has {room.message_count} of the {room.consensus_floor} messages required before an "
+            f"agreed close ({messages_needed} more needed)"
+        )
+    if missing_objectors:
+        who = " and ".join(f"'{m}'" for m in missing_objectors)
+        verb = "has" if len(missing_objectors) == 1 else "have"
+        missing_parts.append(f"{who} still {verb} not posted a \"kind\": \"objection\" message in this room")
+    missing = "; and ".join(missing_parts)
+    return f"This 'done' post cannot close room '{room.name}' as agreed yet: {missing}. {_CLOSE_AS_AGREED_DIRECTIVE}"
+
+
+async def get_consensus_gate_status(db: AsyncSession, room: Room) -> dict | None:
+    """ADR-0017: read-only snapshot of the consensus-floor-and-objections
+    gate state for a debate/critique room -- `{"consensus_floor": int,
+    "message_count": int, "messages_needed": int, "objectors": {agent_name:
+    bool}}`. Returns None for a room whose mode is outside
+    `_CONSENSUS_GATED_MODES` (decision 3: nothing to show/gate).
+
+    Shared by `_check_close_as_agreed_gate` below (the actual enforcement)
+    and the room UI (app/routers/ui_rooms.py's `_room_context`, ADR-0017's
+    UI surfacing: "12/20 messages, objections: Commander [check], Builder
+    [dash]") -- both read exactly this query, so the two can never drift on
+    what counts as "has objected". "Has objected" means appearing at least
+    once as `sender` on a `kind='objection'` row anywhere in the room's
+    history, including a later-tombstoned one: ADR-0015 preserves `kind` on
+    delete (`delete_message`), only `text` is overwritten.
+    """
+    if room.mode not in _CONSENSUS_GATED_MODES:
+        return None
+    members = await get_members(db, room.id)
+    objectors = set(
+        (
+            await db.scalars(
+                select(RoomMessage.sender)
+                .where(RoomMessage.room_id == room.id, RoomMessage.kind == "objection")
+                .distinct()
+            )
+        ).all()
+    )
+    return {
+        "consensus_floor": room.consensus_floor,
+        "message_count": room.message_count,
+        "messages_needed": max(0, room.consensus_floor - room.message_count),
+        "objectors": {member: member in objectors for member in members},
+    }
+
+
+async def _check_close_as_agreed_gate(db: AsyncSession, room: Room, sender: str, kind: str) -> None:
+    """ADR-0017 decisions 1/3/4/6: gates an AGENT's (sender != 'owner')
+    kind="done" post in a debate/critique room behind (a) `room.message_count
+    >= room.consensus_floor` and (b) every room member appearing at least
+    once as `sender` on a `kind='objection'` row in this room -- "at least
+    once, anywhere in the room's history", not immediately preceding this
+    post (decision 4). See `get_consensus_gate_status` above for exactly
+    what counts (including a tombstoned objection).
+
+    No-ops (returns without checking anything) for `sender == 'owner'`
+    (decision 6: the owner is never blocked, and `close_room` -- the
+    owner's Stop control -- never calls this function at all), for
+    `kind != 'done'`, and for any mode outside `_CONSENSUS_GATED_MODES`
+    (decision 3: freeform/collaborate/brainstorm are unaffected) --
+    `get_consensus_gate_status` returning None covers the mode check.
+
+    MUST be called under the room's row lock (`post_message`'s
+    `with_for_update` acquisition), at the same point that function
+    already re-checks `room.status`, and BEFORE the insert retry loop --
+    raising here means nothing is ever inserted (decision 4/5: "reject
+    before any row is written", the same posture every other pre-insert
+    check in `post_message` already has).
+    """
+    if sender == "owner" or kind != "done":
+        return
+    status = await get_consensus_gate_status(db, room)
+    if status is None:
+        return
+
+    missing_objectors = [member for member, objected in status["objectors"].items() if not objected]
+    messages_needed = status["messages_needed"]
+    if messages_needed == 0 and not missing_objectors:
+        return
+
+    raise ApiError(
+        409,
+        "close_as_agreed_not_permitted",
+        _close_as_agreed_not_permitted_detail(room, messages_needed, missing_objectors),
+    )
 
 
 async def _maybe_ping_owner_room_not_opened(room: Room, *, agent_name: str | None) -> None:
@@ -754,6 +935,14 @@ async def post_message(
             f"Room '{room.name}' is closed (reason: {room.close_reason}); no further messages are accepted. "
             "Recovery: start a new room.",
         )
+
+    # ADR-0017 decisions 1/4/5: the consensus-floor-and-objections gate on
+    # an agent's kind="done" post in a debate/critique room -- checked
+    # here, under the row lock just acquired above, before the insert retry
+    # loop below, so a failing gate inserts nothing. No-op for sender ==
+    # 'owner', kind != 'done', or a mode outside scope; see that function's
+    # docstring.
+    await _check_close_as_agreed_gate(db, room, sender, kind)
 
     now = datetime.now(UTC)
     message: RoomMessage | None = None
@@ -1081,7 +1270,12 @@ async def switch_room_mode(
 
     Only an open room may switch (self-explaining 'room_closed', re-checked
     under the lock for the same race reason `close_room`'s own status
-    re-check documents). The announcement is posted the same way
+    re-check documents). Switching INTO `debate`/`critique` additionally
+    re-applies ADR-0017 decision 2's cross-field check (self-explaining
+    'consensus_floor_unreachable', same lock) -- see the check itself,
+    just below the status re-check, for why this is needed even though
+    `create_room` already validates the same combination. The announcement
+    is posted the same way
     `post_closing_nudge` posts the sweeper's nudge: it takes the next `seq`
     and increments `message_count` (so it counts toward the room's cap, per
     ADR-0009 decision 3) but deliberately bypasses `post_message`'s done/cap
@@ -1129,6 +1323,35 @@ async def switch_room_mode(
             "room_closed",
             f"Room '{room.name}' is closed (reason: {room.close_reason}); its mode can no longer be "
             "switched. Recovery: start a new room.",
+        )
+
+    # ADR-0017 decision 2's cross-field check, re-applied here (independent-
+    # review finding): `create_room` rejects `consensus_floor >= max_messages`
+    # for debate/critique at create time, but neither field has a mutator,
+    # and a room's `consensus_floor` is fixed at whatever create_room
+    # accepted for its ORIGINAL mode -- which may have been freeform/
+    # collaborate/brainstorm, where the cross-check never ran at all (decision
+    # 3 scopes it to debate/critique only). Switching such a room INTO
+    # debate/critique would land it in exactly the state decision 2 says must
+    # be rejected, with no check anywhere else to catch it: an agent's
+    # `kind="done"` could then never pass `_check_close_as_agreed_gate`
+    # (`room.message_count` can never reach a floor that is >= the room's own
+    # cap). Checked under the row lock just acquired above -- same
+    # serialization point `room.status` was just re-checked at -- so a
+    # concurrent switch can't race this read. Reject, don't clamp, per the
+    # ADR's own posture: neither `consensus_floor` nor `max_messages` can be
+    # edited on an existing room, so "lower the floor" is not actually an
+    # option here the way it is at create time -- only starting a new room is.
+    if mode in _CONSENSUS_GATED_MODES and room.consensus_floor >= room.max_messages:
+        raise ApiError(
+            409,
+            "consensus_floor_unreachable",
+            f"Switching room '{room.name}' to mode {mode!r} would leave it with consensus_floor "
+            f"({room.consensus_floor}) >= max_messages ({room.max_messages}) -- the same unreachable-gate "
+            "combination `create_room` rejects at create time, and neither value can be changed on an "
+            "existing room. An agent's \"done\" could never pass the consensus gate in this room. Recovery: "
+            f"start a new room in mode {mode!r} with a max_messages/consensus_floor combination where "
+            "consensus_floor < max_messages, or leave this room in its current mode.",
         )
 
     # Members are read (and `sides` validated) only now, under the lock --

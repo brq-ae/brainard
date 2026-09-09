@@ -41,9 +41,13 @@ class RoomMode:
     # filled in. `side` is None for symmetric modes. None for freeform (no
     # special stance text -- the join prompt's generic framing stands).
     role_text: Callable[[str | None, str, str], str] | None
-    # side -> the closing-statement wrap-up instruction. `side` is None for
-    # symmetric modes. None for freeform.
-    closing_instruction: Callable[[str | None], str] | None
+    # (side, consensus_floor) -> the closing-statement wrap-up instruction.
+    # `side` is None for symmetric modes. None for freeform. ADR-0017: the
+    # room's live `consensus_floor` is threaded through so debate/critique's
+    # closing text can state the floor and objection requirement plainly
+    # (decision 5); collaborate/brainstorm accept but ignore the value --
+    # only the two adversarial modes are in scope (decision 3).
+    closing_instruction: Callable[[str | None, int], str] | None
 
 
 def _debate_role_text(side: str | None, topic: str, partner: str) -> str:
@@ -58,15 +62,32 @@ def _debate_role_text(side: str | None, topic: str, partner: str) -> str:
     )
 
 
-def _debate_closing(_side: str | None) -> str:
-    return "As the deadline nears (you'll get a system notice), post a closing statement summarizing your strongest points."
+def _consensus_gate_note(consensus_floor: int) -> str:
+    """ADR-0017 decision 5: the shared sentence appended to both debate's and
+    critique's closing instruction -- states the floor number and the
+    objection requirement concretely, so a compliant agent should never
+    reach `post_message`'s `close_as_agreed_not_permitted` 409 backstop.
+    """
+    return (
+        f"Before a \"done\" post can close this room as agreed, this room requires at least {consensus_floor} "
+        "messages AND both you and your partner to have each posted at least one message with an added "
+        '"kind": "objection" field -- your strongest remaining objection, or an explicit statement that you '
+        "have none. State it whenever you're ready; it doesn't have to be your last message before \"done\"."
+    )
+
+
+def _debate_closing(_side: str | None, consensus_floor: int) -> str:
+    return (
+        "As the deadline nears (you'll get a system notice), post a closing statement summarizing your "
+        f"strongest points. {_consensus_gate_note(consensus_floor)}"
+    )
 
 
 def _collaborate_role_text(_side: str | None, topic: str, partner: str) -> str:
     return f"Collaborate with {partner} to {topic}. Build on each other's contributions and converge on the best result."
 
 
-def _collaborate_closing(_side: str | None) -> str:
+def _collaborate_closing(_side: str | None, _consensus_floor: int) -> str:
     return "When wrapping up, post a short summary of what you concluded or produced together."
 
 
@@ -77,7 +98,7 @@ def _brainstorm_role_text(_side: str | None, topic: str, partner: str) -> str:
     )
 
 
-def _brainstorm_closing(_side: str | None) -> str:
+def _brainstorm_closing(_side: str | None, _consensus_floor: int) -> str:
     return "When wrapping up, post a consolidated list of the best ideas."
 
 
@@ -90,10 +111,13 @@ def _critique_role_text(side: str | None, topic: str, partner: str) -> str:
     )
 
 
-def _critique_closing(side: str | None) -> str:
-    if side == "proposer":
-        return "When wrapping up, post a revised proposal accounting for the critique."
-    return "When wrapping up, post your top remaining concerns."
+def _critique_closing(side: str | None, consensus_floor: int) -> str:
+    base = (
+        "When wrapping up, post a revised proposal accounting for the critique."
+        if side == "proposer"
+        else "When wrapping up, post your top remaining concerns."
+    )
+    return f"{base} {_consensus_gate_note(consensus_floor)}"
 
 
 ROOM_MODES: dict[str, RoomMode] = {
@@ -164,11 +188,14 @@ def role_text_for(mode: str, side: str | None, topic: str, partner: str) -> str 
     return fn(side, topic, partner)
 
 
-def closing_instruction_for(mode: str, side: str | None) -> str | None:
+def closing_instruction_for(mode: str, side: str | None, consensus_floor: int) -> str | None:
     """This mode+side's closing-statement wrap-up instruction, or None for
-    freeform.
+    freeform. ADR-0017: `consensus_floor` is the room's live
+    `Room.consensus_floor` value, interpolated into debate/critique's
+    closing text (decision 5) -- collaborate/brainstorm accept but ignore
+    it.
     """
     fn = ROOM_MODES[mode].closing_instruction
     if fn is None:
         return None
-    return fn(side)
+    return fn(side, consensus_floor)

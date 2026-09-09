@@ -601,6 +601,15 @@ class Room(Base):
     requires_owner_open: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     pending_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     owner_open_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ADR-0017: the minimum message count a debate/critique room must reach
+    # before an agent's `kind="done"` post can close it as agreed (decision
+    # 2) -- stored on every room regardless of mode (same posture `topic`
+    # already has, app/rooms.py's `_validate_topic`: "accepted for every
+    # room... only read by the gate in debate/critique rooms"), not-null,
+    # default 20 (`app/rooms.py`'s `DEFAULT_CONSENSUS_FLOOR`), bounds
+    # 1-10000 validated the same shape `_validate_max_messages` already
+    # uses for `max_messages`.
+    consensus_floor: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
 
     __table_args__ = (
         CheckConstraint("status IN ('open', 'closed')", name="ck_rooms_status"),
@@ -654,7 +663,15 @@ class RoomMessage(Base):
     `seq`, `sender`, `kind`, and `created_at` are never touched by a
     delete, so the transcript's sequence numbering, ordering, and "who
     said something happened here" context all survive intact -- only the
-    row's `text` and this column change.
+    row's `text` and this column change. This is also why ADR-0017's gate
+    can rely on a tombstoned `kind='objection'` row still counting: `kind`
+    survives a delete untouched.
+
+    ADR-0017: `kind='objection'` is a third agent-postable kind (alongside
+    'message'/'done'), added to the CHECK constraint below. `text` on an
+    objection is freeform, exactly like every other kind -- the server
+    never judges whether it's substantive, the same posture already taken
+    toward 'done'.
     """
 
     __tablename__ = "room_messages"
@@ -669,7 +686,7 @@ class RoomMessage(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
-        CheckConstraint("kind IN ('message', 'done', 'system')", name="ck_room_messages_kind"),
+        CheckConstraint("kind IN ('message', 'done', 'system', 'objection')", name="ck_room_messages_kind"),
         # Serves both the "index on (room_id, seq)" and "unique on
         # (room_id, seq)" requirements at once -- a unique index is also a
         # usable index for the ordinary range/cursor lookups.

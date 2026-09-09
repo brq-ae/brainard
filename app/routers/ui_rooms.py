@@ -155,6 +155,7 @@ from app.rooms import create_room as create_room_op
 from app.rooms import delete_message as delete_message_op
 from app.rooms import delete_room as delete_room_op
 from app.rooms import get_all_messages
+from app.rooms import get_consensus_gate_status as get_consensus_gate_status_op
 from app.rooms import get_member_sides, get_members, get_members_for_rooms, get_recent_messages, get_room
 from app.rooms import list_room_groups as list_room_groups_op
 from app.rooms import list_rooms as list_rooms_op
@@ -318,6 +319,7 @@ def _join_prompts_by_member(
             attachments=attachments,
             requires_owner_open=room.requires_owner_open,
             opened_at=room.opened_at,
+            consensus_floor=room.consensus_floor,
         )
         for agent_name in members
     }
@@ -353,12 +355,20 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
     effective = await resolve_llm_config(db)
     llm_configured = bool(effective.base_url and effective.model)
 
+    # ADR-0017 item 8: the consensus-floor-and-objections gate's live
+    # status, for debate/critique rooms only (None for the other three
+    # modes -- see get_consensus_gate_status's docstring) -- surfaced in
+    # the room header so the owner can see why a room hasn't closed as
+    # agreed yet.
+    consensus_gate = await get_consensus_gate_status_op(db, room)
+
     return {
         "room": room,
         "members": members,
         "sides": sides,
         "mode_label": mode_def.label,
         "side_labels": mode_def.side_labels,
+        "consensus_gate": consensus_gate,
         "messages": messages,
         "last_seq": last_seq,
         "join_prompts": _join_prompts_by_member(request, room, members, sides, attachments),
@@ -424,6 +434,12 @@ async def rooms_create(
     agent_a: str = Form(...),
     agent_b: str = Form(...),
     max_messages: str = Form(default=""),
+    # ADR-0017: optional per-room override of the consensus floor (debate/
+    # critique's gate on an agent's "done" post). Same "text field, parsed
+    # like max_messages, domain does the real range check" posture as
+    # max_messages just above -- blank means "use the default"
+    # (create_room's own None -> DEFAULT_CONSENSUS_FLOOR).
+    consensus_floor: str = Form(default=""),
     # notify_on_close is accepted from the form for forward-compatibility
     # with the checkbox rendered in rooms_list.html, but phase A's
     # create_room() has no parameter for it -- it always creates rooms with
@@ -472,6 +488,15 @@ async def rooms_create(
             # than duplicating that validation here.
             parsed_max = 0
 
+    parsed_consensus_floor: int | None = None
+    if consensus_floor.strip():
+        try:
+            parsed_consensus_floor = int(consensus_floor.strip())
+        except ValueError:
+            # Same "feed the domain's own range validator an out-of-range
+            # value" posture as parsed_max above.
+            parsed_consensus_floor = 0
+
     cleaned_topic = topic.strip() or None
     cleaned_group = group.strip() or None
     sides = _sides_for_mode(mode, agent_a, agent_b)
@@ -488,6 +513,7 @@ async def rooms_create(
             sides=sides,
             duration_seconds=duration_seconds,
             group=cleaned_group,
+            consensus_floor=parsed_consensus_floor,
         )
     except ApiError as exc:
         rows, next_cursor = await list_rooms_op(db, limit=ROOM_LIST_LIMIT)
@@ -507,6 +533,7 @@ async def rooms_create(
                     "agent_a": agent_a,
                     "agent_b": agent_b,
                     "max_messages": max_messages,
+                    "consensus_floor": consensus_floor,
                     "mode": mode,
                     "topic": topic,
                     "duration_preset": duration_preset,

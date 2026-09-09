@@ -574,6 +574,13 @@ class RoomCreateRequest(BaseModel):
     # `_validate_group` -- same self-explaining-ApiError reasoning as `mode`
     # above, not a pydantic length constraint here.
     group: str | None = None
+    # ADR-0017: the minimum message count a debate/critique room must reach
+    # before an agent's "done" post can close it as agreed. Accepted (and
+    # stored) for every room regardless of mode -- same posture as `topic`
+    # above -- but only cross-validated against `max_messages` for
+    # debate/critique (app/rooms.py's create_room). None -> the domain's
+    # own DEFAULT_CONSENSUS_FLOOR (20).
+    consensus_floor: int | None = None
 
 
 class RoomCreateResponse(BaseModel):
@@ -588,6 +595,10 @@ class RoomCreateResponse(BaseModel):
     # {agent_name: side} -- side is null for symmetric/freeform members.
     sides: dict[str, str | None]
     group: str | None
+    # ADR-0017: the resolved (default-applied) consensus floor -- stored
+    # for every room regardless of mode, only read by the gate for
+    # debate/critique.
+    consensus_floor: int
 
 
 class RoomListItem(BaseModel):
@@ -604,6 +615,8 @@ class RoomListItem(BaseModel):
     expires_at: datetime | None
     sides: dict[str, str | None]
     group: str | None
+    # ADR-0017: see RoomCreateResponse.consensus_floor.
+    consensus_floor: int
 
 
 class RoomListResponse(BaseModel):
@@ -652,6 +665,8 @@ class RoomDetailResponse(BaseModel):
     # false, may be null even on a room agents have always been free to use).
     opened_at: datetime | None
     requires_owner_open: bool
+    # ADR-0017: see RoomCreateResponse.consensus_floor.
+    consensus_floor: int
     # Most recent N messages, oldest first (chat reading order).
     messages: list[RoomMessageOut]
 

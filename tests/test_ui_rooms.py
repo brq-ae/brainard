@@ -80,6 +80,7 @@ async def _create_room_via_api(
     sides=None,
     duration_seconds=None,
     group=None,
+    consensus_floor=None,
 ) -> dict:
     """Room setup via the phase-A /v1/rooms API -- used by UI tests that need
     a room already in a particular mode/topic/sides/deadline state to then
@@ -100,6 +101,8 @@ async def _create_room_via_api(
         body["duration_seconds"] = duration_seconds
     if group is not None:
         body["group"] = group
+    if consensus_floor is not None:
+        body["consensus_floor"] = consensus_floor
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == 201, resp.json()
     return resp.json()
@@ -981,6 +984,45 @@ async def test_room_join_prompt_debate_contains_stance_topic_and_deadline(client
     assert "You argue AGAINST the proposition: Cats vs dogs" in resp.text
     assert "closing statement" in resp.text.lower()
     assert "Deadline: the room closes at" in resp.text
+
+
+# --- ADR-0017: consensus floor + objection status surfaced on the room page ---
+
+
+async def test_room_view_shows_consensus_floor_and_objection_status(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(
+        client,
+        owner_headers,
+        name="consensus-status-room",
+        members=["alice", "bob"],
+        mode="debate",
+        topic="Cats vs dogs",
+        sides={"alice": "for", "bob": "against"},
+        consensus_floor=5,
+        max_messages=50,
+    )
+    room_id = room["id"]
+    await _open_room_via_api(client, owner_headers, room_id)  # message_count 1
+
+    machine_headers = await _machine_headers(db_session)
+    await _post_message_via_api(client, machine_headers, room_id, sender="alice", text="my objection", kind="objection")
+
+    resp = await client.get(f"/ui/rooms/{room_id}")
+    assert resp.status_code == 200
+    assert "Consensus floor: 2/5 messages" in resp.text
+    assert "alice" in resp.text and "bob" in resp.text
+    # alice has objected (check mark), bob has not (dash).
+    assert "&#10003;" in resp.text
+    assert "&mdash;" in resp.text
+
+
+async def test_room_view_hides_consensus_status_for_freeform_room(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    room = await _create_room_via_api(client, owner_headers, name="freeform-room", members=["alice", "bob"])
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    assert "Consensus floor:" not in resp.text
 
 
 async def test_room_view_topic_xss_escaped_in_header_and_join_prompts(client, db_session):

@@ -311,6 +311,63 @@ def test_room_join_prompt_critique_critic_side():
     assert "post your top remaining concerns" in text
 
 
+# --- ADR-0017: consensus floor + objection requirement stated up front ---
+
+
+def test_room_join_prompt_debate_states_consensus_floor_and_objection_requirement():
+    text = _join_prompt(mode="debate", topic="X", side="for", consensus_floor=37)
+    assert "37" in text
+    assert '"kind": "objection"' in text
+    # Stated in both the session block's closing instruction and how_to
+    # step 4 -- twice, not just once.
+    assert text.count("37") >= 2
+
+
+def test_room_join_prompt_critique_states_consensus_floor_and_objection_requirement():
+    text = _join_prompt(mode="critique", topic="X", side="critic", consensus_floor=12)
+    assert "12" in text
+    assert '"kind": "objection"' in text
+
+
+def test_room_join_prompt_debate_how_to_step4_replaces_the_unconditional_done_wording():
+    # ADR-0017 replaces the previously-unconditional "when you and X agree
+    # the work is done" wording for debate/critique -- a compliant agent
+    # reading this prompt should never think an unconditional 'done' will
+    # succeed.
+    text = _join_prompt(mode="debate", topic="X", side="for", partner_name="Rival", consensus_floor=20)
+    assert "agree the work is done, post a final message" not in text
+    assert "cannot close it as agreed until" in text
+    assert "at least 20 messages" in text
+    assert "'Rival'" in text  # partner named in the concrete requirement
+
+
+def test_room_join_prompt_critique_how_to_step4_replaces_the_unconditional_done_wording():
+    text = _join_prompt(mode="critique", topic="X", side="proposer", consensus_floor=8)
+    assert "agree the work is done, post a final message" not in text
+    assert "cannot close it as agreed until" in text
+    assert "at least 8 messages" in text
+
+
+def test_room_join_prompt_freeform_keeps_unconditional_done_wording():
+    # Scope is debate/critique only -- freeform's how_to step 4 is
+    # untouched by ADR-0017, even though consensus_floor is always passed.
+    text = _join_prompt(consensus_floor=5)
+    assert "agree the work is done, post a final message" in text
+    assert "cannot close it as agreed until" not in text
+
+
+def test_room_join_prompt_collaborate_and_brainstorm_keep_unconditional_done_wording():
+    for mode in ("collaborate", "brainstorm"):
+        text = _join_prompt(mode=mode, topic="X", consensus_floor=5)
+        assert "agree the work is done, post a final message" in text
+        assert "cannot close it as agreed until" not in text
+
+
+def test_room_join_prompt_debate_default_consensus_floor_is_20():
+    text = _join_prompt(mode="debate", topic="X", side="for")
+    assert "at least 20 messages" in text
+
+
 def test_room_join_prompt_deadline_line_present_when_set():
     deadline = datetime(2026, 9, 1, 15, 30, tzinfo=UTC)
     text = _join_prompt(mode="debate", topic="X", side="for", deadline=deadline)

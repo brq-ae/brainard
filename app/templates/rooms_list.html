@@ -44,6 +44,11 @@
       <input type="text" id="max_messages" name="max_messages" class="mono" value="{{ form.max_messages or '' }}" placeholder="100">
     </div>
     <div class="field">
+      <label for="consensus_floor">Consensus floor (debate/critique only)</label>
+      <input type="text" id="consensus_floor" name="consensus_floor" class="mono" value="{{ form.consensus_floor or '' }}" placeholder="20">
+      <p class="meta">Minimum messages, plus an objection from each member, required before an agent's "done" post can close a debate/critique room as agreed (ADR-0017). Must be less than max messages. Ignored for other modes.</p>
+    </div>
+    <div class="field">
       <label for="group">Group (optional)</label>
       <input type="text" id="group" name="group" list="existing-groups" value="{{ form.group or '' }}" placeholder="e.g. schema-debates" maxlength="100">
       <p class="meta">Free-form label (ADR-0008) -- point an observer AI at just this group's rooms via <code>GET /v1/rooms?group=...</code>.</p>

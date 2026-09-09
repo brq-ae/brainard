@@ -56,6 +56,7 @@ async def _create_room(
     duration_seconds=None,
     expires_at=None,
     group=None,
+    consensus_floor=None,
     expect_status=201,
 ) -> dict:
     body: dict = {"name": name, "members": members if members is not None else ["agent-a", "agent-b"]}
@@ -73,6 +74,8 @@ async def _create_room(
         body["expires_at"] = expires_at
     if group is not None:
         body["group"] = group
+    if consensus_floor is not None:
+        body["consensus_floor"] = consensus_floor
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == expect_status, resp.json()
     return resp.json()
@@ -1917,6 +1920,74 @@ async def test_switch_mode_closed_room_rejected(client, db_session):
     assert resp.json()["error"]["code"] == "room_closed"
 
 
+async def test_switch_mode_into_debate_rejected_when_consensus_floor_unreachable(client, db_session):
+    # ADR-0017 decision 2's create-time cross-check never ran for this room
+    # (it was created freeform, where the check is scoped out) -- switching
+    # it INTO debate would land it directly in the state that check exists
+    # to forbid: consensus_floor >= max_messages, an agent 'done' could
+    # never pass the gate. switch_room_mode must catch this itself.
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client, owner_headers, members=["agent-a", "agent-b"], max_messages=5, consensus_floor=10
+    )
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "debate", "topic": "cats vs dogs", "sides": {"agent-a": "for", "agent-b": "against"}},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"]["code"] == "consensus_floor_unreachable"
+    assert "10" in body["error"]["detail"] and "5" in body["error"]["detail"]
+
+    # Untouched by the rejected switch -- still freeform, no announcement posted.
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    detail_body = detail.json()
+    assert detail_body["mode"] == "freeform"
+    assert detail_body["consensus_floor"] == 10
+    assert detail_body["max_messages"] == 5
+
+
+async def test_switch_mode_into_critique_rejected_when_consensus_floor_equals_max_messages(client, db_session):
+    # The `>=` boundary specifically, mirroring create_room's own boundary
+    # test -- floor == cap is rejected, not just floor > cap.
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client, owner_headers, members=["agent-a", "agent-b"], max_messages=20, consensus_floor=20
+    )
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "critique", "topic": "the proposal", "sides": {"agent-a": "proposer", "agent-b": "critic"}},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "consensus_floor_unreachable"
+
+
+async def test_switch_mode_into_non_gated_mode_unaffected_by_unreachable_consensus_floor(client, db_session):
+    # The same unreachable floor/cap combination that blocks a switch INTO
+    # debate/critique (decision 3 scope) must not block a switch into a
+    # mode the gate never applies to.
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client, owner_headers, members=["agent-a", "agent-b"], max_messages=5, consensus_floor=10
+    )
+
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/mode",
+        json={"mode": "collaborate", "topic": "let's build this"},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200
+    detail = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    detail_body = detail.json()
+    assert detail_body["mode"] == "collaborate"
+    assert detail_body["consensus_floor"] == 10  # unchanged -- switch_room_mode has no mutator for it
+    assert detail_body["max_messages"] == 5
+
+
 async def test_switch_mode_unknown_room_404(client, db_session):
     owner_headers = await _owner_headers(db_session)
     resp = await client.post(
@@ -1951,13 +2022,22 @@ async def test_switch_mode_announcement_counts_toward_cap_but_never_trips_it(cli
     """ADR-0009 decision 3: the announcement counts as a message toward the
     cap, but the switch itself must never trip the cap-auto-close -- same
     posture as post_closing_nudge's own sweeper message.
+
+    Switches into `brainstorm`, not `debate`/`critique`: with `max_messages`
+    pinned to 1 (to exercise the cap boundary), no `consensus_floor` >= 1
+    could ever be < max_messages, so a debate/critique target would now
+    correctly trip ADR-0017's own `consensus_floor_unreachable` switch-mode
+    check (a different guardrail than the one under test here) before ever
+    reaching the cap logic this test is actually about. `brainstorm` is
+    outside that gate's scope entirely (decision 3), same as this test's
+    original intent.
     """
     owner_headers = await _owner_headers(db_session)
     room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], max_messages=1)
 
     resp = await client.post(
         f"/v1/rooms/{room['id']}/mode",
-        json={"mode": "debate", "topic": "cats vs dogs", "sides": {"agent-a": "for", "agent-b": "against"}},
+        json={"mode": "brainstorm", "topic": "cats vs dogs"},
         headers=owner_headers,
     )
     assert resp.status_code == 200, resp.json()
@@ -3168,3 +3248,758 @@ async def test_delete_message_race_concurrent_deletes_of_same_message_never_doub
 
             message_row = await check_session.get(RoomMessage, message_id)
             assert message_row.text == "[message deleted by owner]"
+
+
+# --- ADR-0017: consensus floor + objection statements before a debate/
+# critique room closes as agreed ---
+
+
+async def _post(client, headers, room_id, sender, text, kind="message", expect_status=200):
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/messages", json={"sender": sender, "text": text, "kind": kind}, headers=headers
+    )
+    assert resp.status_code == expect_status, resp.json()
+    return resp.json()
+
+
+async def _create_debate_room(client, owner_headers, *, consensus_floor=5, max_messages=50, members=None):
+    members = members or ["agent-a", "agent-b"]
+    sides = {members[0]: "for", members[1]: "against"}
+    room = await _create_room(
+        client,
+        owner_headers,
+        mode="debate",
+        topic="pineapple on pizza",
+        sides=sides,
+        members=members,
+        consensus_floor=consensus_floor,
+        max_messages=max_messages,
+    )
+    await _open_room(client, owner_headers, room["id"])  # seq 1, message_count 1
+    return room
+
+
+# --- create-time: consensus_floor validation ---
+
+
+async def test_create_room_consensus_floor_defaults_to_20(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client, owner_headers, mode="debate", topic="x", sides={"agent-a": "for", "agent-b": "against"}
+    )
+    assert room["consensus_floor"] == 20
+
+
+async def test_create_room_accepts_custom_consensus_floor(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client,
+        owner_headers,
+        mode="debate",
+        topic="x",
+        sides={"agent-a": "for", "agent-b": "against"},
+        consensus_floor=7,
+        max_messages=50,
+    )
+    assert room["consensus_floor"] == 7
+
+
+async def test_create_room_rejects_bad_consensus_floor_zero(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms", json={"name": "r", "members": ["a", "b"], "consensus_floor": 0}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_consensus_floor"
+
+
+async def test_create_room_rejects_bad_consensus_floor_too_large(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms", json={"name": "r", "members": ["a", "b"], "consensus_floor": 10001}, headers=owner_headers
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_consensus_floor"
+
+
+async def test_create_room_debate_rejects_consensus_floor_equal_to_max_messages(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={
+            "name": "r",
+            "members": ["agent-a", "agent-b"],
+            "mode": "debate",
+            "topic": "x",
+            "sides": {"agent-a": "for", "agent-b": "against"},
+            "max_messages": 20,
+            "consensus_floor": 20,
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "consensus_floor_unreachable"
+
+
+async def test_create_room_debate_rejects_consensus_floor_above_max_messages(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={
+            "name": "r",
+            "members": ["agent-a", "agent-b"],
+            "mode": "debate",
+            "topic": "x",
+            "sides": {"agent-a": "for", "agent-b": "against"},
+            "max_messages": 20,
+            "consensus_floor": 25,
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "consensus_floor_unreachable"
+
+
+async def test_create_room_critique_rejects_unreachable_consensus_floor(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    resp = await client.post(
+        "/v1/rooms",
+        json={
+            "name": "r",
+            "members": ["agent-a", "agent-b"],
+            "mode": "critique",
+            "topic": "x",
+            "sides": {"agent-a": "proposer", "agent-b": "critic"},
+            "max_messages": 10,
+            "consensus_floor": 10,
+        },
+        headers=owner_headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "consensus_floor_unreachable"
+
+
+async def test_create_room_freeform_ignores_the_unreachable_floor_cross_check(client, db_session):
+    # Scope is debate/critique only (decision 3) -- freeform stores
+    # whatever consensus_floor it's given without cross-checking it against
+    # max_messages at all.
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, max_messages=10, consensus_floor=10)
+    assert room["consensus_floor"] == 10
+    assert room["max_messages"] == 10
+
+
+# --- the gate itself ---
+
+
+async def test_agent_done_blocked_below_consensus_floor_in_debate_room(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=5)
+    room_id = room["id"]
+
+    # message_count is 1 (the owner's opening message) -- well below floor 5.
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/messages",
+        json={"sender": "agent-a", "text": "I think we're done", "kind": "done"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"]["code"] == "close_as_agreed_not_permitted"
+
+    detail = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail["message_count"] == 1  # API-reported count unchanged
+    assert detail["status"] == "open"
+
+    # Prove database state directly, not just what the API reports: exactly
+    # the one pre-existing row (the owner's opening message), nothing else.
+    rows = (await db_session.scalars(select(RoomMessage).where(RoomMessage.room_id == room_id))).all()
+    assert len(rows) == 1
+    assert rows[0].sender == "owner"
+    room_row = await db_session.get(Room, room_id)
+    assert room_row.message_count == 1
+    assert room_row.status == "open"
+
+
+async def test_agent_done_blocked_when_one_member_has_not_objected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=4)
+    room_id = room["id"]
+
+    await _post(client, machine_headers, room_id, "agent-a", "my strongest objection", kind="objection")  # count 2
+    await _post(client, machine_headers, room_id, "agent-a", "filler")  # count 3
+    await _post(client, machine_headers, room_id, "agent-b", "filler")  # count 4, floor met
+
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/messages",
+        json={"sender": "agent-a", "text": "done now", "kind": "done"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"]["code"] == "close_as_agreed_not_permitted"
+    assert "agent-b" in body["error"]["detail"]  # names the specific missing member
+
+    detail = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail["message_count"] == 4  # API-reported count unchanged
+
+    # Prove database state directly: exactly the 4 pre-race rows, no 'done'
+    # row anywhere, and no orphaned seq beyond 4.
+    rows = (await db_session.scalars(select(RoomMessage).where(RoomMessage.room_id == room_id))).all()
+    assert len(rows) == 4
+    assert {r.kind for r in rows} == {"message", "objection"}  # 'done' never made it into the table
+    assert max(r.seq for r in rows) == 4
+    room_row = await db_session.get(Room, room_id)
+    assert room_row.message_count == 4
+    assert room_row.status == "open"
+
+
+async def test_agent_done_allowed_when_floor_met_and_both_objected(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=4)
+    room_id = room["id"]
+
+    await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+    await _post(client, machine_headers, room_id, "agent-b", "no objection -- satisfied", kind="objection")  # count 3
+    await _post(client, machine_headers, room_id, "agent-a", "filler")  # count 4, floor met
+
+    result = await _post(client, machine_headers, room_id, "agent-b", "agreed, done", kind="done")
+    assert result["room_status"] == "closed"
+    assert result["close_reason"] == "done"
+
+    detail = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail["status"] == "closed"
+    assert detail["close_reason"] == "done"
+
+
+async def test_owner_close_room_bypasses_the_gate_entirely(client, db_session):
+    # Owner Stop (close_room) never consults the gate at all -- unmet floor
+    # and zero objections, yet the owner can still close immediately.
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=20, max_messages=50)
+    room_id = room["id"]
+
+    resp = await client.post(f"/v1/rooms/{room_id}/close", json={}, headers=owner_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "closed"
+    assert body["close_reason"] == "owner"
+
+
+async def test_owner_authored_done_post_bypasses_the_gate(client, db_session):
+    # sender == "owner" posting kind="done" through post_message is exempt
+    # from the gate too (decision 6) -- floor unmet, zero objections.
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=20, max_messages=50)
+    room_id = room["id"]
+
+    result = await _post(client, owner_headers, room_id, "owner", "closing this myself", kind="done")
+    assert result["room_status"] == "closed"
+    assert result["close_reason"] == "done"
+
+
+async def test_freeform_room_done_unaffected_by_consensus_gate(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])  # freeform default
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)  # count 1, well below the default floor of 20
+
+    result = await _post(client, machine_headers, room_id, "agent-a", "done already", kind="done")
+    assert result["room_status"] == "closed"
+    assert result["close_reason"] == "done"
+
+
+async def test_brainstorm_room_done_unaffected_by_consensus_gate(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], mode="brainstorm", topic="x")
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)
+
+    result = await _post(client, machine_headers, room_id, "agent-a", "done already", kind="done")
+    assert result["room_status"] == "closed"
+    assert result["close_reason"] == "done"
+
+
+async def test_collaborate_room_done_unaffected_by_consensus_gate(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], mode="collaborate", topic="x")
+    room_id = room["id"]
+    await _open_room(client, owner_headers, room_id)
+
+    result = await _post(client, machine_headers, room_id, "agent-a", "done already", kind="done")
+    assert result["room_status"] == "closed"
+    assert result["close_reason"] == "done"
+
+
+async def test_objection_kind_is_accepted_and_persisted(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=4)
+    room_id = room["id"]
+
+    await _post(client, machine_headers, room_id, "agent-a", "No objection -- I'm satisfied.", kind="objection")
+
+    detail = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    posted = [m for m in detail["messages"] if m["kind"] == "objection"]
+    assert len(posted) == 1
+    assert posted[0]["text"] == "No objection -- I'm satisfied."
+
+
+async def test_failed_gate_attempt_inserts_nothing_and_seq_has_no_gap(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=10)
+    room_id = room["id"]
+
+    await _post(client, machine_headers, room_id, "agent-a", "filler")  # seq 2, count 2
+
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/messages",
+        json={"sender": "agent-b", "text": "let's call it done", "kind": "done"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 409
+
+    detail_after_failure = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail_after_failure["message_count"] == 2  # API-reported count unchanged
+
+    # Prove database state directly: exactly the 2 pre-attempt rows, no
+    # 'done' row, before the next real message is even posted.
+    rows_after_failure = (await db_session.scalars(select(RoomMessage).where(RoomMessage.room_id == room_id))).all()
+    assert len(rows_after_failure) == 2
+    assert {r.seq for r in rows_after_failure} == {1, 2}
+    assert all(r.kind != "done" for r in rows_after_failure)
+    room_row_after_failure = await db_session.get(Room, room_id)
+    assert room_row_after_failure.message_count == 2
+    assert room_row_after_failure.status == "open"
+
+    next_message = await _post(client, machine_headers, room_id, "agent-b", "still going")
+    assert next_message["seq"] == 3  # no gap -- the failed 'done' never took a seq number
+
+    # And once more, directly: seq 3 is the very next row, with nothing
+    # from the failed 'done' attempt ever having existed in between.
+    rows_final = (await db_session.scalars(select(RoomMessage).where(RoomMessage.room_id == room_id))).all()
+    assert sorted(r.seq for r in rows_final) == [1, 2, 3]
+    assert all(r.kind != "done" for r in rows_final)
+
+
+async def test_close_as_agreed_refusal_is_a_directive_not_a_bare_retryable_error(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=5)
+    room_id = room["id"]
+
+    resp = await client.post(
+        f"/v1/rooms/{room_id}/messages",
+        json={"sender": "agent-a", "text": "done", "kind": "done"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 409
+    message = resp.json()["error"]["detail"]
+    # Names precisely what's missing...
+    assert "4 more" in message  # 1 posted so far, floor 5
+    assert "'agent-a'" in message and "'agent-b'" in message
+    # ...and tells the agent what to do instead, not just that it failed.
+    assert "Do not stop" in message
+    assert "keep debating" in message.lower()
+    assert '"kind": "objection"' in message
+    assert "not a retryable error" in message.lower()
+
+
+# --- ADR-0015 interaction: deletion ---
+
+
+async def test_agreed_closed_room_not_reopened_by_deletion_dropping_count_below_floor(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=3)
+    room_id = room["id"]
+
+    obj_a = await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+    obj_b = await _post(client, machine_headers, room_id, "agent-b", "no objection", kind="objection")  # count 3, floor met
+
+    result = await _post(client, machine_headers, room_id, "agent-a", "agreed, done", kind="done")
+    assert result["room_status"] == "closed"
+    assert result["close_reason"] == "done"
+
+    # Delete both objection messages -- message_count drops from 4 to 2,
+    # below the floor of 3. The already-agreed close must NOT reopen.
+    for msg in (obj_a, obj_b):
+        del_resp = await client.delete(f"/v1/rooms/{room_id}/messages/{msg['id']}", headers=owner_headers)
+        assert del_resp.status_code == 200, del_resp.json()
+
+    detail = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail["message_count"] == 2  # below consensus_floor (3)
+    assert detail["status"] == "closed"  # never reopened
+    assert detail["close_reason"] == "done"
+
+    # And the room still refuses further posts, same as any closed room.
+    still_closed = await client.post(
+        f"/v1/rooms/{room_id}/messages",
+        json={"sender": "agent-a", "text": "hello?"},
+        headers=machine_headers,
+    )
+    assert still_closed.status_code == 409
+    assert still_closed.json()["error"]["code"] == "room_closed"
+
+
+async def test_tombstoned_objection_message_still_counts_toward_the_gate(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=4)
+    room_id = room["id"]
+
+    obj_a = await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+
+    # The owner tombstones agent-a's objection (e.g. it happened to contain
+    # something sensitive) -- deletion decrements message_count (ADR-0015
+    # decision 3) but preserves `kind` (decision 2).
+    del_resp = await client.delete(f"/v1/rooms/{room_id}/messages/{obj_a['id']}", headers=owner_headers)
+    assert del_resp.status_code == 200, del_resp.json()
+
+    row = await db_session.get(RoomMessage, obj_a["id"])
+    assert row.kind == "objection"  # kind survives the tombstone
+    assert row.text == "[message deleted by owner]"
+
+    detail_after_delete = (await client.get(f"/v1/rooms/{room_id}", headers=owner_headers)).json()
+    assert detail_after_delete["message_count"] == 1  # back down after the tombstone freed a slot
+
+    # Bring the room back up to the floor with ordinary messages.
+    await _post(client, machine_headers, room_id, "agent-a", "filler 1")  # count 2
+    await _post(client, machine_headers, room_id, "agent-a", "filler 2")  # count 3
+    await _post(client, machine_headers, room_id, "agent-b", "no objection here", kind="objection")  # count 4, floor met
+
+    # agent-a's objection is tombstoned but still counts -- the gate should
+    # now be satisfied for both members.
+    result = await _post(client, machine_headers, room_id, "agent-b", "let's close it", kind="done")
+    assert result["room_status"] == "closed"
+    assert result["close_reason"] == "done"
+
+
+# --- ADR-0017 concurrency (independent-review finding): none of the tests
+# above exercise a genuine race on `_check_close_as_agreed_gate` -- they are
+# all sequential HTTP calls. These force real interleaving on the room's row
+# lock, same technique as this file's other row-lock races
+# (`_delayed_commit_session` + `asyncio.gather` + an elapsed-time assertion
+# to rule out timing luck, not just decoupled scheduling), calling
+# `post_message`/`delete_message` directly (not through `client`, which
+# can't be made to hold a lock open on demand).
+
+
+async def test_close_as_agreed_gate_race_two_concurrent_done_posts_at_floor(client, db_session):
+    """(a) Two genuinely concurrent kind='done' posts, both otherwise
+    eligible (floor already met, both members already objected before the
+    race starts). Exactly one may close the room as agreed: the winner's
+    'done' lands and closes it; the loser, blocked on the room's row lock
+    until the winner's commit, must see the room already closed (a clean
+    'room_closed' 409) rather than a second close or any corrupted
+    message_count/seq.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
+    room_id = room["id"]
+
+    await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+    await _post(client, machine_headers, room_id, "agent-b", "no objection", kind="objection")  # count 3, floor met
+
+    winner_session = _delayed_commit_session(COMMIT_DELAY)
+    loser_session = AsyncSessionLocal()
+
+    async def run_done_a():
+        async with winner_session:
+            return await post_message_op(
+                winner_session, room_id, "agent-a", "done, agreed", "done", principal=_RACE_MACHINE_PRINCIPAL
+            )
+
+    async def run_done_b():
+        await asyncio.sleep(HEAD_START)
+        async with loser_session:
+            try:
+                return await post_message_op(
+                    loser_session, room_id, "agent-b", "also done", "done", principal=_RACE_MACHINE_PRINCIPAL
+                )
+            except ApiError as exc:
+                return exc
+
+    start = time.monotonic()
+    result_a, result_b = await asyncio.gather(run_done_a(), run_done_b())
+    elapsed = time.monotonic() - start
+
+    # Genuine blocking, not decoupled timing luck.
+    assert elapsed >= COMMIT_DELAY
+
+    message_a, room_after_a = result_a
+    assert message_a.kind == "done"
+    assert room_after_a.status == "closed"
+    assert room_after_a.close_reason == "done"
+
+    # The loser hit the already-closed room's guard -- never a second close.
+    assert isinstance(result_b, ApiError)
+    assert result_b.code == "room_closed"
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room_id)
+        assert final_room.status == "closed"
+        assert final_room.close_reason == "done"
+        assert final_room.message_count == 4  # 3 pre-race + exactly one 'done', never two
+        done_rows = (
+            await check_session.execute(
+                RoomMessage.__table__.select().where(
+                    RoomMessage.__table__.c.room_id == room_id, RoomMessage.__table__.c.kind == "done"
+                )
+            )
+        ).all()
+        assert len(done_rows) == 1  # exactly one 'done' row ever inserted, never two
+
+
+async def test_close_as_agreed_gate_race_objection_wins_against_pending_done(client, db_session):
+    """(b), interleaving 1: agent-b's objection (the LAST one needed to
+    satisfy decision 4) acquires the room's row lock first and holds it
+    (delayed commit) while agent-a's 'done' waits on the same lock. Once
+    the objection's insert is genuinely committed, the done's own gate
+    check -- which only runs after IT acquires the lock next -- must see
+    that fully-committed objection (never a stale pre-race objector set),
+    and, the floor already being met, succeed.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
+    room_id = room["id"]
+
+    await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+    await _post(client, machine_headers, room_id, "agent-b", "filler")  # count 3, floor met; agent-b hasn't objected yet
+
+    winner_session = _delayed_commit_session(COMMIT_DELAY)
+    loser_session = AsyncSessionLocal()
+
+    async def run_objection():
+        async with winner_session:
+            return await post_message_op(
+                winner_session, room_id, "agent-b", "no objection here", "objection", principal=_RACE_MACHINE_PRINCIPAL
+            )
+
+    async def run_done():
+        await asyncio.sleep(HEAD_START)
+        async with loser_session:
+            return await post_message_op(
+                loser_session, room_id, "agent-a", "let's close it", "done", principal=_RACE_MACHINE_PRINCIPAL
+            )
+
+    start = time.monotonic()
+    objection_result, done_result = await asyncio.gather(run_objection(), run_done())
+    elapsed = time.monotonic() - start
+    assert elapsed >= COMMIT_DELAY
+
+    objection_message, _room_after_objection = objection_result
+    assert objection_message.kind == "objection"
+    done_message, room_after_done = done_result
+    assert done_message.kind == "done"
+    assert room_after_done.status == "closed"
+    assert room_after_done.close_reason == "done"
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room_id)
+        assert final_room.status == "closed"
+        assert final_room.message_count == 5  # 3 pre-race + the objection + the done
+
+
+async def test_close_as_agreed_gate_race_done_wins_against_pending_objection(client, db_session, monkeypatch):
+    """(b), interleaving 2, the direction that actually stresses "no torn
+    objection count": agent-a's 'done' acquires the room's row lock FIRST,
+    while agent-b's objection is still in flight, not yet committed. The
+    gate must give the done attempt no credit for an objection that has
+    not actually landed -- it must read exactly the pre-race objector set
+    (agent-a objected, agent-b did not) and correctly reject, inserting
+    nothing. agent-b's objection then proceeds once the lock is released.
+
+    Unlike every other race in this file, the winning side here does NOT
+    commit at all (the gate raises before the insert loop even starts, per
+    `_check_close_as_agreed_gate`'s docstring) -- so `_delayed_commit_session`
+    (which only delays `.commit()`) cannot be used to force genuine
+    blocking on this side; there is no commit to delay. Instead,
+    `_check_close_as_agreed_gate` itself is monkeypatched to sleep before
+    delegating to the real check, while the room's row lock is already held
+    (acquired earlier in `post_message`, before this call) -- forcing the
+    same genuine, elapsed-time-provable blocking the other races get from a
+    delayed commit, without changing what the check actually decides.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
+    room_id = room["id"]
+
+    await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+    await _post(client, machine_headers, room_id, "agent-b", "filler")  # count 3, floor met; agent-b hasn't objected yet
+
+    real_gate_check = rooms_module._check_close_as_agreed_gate
+
+    async def delayed_gate_check(db, room, sender, kind):
+        if kind == "done":
+            await asyncio.sleep(COMMIT_DELAY)
+        return await real_gate_check(db, room, sender, kind)
+
+    monkeypatch.setattr(rooms_module, "_check_close_as_agreed_gate", delayed_gate_check)
+
+    winner_session = AsyncSessionLocal()
+    loser_session = AsyncSessionLocal()
+
+    async def run_done():
+        async with winner_session:
+            try:
+                return await post_message_op(
+                    winner_session, room_id, "agent-a", "let's close it", "done", principal=_RACE_MACHINE_PRINCIPAL
+                )
+            except ApiError as exc:
+                return exc
+
+    async def run_objection():
+        await asyncio.sleep(HEAD_START)
+        async with loser_session:
+            return await post_message_op(
+                loser_session, room_id, "agent-b", "no objection here", "objection", principal=_RACE_MACHINE_PRINCIPAL
+            )
+
+    start = time.monotonic()
+    done_result, objection_result = await asyncio.gather(run_done(), run_objection())
+    elapsed = time.monotonic() - start
+
+    # Genuine blocking: the objection could not have finished before the
+    # done's (patched, but still lock-holding) gate check released the lock.
+    assert elapsed >= COMMIT_DELAY
+
+    assert isinstance(done_result, ApiError)
+    assert done_result.code == "close_as_agreed_not_permitted"
+    assert "agent-b" in done_result.detail  # names the specific missing member
+
+    objection_message, room_after_objection = objection_result
+    assert objection_message.kind == "objection"
+    assert room_after_objection.status == "open"  # the rejected done never closed it
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room_id)
+        assert final_room.status == "open"
+        assert final_room.message_count == 4  # 3 pre-race + the objection only; the failed done inserted nothing
+        done_rows = (
+            await check_session.execute(
+                RoomMessage.__table__.select().where(
+                    RoomMessage.__table__.c.room_id == room_id, RoomMessage.__table__.c.kind == "done"
+                )
+            )
+        ).all()
+        assert done_rows == []  # the rejected done never made it into the table
+
+
+async def test_close_as_agreed_gate_race_delete_wins_against_pending_done(client, db_session):
+    """(c), interleaving 1: the owner's delete of one message (dropping
+    `message_count` back under the floor) acquires the room's row lock
+    first and holds it (delayed commit) while an agent's 'done' waits on
+    the same lock. Once the delete's decrement is genuinely committed, the
+    done's gate check -- reading `message_count` only after it acquires the
+    lock next -- must see that fully-committed, lower count (never a torn
+    read straddling the decrement), and correctly reject.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
+    room_id = room["id"]
+
+    obj_a = await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+    await _post(client, machine_headers, room_id, "agent-b", "no objection", kind="objection")  # count 3, floor met exactly
+
+    winner_session = _delayed_commit_session(COMMIT_DELAY)
+    loser_session = AsyncSessionLocal()
+
+    async def run_delete():
+        async with winner_session:
+            return await delete_message_op(winner_session, room_id, obj_a["id"])
+
+    async def run_done():
+        await asyncio.sleep(HEAD_START)
+        async with loser_session:
+            try:
+                return await post_message_op(
+                    loser_session, room_id, "agent-a", "let's close it", "done", principal=_RACE_MACHINE_PRINCIPAL
+                )
+            except ApiError as exc:
+                return exc
+
+    start = time.monotonic()
+    delete_result, done_result = await asyncio.gather(run_delete(), run_done())
+    elapsed = time.monotonic() - start
+    assert elapsed >= COMMIT_DELAY
+
+    deleted_message, _room_after_delete = delete_result
+    assert deleted_message.deleted_at is not None
+
+    # The done's gate check saw the post-delete count (2), below the floor
+    # (3) -- correctly rejected, nothing inserted. (agent-a's tombstoned
+    # objection still counts as an objection per ADR-0015/0017 interaction,
+    # so this is purely a message_count boundary case, not an objector one.)
+    assert isinstance(done_result, ApiError)
+    assert done_result.code == "close_as_agreed_not_permitted"
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room_id)
+        assert final_room.status == "open"
+        assert final_room.message_count == 2  # the tombstone's decrement landed; the failed done inserted nothing
+
+
+async def test_close_as_agreed_gate_race_done_wins_against_pending_delete(client, db_session):
+    """(c), interleaving 2: the done attempt acquires the room's row lock
+    first, while a concurrent delete (which would drop message_count under
+    the floor) is still in flight. The done's gate check must see the
+    still-full pre-delete count (genuinely committed, not a preview of a
+    not-yet-applied decrement) and succeed; the delete then applies after
+    the close, decrementing message_count on an already-closed room without
+    reopening it (ADR-0015 decision 4, exercised here under real
+    concurrency rather than sequentially).
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
+    room_id = room["id"]
+
+    obj_a = await _post(client, machine_headers, room_id, "agent-a", "my objection", kind="objection")  # count 2
+    await _post(client, machine_headers, room_id, "agent-b", "no objection", kind="objection")  # count 3, floor met exactly
+
+    winner_session = _delayed_commit_session(COMMIT_DELAY)
+    loser_session = AsyncSessionLocal()
+
+    async def run_done():
+        async with winner_session:
+            return await post_message_op(
+                winner_session, room_id, "agent-a", "let's close it", "done", principal=_RACE_MACHINE_PRINCIPAL
+            )
+
+    async def run_delete():
+        await asyncio.sleep(HEAD_START)
+        async with loser_session:
+            return await delete_message_op(loser_session, room_id, obj_a["id"])
+
+    start = time.monotonic()
+    done_result, delete_result = await asyncio.gather(run_done(), run_delete())
+    elapsed = time.monotonic() - start
+    assert elapsed >= COMMIT_DELAY
+
+    done_message, room_after_done = done_result
+    assert done_message.kind == "done"
+    assert room_after_done.status == "closed"
+    assert room_after_done.close_reason == "done"
+
+    deleted_message, room_after_delete = delete_result
+    assert deleted_message.deleted_at is not None
+    assert room_after_delete.status == "closed"  # the delete never reopens an already-agreed close
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room_id)
+        assert final_room.status == "closed"
+        assert final_room.close_reason == "done"
+        # 3 pre-race + the done (count 4) - the delete's decrement (count 3).
+        assert final_room.message_count == 3

@@ -53,6 +53,14 @@ after `intro` -- AHEAD OF EVEN the file-policy block above, becoming the
 first thing a joining agent reads: it governs whether the agent may act on
 anything else in the prompt yet. A compliant agent that reads it should
 never reach `post_message`'s `room_not_opened` 403 backstop.
+
+ADR-0017 further extends `generate_room_join_prompt` with a
+`consensus_floor` parameter, threaded into `_room_session_block`'s
+debate/critique closing instruction and into `how_to` step 4: a
+debate/critique room's "done" close is no longer unconditional, so both
+places now state the room's live consensus-floor-and-objections
+requirement concretely, before an agent could ever reach `post_message`'s
+`close_as_agreed_not_permitted` 409 backstop.
 """
 
 from datetime import UTC, datetime
@@ -185,7 +193,7 @@ def generate_onboarding_prompt(
 
 
 def _room_session_block(
-    mode: str, topic: str | None, side: str | None, partner: str, deadline: datetime | None
+    mode: str, topic: str | None, side: str | None, partner: str, deadline: datetime | None, consensus_floor: int
 ) -> str | None:
     """The ADR-0007 "session" paragraph: a "This is a <mode label> session"
     header, this agent's mode+side role text (topic/partner filled in) and
@@ -193,6 +201,12 @@ def _room_session_block(
     a deadline line if the room has one. Returns None for 'freeform': no
     special stance text, the join prompt's existing generic framing stands
     unchanged.
+
+    ADR-0017: `consensus_floor` (the room's live `Room.consensus_floor`) is
+    threaded through to `closing_instruction_for` so a debate/critique
+    room's closing instruction states the floor number and the objection
+    requirement concretely (decision 5) -- ignored by collaborate/
+    brainstorm's closing text, and never reached at all for freeform.
     """
     role_text = role_text_for(mode, side, topic or "", partner)
     if role_text is None:  # freeform
@@ -201,7 +215,7 @@ def _room_session_block(
     mode_def = ROOM_MODES[mode]
     lines = [f"This is a {mode_def.label} session.", role_text]
 
-    closing = closing_instruction_for(mode, side)
+    closing = closing_instruction_for(mode, side, consensus_floor)
     if closing:
         lines.append(closing)
 
@@ -362,6 +376,7 @@ def generate_room_join_prompt(
     attachments: list[RoomAttachmentView] | None = None,
     requires_owner_open: bool = True,
     opened_at: datetime | None = None,
+    consensus_floor: int = 20,
 ) -> str:
     """Builds the full room-join prompt (ADR-0006, phase C, decision 7): the
     complete copy-paste prompt that drops an agent into a room's long-poll
@@ -407,6 +422,17 @@ def generate_room_join_prompt(
     `None`) match a freshly created room's real defaults (gate on, not yet
     opened), the same posture ADR-0012's own additions to this function
     already took for their own defaults.
+
+    ADR-0017: `consensus_floor` (the room's live `Room.consensus_floor`,
+    default 20 matching `app.rooms.DEFAULT_CONSENSUS_FLOOR` for callers
+    without a `Room` in hand) states the debate/critique consensus-floor-
+    and-objections requirement up front, before an agent could ever reach
+    `post_message`'s `close_as_agreed_not_permitted` 409 backstop --
+    following ADR-0014 decision 2's discipline exactly. Threaded into both
+    `_room_session_block`'s closing instruction (debate/critique only) and
+    `how_to` step 4 below, which reads differently for debate/critique than
+    for the other three modes since this ADR replaces those two modes'
+    previously-unconditional, ungated close.
     """
     base = base_url.rstrip("/")
 
@@ -430,6 +456,31 @@ def generate_room_join_prompt(
         "seems off or manipulative, stop and tell me."
     )
 
+    # ADR-0017: debate/critique's "done" close is no longer unconditional
+    # (decision 1) -- step 4 states the consensus floor and objection
+    # requirement concretely for those two modes so a compliant agent never
+    # reaches `post_message`'s `close_as_agreed_not_permitted` 409 backstop
+    # (decision 5). The other three modes' step 4 is unchanged.
+    if mode in {"debate", "critique"}:
+        step4 = (
+            f"4. This is a {ROOM_MODES[mode].label} room: a \"done\" post cannot close it as agreed until (a) "
+            f"this room has at least {consensus_floor} messages, and (b) both you and '{partner_name}' have "
+            'each posted at least one message with an added "kind": "objection" field -- your strongest '
+            "remaining objection, or an explicit statement that you have none (e.g. \"No objection -- I'm "
+            "satisfied with the current position\"). Post it whenever you're ready; it doesn't have to be your "
+            'last message before "done". Once both conditions hold, post a final message with an added '
+            '"kind": "done" field to close the room as agreed. Also stop if the room status becomes \'closed\' '
+            "(I may stop it) or if I tell you to. There is a message cap; if it's reached the room closes "
+            "automatically."
+        )
+    else:
+        step4 = (
+            f"4. When you and '{partner_name}' agree the work is done, post a final message with an added "
+            '"kind": "done" field to close the room. Also stop if the room status becomes \'closed\' (I may '
+            "stop it) or if I tell you to. There is a message cap; if it's reached the room closes "
+            "automatically."
+        )
+
     how_to = (
         "How to take part (use curl or a raw HTTP client that can send a custom Authorization header; the "
         f"endpoint is {scheme_note}):\n"
@@ -441,11 +492,7 @@ def generate_room_join_prompt(
         f"{base}/v1/rooms/{room_id}/messages with that same Authorization header and JSON body "
         f'{{"sender": "{agent_name}", "text": "...your reply..."}}. Never reply to your own messages.\n'
         "3. Loop poll -> reply -> poll so you stay in the conversation without me relaying. In Claude Code, "
-        "running this as a self-paced /loop works well.\n"
-        f"4. When you and '{partner_name}' agree the work is done, post a final message with an added "
-        '"kind": "done" field to close the room. Also stop if the room status becomes \'closed\' (I may '
-        "stop it) or if I tell you to. There is a message cap; if it's reached the room closes "
-        "automatically."
+        "running this as a self-paced /loop works well.\n" + step4
     )
 
     keep_me_informed = "Keep me informed per G9 (notify me when you're blocked or when the room work is done)."
@@ -460,7 +507,7 @@ def generate_room_join_prompt(
         attachments=attachments or [],
     )
 
-    session_block = _room_session_block(mode, topic, side, partner_name, deadline)
+    session_block = _room_session_block(mode, topic, side, partner_name, deadline, consensus_floor)
     # ADR-0014 decision 2: the open-gate paragraph is placed right after
     # intro, AHEAD OF EVEN the file policy block -- it governs whether
     # anything else here (including the file policy) may be acted on yet.

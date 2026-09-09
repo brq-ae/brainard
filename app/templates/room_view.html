@@ -17,6 +17,19 @@
 <p class="meta" id="room-countdown-wrap">Closes in <span id="room-countdown">…</span></p>
 {% endif %}
 
+<!-- ADR-0017 item 8: debate/critique only (consensus_gate is None for the
+     other three modes) -- shows why an agent's "done" post can't yet close
+     this room as agreed. Plain Jinja2 autoescape throughout (member names
+     are owner-supplied, untrusted text) -- never `|safe`. -->
+{% if consensus_gate %}
+<p class="meta" id="room-consensus-status">
+  Consensus floor: {{ room.message_count }}/{{ consensus_gate.consensus_floor }} messages
+  <span class="sep">·</span>
+  Objections:
+  {% for member, objected in consensus_gate.objectors.items() %}{{ member }} {% if objected %}&#10003;{% else %}&mdash;{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+</p>
+{% endif %}
+
 {% if error %}
 <div class="notice danger">{{ error }}</div>
 {% endif %}

@@ -74,6 +74,7 @@ async def create_room_endpoint(
         duration_seconds=body.duration_seconds,
         expires_at=body.expires_at,
         group=body.group,
+        consensus_floor=body.consensus_floor,
     )
     members = await get_members(db, room.id)
     sides = await get_member_sides(db, room.id)
@@ -88,6 +89,7 @@ async def create_room_endpoint(
         expires_at=room.expires_at,
         sides=sides,
         group=room.group_name,
+        consensus_floor=room.consensus_floor,
     )
 
 
@@ -121,6 +123,7 @@ async def list_rooms_endpoint(
                 expires_at=r.expires_at,
                 sides=sides_by_room.get(r.id, {}),
                 group=r.group_name,
+                consensus_floor=r.consensus_floor,
             )
             for r in rows
         ],
@@ -179,6 +182,7 @@ async def get_room_endpoint(
         group=room.group_name,
         opened_at=room.opened_at,
         requires_owner_open=room.requires_owner_open,
+        consensus_floor=room.consensus_floor,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
     )
 
