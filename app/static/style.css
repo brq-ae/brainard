@@ -115,6 +115,13 @@ main {
   margin-bottom: 20px;
 }
 
+/* ADR-0019 decision 1: a panel heading sitting alongside an action button
+   (e.g. "New room" + "Copy room-setup briefing") -- kept as siblings, both
+   outside any <details>, so a button here can never double-toggle a
+   disclosure it isn't nested inside. */
+.panel-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.panel-header h2 { margin: 0; }
+
 .grid { display: grid; gap: 16px; }
 .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 .grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }

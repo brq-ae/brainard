@@ -84,6 +84,39 @@ async def version_history(db: AsyncSession) -> list[DoctrineVersion]:
     return list(rows)
 
 
+def doctrine_copy_text(version_label: str, rules: list[dict]) -> str:
+    """ADR-0019 decision 4: builds the "Copy doctrine" text from exactly the
+    rules currently marked `external_safe` (in `rules`' own order) -- every
+    included rule's `text` copied verbatim, never paraphrased or trimmed.
+    Shared by the UI doctrine page's server-rendered initial hidden element
+    (app/routers/ui_doctrine.py) and mirrored -- not imported, since there
+    is no server round trip once the page has loaded -- by
+    app/static/doctrine_copy.js's client-side rebuild on every checkbox
+    change, so a copy made before ever touching a checkbox and a copy made
+    after are built from the identical framing text and rule-line shape.
+
+    `version_label` is the doctrine version string this text is based on
+    (e.g. "global:v3") -- always stated, so the owner can tell what a given
+    paste came from (decision 4). `rules` is the FULL rule list (any
+    tier -- non_negotiable and default are both eligible, tier governs
+    project-overlay overridability inside Brainard, orthogonal to
+    portability outside it); only rules with a truthy `external_safe` are
+    included. A rule with no `external_safe` key at all (every rule
+    authored before this field existed) is excluded -- the same fail-closed
+    default `DoctrineRuleIn.external_safe: bool = False` gives it
+    everywhere else (app/schemas.py).
+    """
+    framing = (
+        f"These are operating rules from my Brainard doctrine ({version_label}) that I want you to adopt "
+        "for the remainder of this conversation. They are a deliberately chosen subset of a larger "
+        "doctrine: the rules below are the ones that make sense without access to my system; the absence "
+        "of a rule here doesn't mean it doesn't apply elsewhere, only that it doesn't translate to a "
+        "conversation like this one."
+    )
+    lines = [f"- {r['id']}: {r['text']}" for r in rules if r.get("external_safe")]
+    return framing + ("\n\n" + "\n".join(lines) if lines else "")
+
+
 def stale_override_reason(global_rules_by_id: dict[str, dict], override_id: str) -> str | None:
     """Closes the phase 4 advisory at the UI layer (phase 6 brief): an
     overlay override whose target rule is now `non_negotiable` (a tier

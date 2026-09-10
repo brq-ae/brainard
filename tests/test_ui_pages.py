@@ -254,6 +254,236 @@ async def test_doctrine_stale_override_marked_when_target_no_longer_exists(clien
     assert "no longer exists" in resp.text.lower()
 
 
+# --- ADR-0019 decision 4: "Copy doctrine" checklist -- external_safe,
+# owner-only, starts empty for today's (unflagged) rules, round-trips
+# without a migration (`rules` is an unconstrained JSONB column,
+# app/models.py's DoctrineVersion -- see app/schemas.py's DoctrineRuleIn
+# docstring for why no alembic revision is needed). ---
+
+
+async def test_doctrine_checklist_starts_empty_with_todays_unflagged_rules(client, db_session):
+    """None of the owner's rules have ever had `external_safe` posted (the
+    field didn't exist before this feature) -- every checkbox must render
+    unchecked, and the hidden copy text must carry no rule lines (framing
+    only), exactly ADR-0019's stated "accepted, temporary cost."
+    """
+    owner_token = generate_owner_token()
+    db_session.add(OwnerToken(token_hash=hash_token(owner_token)))
+    await db_session.commit()
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+
+    r = await client.post(
+        "/v1/doctrine/global",
+        json={
+            "content": "g1",
+            "rules": [
+                {"id": "G1", "tier": "non_negotiable", "text": "Never assume."},
+                {"id": "G2", "tier": "default", "text": "Prefer small commits."},
+            ],
+        },
+        headers=owner_headers,
+    )
+    assert r.status_code == 201
+
+    await client.post("/ui/login", data={"token": owner_token})
+    resp = await client.get("/ui/doctrine")
+    assert resp.status_code == 200
+    assert 'id="doctrine-checklist"' in resp.text
+    assert "checked" not in resp.text.split('id="doctrine-checklist"', 1)[1].split("</ul>", 1)[0]
+
+    briefing = resp.text.split('id="doctrine-briefing-text"', 1)[1].split("</pre>", 1)[0]
+    assert "Never assume." not in briefing
+    assert "Prefer small commits." not in briefing
+    assert "global:v1" in briefing  # version is still stated even with nothing selected
+
+
+async def test_doctrine_checklist_preselects_only_external_safe_rules(client, db_session):
+    owner_token = generate_owner_token()
+    db_session.add(OwnerToken(token_hash=hash_token(owner_token)))
+    await db_session.commit()
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+
+    r = await client.post(
+        "/v1/doctrine/global",
+        json={
+            "content": "g1",
+            "rules": [
+                {"id": "G1", "tier": "non_negotiable", "text": "Never assume.", "external_safe": True},
+                {"id": "G2", "tier": "default", "text": "Prefer small commits.", "external_safe": False},
+                {"id": "G4", "tier": "default", "text": "Deposit a handoff at session end."},  # unflagged
+            ],
+        },
+        headers=owner_headers,
+    )
+    assert r.status_code == 201
+
+    await client.post("/ui/login", data={"token": owner_token})
+    resp = await client.get("/ui/doctrine")
+    assert resp.status_code == 200
+
+    checklist = resp.text.split('id="doctrine-checklist"', 1)[1].split("</ul>", 1)[0]
+
+    def _input_tag_for(rule_id: str) -> str:
+        marker = f'data-rule-id="{rule_id}"'
+        idx = checklist.index(marker)
+        tag_start = checklist.rindex("<input", 0, idx)
+        tag_end = checklist.index(">", idx)
+        return checklist[tag_start : tag_end + 1]
+
+    assert "checked" in _input_tag_for("G1")  # external_safe: true
+    assert "checked" not in _input_tag_for("G2")  # external_safe: false
+    assert "checked" not in _input_tag_for("G4")  # no external_safe key at all -- fail closed
+
+    briefing = resp.text.split('id="doctrine-briefing-text"', 1)[1].split("</pre>", 1)[0]
+    assert "- G1: Never assume." in briefing
+    assert "Prefer small commits." not in briefing
+    assert "Deposit a handoff" not in briefing
+
+
+async def test_doctrine_checklist_and_copy_button_owner_only(client, db_session):
+    owner_token = generate_owner_token()
+    db_session.add(OwnerToken(token_hash=hash_token(owner_token)))
+    await db_session.commit()
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    await client.post(
+        "/v1/doctrine/global",
+        json={"content": "g1", "rules": [{"id": "G1", "tier": "non_negotiable", "text": "Never assume."}]},
+        headers=owner_headers,
+    )
+
+    # No cookie session at all -- require_ui_session redirects to /ui/login,
+    # same as every other /ui/* page; no new gating was added for this.
+    resp = await client.get("/ui/doctrine", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+    # Same guarantee, demonstrated the same way as
+    # test_ui_rooms.py's test_rooms_list_machine_token_cannot_reach_ui: a
+    # valid machine bearer token is not a UI cookie session either --
+    # require_ui_session doesn't accept it as a substitute.
+    machine_headers = await _machine_headers(db_session)
+    resp = await client.get("/ui/doctrine", headers=machine_headers, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/ui/login"
+
+
+async def test_doctrine_checklist_omitted_when_no_global_doctrine(client, db_session):
+    await _login(client, db_session)
+    resp = await client.get("/ui/doctrine")
+    assert resp.status_code == 200
+    assert "doctrine-checklist" not in resp.text
+    assert "doctrine-briefing-text" not in resp.text
+
+
+async def test_doctrine_copy_button_uses_shared_data_copy_target_handler(client, db_session):
+    """No second copy path (ADR-0019 decision 5) -- the button is an
+    ordinary [data-copy-target] button pointing at the hidden element, same
+    markup shape as every other copy button on this site.
+    """
+    owner_token = generate_owner_token()
+    db_session.add(OwnerToken(token_hash=hash_token(owner_token)))
+    await db_session.commit()
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    await client.post(
+        "/v1/doctrine/global",
+        json={"content": "g1", "rules": [{"id": "G1", "tier": "non_negotiable", "text": "Never assume."}]},
+        headers=owner_headers,
+    )
+
+    await client.post("/ui/login", data={"token": owner_token})
+    resp = await client.get("/ui/doctrine")
+    assert resp.status_code == 200
+    assert 'data-copy-target="doctrine-briefing-text"' in resp.text
+    assert '<script src="/static/doctrine_copy.js"></script>' in resp.text
+    assert '<script src="/static/main.js">' in resp.text  # unmodified shared handler still loaded
+
+
+async def test_doctrine_rule_text_xss_escaped_in_checklist_and_copy_text(client, db_session):
+    """A rule's `text` is owner-authored via the API, but still untrusted
+    content by this UI's own discipline for everything it renders -- must
+    never appear as raw, executable markup in either the checkbox label or
+    the `data-rule-text` attribute the copy text is built from.
+    """
+    from markupsafe import escape as markupsafe_escape
+
+    xss_payload = "<script>alert(1)</script>"
+    owner_token = generate_owner_token()
+    db_session.add(OwnerToken(token_hash=hash_token(owner_token)))
+    await db_session.commit()
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    await client.post(
+        "/v1/doctrine/global",
+        json={
+            "content": "g1",
+            "rules": [{"id": "G1", "tier": "default", "text": xss_payload, "external_safe": True}],
+        },
+        headers=owner_headers,
+    )
+
+    await client.post("/ui/login", data={"token": owner_token})
+    resp = await client.get("/ui/doctrine")
+    assert resp.status_code == 200
+    assert xss_payload not in resp.text
+    assert str(markupsafe_escape(xss_payload)) in resp.text
+
+
+# --- ADR-0019: external_safe round-trips through a doctrine POST without a
+# migration (`rules` is an unconstrained JSONB column already, so a new key
+# needs no alembic revision -- the round trip through storage and back out
+# into the UI checklist IS the evidence). ---
+
+
+async def test_external_safe_round_trips_through_doctrine_post_and_storage(client, db_session):
+    from sqlalchemy import select
+
+    from app.models import DoctrineVersion
+
+    owner_token = generate_owner_token()
+    db_session.add(OwnerToken(token_hash=hash_token(owner_token)))
+    await db_session.commit()
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+
+    r = await client.post(
+        "/v1/doctrine/global",
+        json={
+            "content": "g1",
+            "rules": [{"id": "G1", "tier": "non_negotiable", "text": "Never assume.", "external_safe": True}],
+        },
+        headers=owner_headers,
+    )
+    assert r.status_code == 201
+
+    # Read the raw stored JSONB column back directly -- no schema/migration
+    # involved, `rules` already accepts an arbitrary dict shape.
+    row = (await db_session.execute(select(DoctrineVersion).where(DoctrineVersion.kind == "global"))).scalar_one()
+    assert row.rules[0]["external_safe"] is True
+
+    # And back out through the UI checklist, which is what actually reads
+    # this field (app/routers/ui_doctrine.py's `all_global_rules`).
+    await client.post("/ui/login", data={"token": owner_token})
+    resp = await client.get("/ui/doctrine")
+    assert "- G1: Never assume." in resp.text.split('id="doctrine-briefing-text"', 1)[1].split("</pre>", 1)[0]
+
+
+async def test_doctrine_global_post_omitting_external_safe_still_works_old_caller_compatible(client, db_session):
+    """Additive/backward-compatible (ADR-0019 Consequences): an existing
+    caller of POST /v1/doctrine/global that never heard of `external_safe`
+    keeps working exactly as before, defaulting every rule closed.
+    """
+    owner_token = generate_owner_token()
+    db_session.add(OwnerToken(token_hash=hash_token(owner_token)))
+    await db_session.commit()
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+
+    r = await client.post(
+        "/v1/doctrine/global",
+        json={"content": "g1", "rules": [{"id": "G1", "tier": "non_negotiable", "text": "Never assume."}]},
+        headers=owner_headers,
+    )
+    assert r.status_code == 201
+    assert r.json()["rules"][0]["id"] == "G1"  # unaffected -- old response shape intact
+
+
 # --- XSS: AI-written entry bodies must render escaped/sanitized ---
 
 

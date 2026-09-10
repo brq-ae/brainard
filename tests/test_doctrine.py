@@ -3,6 +3,7 @@ GET /v1/doctrine (contracts-v1.md §4)."""
 
 from ulid import ULID
 
+from app.doctrine import doctrine_copy_text
 from app.models import Machine, OwnerToken, Project
 from app.security import generate_machine_token, generate_owner_token, hash_token
 
@@ -310,6 +311,61 @@ async def test_adr0012_cleanup_rule_accepted_and_classified_default_not_non_nego
     global_rules_by_id = {r["id"]: r for r in get_resp.json()["global"]["rules"]}
     assert global_rules_by_id["G11"]["tier"] == "default"
     assert global_rules_by_id["G11"]["tier"] != "non_negotiable"
+
+
+# --- ADR-0019 decision 4: "Copy doctrine" -- doctrine_copy_text (the pure
+# function shared, conceptually, by the server-rendered initial hidden
+# element and app/static/doctrine_copy.js's client-side rebuild) ---
+
+
+def test_doctrine_copy_text_includes_only_external_safe_rules_verbatim():
+    rules = [
+        {"id": "G1", "tier": "non_negotiable", "text": "Never assume.", "external_safe": True},
+        {"id": "G2", "tier": "non_negotiable", "text": "Never guess.", "external_safe": False},
+        {"id": "G3", "tier": "default", "text": "Prefer small commits."},  # no key at all -- legacy rule
+    ]
+    text = doctrine_copy_text("global:v1", rules)
+    assert "- G1: Never assume." in text
+    assert "G2" not in text
+    assert "Never guess." not in text
+    assert "G3" not in text
+    assert "Prefer small commits." not in text
+
+
+def test_doctrine_copy_text_states_the_version():
+    text = doctrine_copy_text("global:v7", [])
+    assert "global:v7" in text
+
+
+def test_doctrine_copy_text_frames_as_deliberate_subset():
+    text = doctrine_copy_text("global:v1", [])
+    assert "deliberately chosen" in text
+    assert "doesn't mean it doesn't apply elsewhere" in text
+    assert "adopt" in text.lower()
+
+
+def test_doctrine_copy_text_empty_when_nothing_flagged_external_safe():
+    """Every one of the owner's CURRENT rules was authored before this field
+    existed, so none has `external_safe: true` yet (ADR-0019 Consequences:
+    "the checklist starts empty until the owner re-authors doctrine") --
+    the copy text still names the version and the framing, just with no
+    rule lines appended.
+    """
+    rules = [
+        {"id": "G1", "tier": "non_negotiable", "text": "Never assume."},
+        {"id": "G2", "tier": "default", "text": "Prefer small commits."},
+    ]
+    text = doctrine_copy_text("global:v1", rules)
+    assert "G1" not in text
+    assert "G2" not in text
+    assert "Never assume." not in text
+
+
+def test_doctrine_copy_text_preserves_rule_text_exactly_never_paraphrased():
+    long_text = "Do the thing, exactly like THIS -- with punctuation, symbols (100%), and a trailing colon:"
+    rules = [{"id": "G9", "tier": "default", "text": long_text, "external_safe": True}]
+    text = doctrine_copy_text("global:v1", rules)
+    assert long_text in text
 
 
 async def test_adr0012_cleanup_rule_is_overridable_like_any_default_tier_rule(client, db_session):

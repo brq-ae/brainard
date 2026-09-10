@@ -34,6 +34,41 @@
   <h3>Full text</h3>
   <div class="entry-body">{{ global_row.content | md }}</div>
 </div>
+
+<!-- ADR-0019 decision 4: "Copy doctrine" -- a checklist of whole rules
+     (never paraphrased or trimmed) for handing a deliberately chosen
+     subset of doctrine to an external LLM conversation that can't reach
+     the Brain. Owner-only, same require_ui_session posture as the rest of
+     this page -- no new gating. Omitted entirely when there's no global
+     doctrine (the enclosing "not global_row" check above already covers
+     that). -->
+<div class="panel">
+  <div class="panel-header">
+    <h2>Copy doctrine for an external LLM</h2>
+    <button type="button" class="btn" data-copy-target="doctrine-briefing-text">Copy doctrine</button>
+  </div>
+  <p class="meta">
+    Tick the rules you want to hand to an external LLM conversation (e.g. Gemini, ChatGPT) that can't reach
+    the Brain -- each rule is copied whole or not at all, never paraphrased or trimmed. Unticked rules are
+    simply left out of the copy, not implied to not apply.
+  </p>
+  {% if all_global_rules %}
+  <ul class="list" id="doctrine-checklist" data-doctrine-version="{{ doctrine_version_label }}">
+    {% for r in all_global_rules %}
+    <li>
+      <label class="checkbox-label">
+        <input type="checkbox" {% if r.external_safe %}checked{% endif %} data-rule-id="{{ r.id }}" data-rule-text="{{ r.text }}">
+        <span><strong>{{ r.id }}</strong> — {{ r.text }}</span>
+      </label>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No rules defined.</p>
+  {% endif %}
+  <pre id="doctrine-briefing-text" hidden>{{ doctrine_briefing }}</pre>
+</div>
+<script src="/static/doctrine_copy.js"></script>
 {% endif %}
 
 <div class="panel">

@@ -9,7 +9,39 @@
 {% endif %}
 
 <div class="panel">
-  <h2>New room</h2>
+  <div class="panel-header">
+    <h2>New room</h2>
+    <button type="button" class="btn" data-copy-target="room-setup-briefing-text">Copy room-setup briefing</button>
+  </div>
+  <!-- ADR-0019 decision 2: a generic, zero-fleet-data format spec for an
+       external LLM, computed once at import time from ROOM_MODES and
+       app/rooms.py's validator constants (app/room_setup_briefing.py) --
+       never from a database row. Hidden container + the shared
+       [data-copy-target] handler (app/static/main.js, ADR-0013 decision 5),
+       same "compute server-side, expose via .textContent" pattern
+       transcript_md/join_prompts already use. -->
+  <pre id="room-setup-briefing-text" hidden>{{ room_setup_briefing }}</pre>
+
+  <!-- ADR-0019 decision 3: the "paste setup" box -- parses an external
+       LLM's reply to the briefing above (client-side, app/static/
+       room_setup_paste.js) and fills in the form fields below. Never
+       auto-submits; the owner reviews, fills in the agent names/group/
+       project themselves, then clicks "Create room" same as always. -->
+  <div class="field">
+    <label for="room-setup-paste-input">Paste an external LLM's room-setup reply</label>
+    <!-- maxlength is a sanity bound, not a security control (ADR-0019
+         Consequences) -- comfortably larger than any legitimate
+         BRAINARD-ROOM-SETUP-v1 block, including surrounding prose the
+         external LLM's reply might carry around it. parseBlock still
+         validates the block's *shape* regardless, and create_room remains
+         the real (server-side) validation authority either way. -->
+    <textarea id="room-setup-paste-input" rows="6" maxlength="20000" placeholder="Paste the BRAINARD-ROOM-SETUP-v1 … END-BRAINARD-ROOM-SETUP block here"></textarea>
+    <button type="button" id="room-setup-paste-button" class="btn">Parse pasted setup</button>
+    <p id="room-setup-paste-message" class="meta" role="status" aria-live="polite"></p>
+  </div>
+
+  <details id="new-room-details">
+    <summary>Show new-room form ({{ rooms|length }} room{{ 's' if rooms|length != 1 else '' }} below)</summary>
   <form method="post" action="/ui/rooms">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="field">
@@ -133,6 +165,7 @@
     </div>
     <button type="submit" class="btn primary">Create room</button>
   </form>
+  </details>
 </div>
 
 <!-- Data for app/static/room_form.js's mode->sides/labels handler --
@@ -140,9 +173,12 @@
      static; never user input) and pre-serialized as JSON in
      app/routers/ui_rooms.py. A <script type="application/json"> block, not
      a data-* attribute, since this is structured mode data, not a single
-     scalar -- read via JSON.parse(textContent), never executed. -->
+     scalar -- read via JSON.parse(textContent), never executed. Also read
+     by app/static/room_setup_paste.js (ADR-0019 decision 3) to validate a
+     pasted block's `mode` value against this same, single mode list. -->
 <script type="application/json" id="room-modes-data">{{ room_modes_json }}</script>
 <script src="/static/room_form.js"></script>
+<script src="/static/room_setup_paste.js"></script>
 
 <!-- Shared by both the "New room" form's group field above and the filter
      field below -- existing group labels currently in use (ADR-0008), so

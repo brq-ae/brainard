@@ -150,6 +150,7 @@ from app.room_ai import deposit_result as deposit_room_ai_result
 from app.room_ai import run_action as run_room_ai_action
 from app.room_export import render_transcript_json, render_transcript_markdown, transcript_filename
 from app.room_modes import DEFAULT_MODE, ROOM_MODES
+from app.room_setup_briefing import ROOM_SETUP_BRIEFING
 from app.rooms import assign_group_to_rooms as assign_group_to_rooms_op
 from app.rooms import close_room as close_room_op
 from app.rooms import create_room as create_room_op
@@ -458,6 +459,11 @@ async def rooms_list(
             "form": {},
             "room_modes": ROOM_MODES,
             "room_modes_json": ROOM_MODES_JSON,
+            # ADR-0019 decision 2: the generic, zero-fleet-data room-setup
+            # format spec -- a static, import-time-computed constant, never
+            # re-fetched or re-derived per request (see
+            # app/room_setup_briefing.py).
+            "room_setup_briefing": ROOM_SETUP_BRIEFING,
             "groups": groups,
             "group_filter": group,
             # ADR-0018 decision 13: the create-room form's per-seat
@@ -613,6 +619,7 @@ async def rooms_create(
                 },
                 "room_modes": ROOM_MODES,
                 "room_modes_json": ROOM_MODES_JSON,
+                "room_setup_briefing": ROOM_SETUP_BRIEFING,
                 "groups": groups,
                 "group_filter": None,
                 "active_machines": await list_active_machines(db),
@@ -863,6 +870,7 @@ async def rooms_assign_group(
                 "form": {},
                 "room_modes": ROOM_MODES,
                 "room_modes_json": ROOM_MODES_JSON,
+                "room_setup_briefing": ROOM_SETUP_BRIEFING,
                 "groups": groups,
                 "group_filter": None,
                 "active_machines": await list_active_machines(db),

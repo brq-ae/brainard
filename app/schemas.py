@@ -227,11 +227,28 @@ class DoctrineRuleIn(BaseModel):
     Literal) so an invalid tier can produce the contract's self-explaining,
     named rejection in the route handler instead of a generic 422 -- same
     reasoning as `EventIn.kind` in the deposits schemas above.
+
+    `external_safe` (ADR-0019 decision 4): an explicit, owner-authored,
+    per-rule marker -- is this rule's *substance* about conduct that
+    genuinely translates to an external LLM conversation with no Brain
+    access and no fleet membership (e.g. "never assume"), as opposed to an
+    instruction that conversation structurally cannot follow (e.g.
+    "deposit a handoff")? Additive and backward-compatible: omitted or
+    unset defaults to `False` (excluded), the fail-closed direction -- a
+    rule nobody has yet made a deliberate call about is treated as *not*
+    safe to hand to an outside LLM, never the reverse. Purely a UI-facing
+    marker (app/routers/ui_doctrine.py's "Copy doctrine" checklist
+    preselection) -- never read or enforced by any server-side gate; a
+    `False` value changes nothing about how the rule is stored, compiled
+    into bootstrap doctrine, or enforced. `rules` is an unconstrained JSONB
+    column (app/models.py's `DoctrineVersion`), so this field needs no
+    migration: it just rides along as one more key in the stored dict.
     """
 
     id: str = Field(min_length=1)
     tier: str
     text: str = Field(min_length=1)
+    external_safe: bool = False
 
 
 class DoctrineGlobalRequest(BaseModel):

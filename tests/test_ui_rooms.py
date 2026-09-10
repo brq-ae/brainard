@@ -169,6 +169,181 @@ async def test_rooms_list_machine_token_cannot_reach_ui(client, db_session):
     assert resp.headers["location"] == "/ui/login"
 
 
+# --- ADR-0019 decision 1: collapsible "New room" form, default collapsed,
+# live count reusing the already-fetched room list ---
+
+
+def _new_room_details_html(page_text: str) -> str:
+    start = page_text.index('<details id="new-room-details"')
+    end = page_text.index("</details>", start)
+    return page_text[start : end + len("</details>")]
+
+
+async def test_new_room_form_collapsed_by_default(client, db_session):
+    """No `open` attribute on the <details> -- the room list is what's
+    visible without scrolling past a multi-field form, per decision 1's
+    stated default.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    await _create_room_via_api(client, owner_headers, name="room-a")
+
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    details_html = _new_room_details_html(resp.text)
+    opening_tag = details_html.split(">", 1)[0] + ">"
+    assert "open" not in opening_tag, f"<details> must have no `open` attribute, got: {opening_tag!r}"
+    assert "<summary>" in details_html
+
+
+async def test_new_room_form_summary_count_matches_rendered_room_list(client, db_session):
+    """The count in <summary> is `rooms|length` -- the same already-fetched
+    list rendered just below, never a second, independently-queried total
+    (ADR-0019 decision 1: "it does not add a second counter that could
+    drift from it").
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    for i in range(3):
+        await _create_room_via_api(client, owner_headers, name=f"counted-room-{i}")
+
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    details_html = _new_room_details_html(resp.text)
+    assert "3 rooms below" in details_html
+    # Sanity: the count is the literal length of the `rooms` list this
+    # exact response also renders below, not an independent figure.
+    assert resp.text.count('href="/ui/rooms/') == 3
+
+
+async def test_new_room_form_summary_count_singular_and_zero(client, db_session):
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    assert "0 rooms below" in _new_room_details_html(resp.text)
+
+    await _create_room_via_api(client, owner_headers, name="solo-room")
+    resp2 = await client.get("/ui/rooms")
+    assert "1 room below" in _new_room_details_html(resp2.text)
+
+
+async def test_new_room_heading_and_copy_button_sit_outside_details(client, db_session):
+    """Decision 1: the heading and "Copy room-setup briefing" button are
+    siblings of <details>, not nested inside its <summary> -- so the button
+    can never double-toggle the disclosure (no button click event needs to
+    be intercepted/stopped).
+    """
+    await _login(client, db_session)
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+
+    details_idx = resp.text.index('<details id="new-room-details"')
+    heading_idx = resp.text.index("<h2>New room</h2>")
+    button_idx = resp.text.index('data-copy-target="room-setup-briefing-text"')
+    summary_idx = resp.text.index("<summary>")
+
+    assert heading_idx < details_idx
+    assert button_idx < details_idx
+    # And, within <summary>...</summary>, there is no nested <button>.
+    summary_end = resp.text.index("</summary>", summary_idx)
+    assert "<button" not in resp.text[summary_idx:summary_end]
+
+
+async def test_new_room_form_unchanged_behavior_inside_details(client, db_session):
+    """The form's own behavior (action, fields, validation, error re-render)
+    is completely unchanged by being wrapped in <details> -- exercised here
+    end-to-end once more against the new markup, mirroring
+    test_create_room_form_creates_and_redirects above.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "still-works",
+            "agent_a": "alpha",
+            "agent_b": "beta",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+
+# --- ADR-0019 decision 2: "Copy room-setup briefing" ---
+
+
+async def test_room_setup_briefing_hidden_element_matches_module_constant(client, db_session):
+    import html as html_module
+
+    from app.room_setup_briefing import ROOM_SETUP_BRIEFING
+
+    await _login(client, db_session)
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+
+    start = resp.text.index('<pre id="room-setup-briefing-text" hidden>') + len(
+        '<pre id="room-setup-briefing-text" hidden>'
+    )
+    end = resp.text.index("</pre>", start)
+    rendered = html_module.unescape(resp.text[start:end])
+    assert rendered == ROOM_SETUP_BRIEFING
+
+
+async def test_room_setup_briefing_button_uses_shared_copy_handler_no_second_path(client, db_session):
+    await _login(client, db_session)
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    assert 'data-copy-target="room-setup-briefing-text"' in resp.text
+    assert "Copy room-setup briefing" in resp.text
+    assert '<script src="/static/main.js">' in resp.text
+    assert '<script src="/static/room_setup_paste.js"></script>' in resp.text
+
+
+async def test_room_setup_briefing_present_on_error_rerender(client, db_session):
+    """All three render sites of rooms_list.html need the briefing constant
+    (ADR-0018 decision 13's own precedent for this exact discipline) --
+    exercised here via the create-room error re-render path.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={"name": "dupe-for-briefing-check", "agent_a": "same", "agent_b": "same", "csrf_token": csrf},
+    )
+    assert resp.status_code == 422
+    assert 'id="room-setup-briefing-text"' in resp.text
+    assert "BRAINARD-ROOM-SETUP-v1" in resp.text  # content is populated, not left blank on this render path
+
+
+# --- ADR-0019 decision 3: the paste box's static markup contract (the
+# actual parsing behavior is exercised by tests/test_room_setup_briefing.py's
+# static-source checks on app/static/room_setup_paste.js -- no JS runner
+# available in this Python-based repo). ---
+
+
+async def test_room_setup_paste_box_present_with_required_element_ids(client, db_session):
+    await _login(client, db_session)
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    for element_id in (
+        "room-setup-paste-input",
+        "room-setup-paste-button",
+        "room-setup-paste-message",
+        "new-room-details",
+    ):
+        assert f'id="{element_id}"' in resp.text
+    # ADR-0019 Consequences: "a sane client-side max length on the paste
+    # textarea" -- a sanity bound, not a security control (create_room
+    # remains the real validation authority regardless).
+    assert 'id="room-setup-paste-input"' in resp.text
+    start = resp.text.index('id="room-setup-paste-input"')
+    end = resp.text.index(">", start)
+    assert "maxlength=" in resp.text[start:end]
+
+
 # --- create room form ---
 
 
@@ -1797,6 +1972,10 @@ async def test_bulk_assign_group_unknown_id_shows_clean_error(client, db_session
     )
     assert resp.status_code == 404
     assert "not-a-real-room" in resp.text
+    # ADR-0019: the third of rooms_list.html's three render sites also
+    # needs the room-setup briefing constant (mirrors ADR-0018 decision
+    # 13's "every render site needs the new context key" discipline).
+    assert "BRAINARD-ROOM-SETUP-v1" in resp.text
 
 
 async def test_bulk_assign_group_machine_token_cannot_reach_ui(client, db_session):
