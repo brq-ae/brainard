@@ -55,6 +55,7 @@ def test_prompt_commander_role_includes_commander_text():
     text = _prompt(role="commander")
     assert "You are the Commander for this project." in text
     assert "You own ALL writes to the hub" in text
+    assert "You are also the Builder's escalation path" in text
     assert "You are the Builder" not in text
 
 
@@ -62,6 +63,8 @@ def test_prompt_builder_role_includes_builder_text():
     text = _prompt(role="builder")
     assert "You are the Builder for this project." in text
     assert "do NOT deposit anything" in text
+    assert "escalate to the Commander" in text
+    assert "the Commander didn't respond" in text
     assert "You are the Commander" not in text
 
 

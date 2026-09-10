@@ -734,6 +734,7 @@ async def test_bootstrap_commander_token_shows_commander_role_text(client, db_se
     assert "### Your role" in text
     assert "You are the Commander for this project." in text
     assert "You own ALL writes to the hub" in text
+    assert "You are also the Builder's escalation path" in text
     assert "**G10**" in text
     assert "You are the Builder for this project." not in text
 
@@ -748,6 +749,8 @@ async def test_bootstrap_builder_token_shows_builder_role_text(client, db_sessio
     assert "### Your role" in text
     assert "You are the Builder for this project." in text
     assert "do NOT deposit anything" in text
+    assert "escalate to the Commander" in text
+    assert "the Commander didn't respond" in text
     assert "**G10**" in text
     assert "You are the Commander for this project." not in text
 
