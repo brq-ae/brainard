@@ -140,6 +140,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.errors import ApiError
 from app.llm_config import resolve_llm_config
+from app.machines import list_active_machines
 from app.models import AttachmentBlob, Room, RoomAttachment
 from app.onboarding import TOKEN_PLACEHOLDER, generate_room_join_prompt, resolve_base_url
 from app.projects import list_project_names
@@ -156,7 +157,7 @@ from app.rooms import delete_message as delete_message_op
 from app.rooms import delete_room as delete_room_op
 from app.rooms import get_all_messages
 from app.rooms import get_consensus_gate_status as get_consensus_gate_status_op
-from app.rooms import get_member_sides, get_members, get_members_for_rooms, get_recent_messages, get_room
+from app.rooms import get_member_bindings, get_member_sides, get_members, get_members_for_rooms, get_recent_messages, get_room
 from app.rooms import list_room_groups as list_room_groups_op
 from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
@@ -164,6 +165,7 @@ from app.rooms import post_attachment_added_message, post_attachment_removed_mes
 from app.rooms import post_message as post_message_op
 from app.rooms import set_agent_uploads_allowed as set_agent_uploads_allowed_op
 from app.rooms import set_requires_owner_open as set_requires_owner_open_op
+from app.rooms import set_room_member_seat as set_room_member_seat_op
 from app.rooms import switch_room_mode as switch_room_mode_op
 from app.search import run_search
 from app.templates_env import templates
@@ -308,6 +310,7 @@ def _join_prompts_by_member(
         agent_name: generate_room_join_prompt(
             base_url=base_url,
             room_id=room.id,
+            room_name=room.name,
             agent_name=agent_name,
             partner_name=next(other for other in members if other != agent_name),
             token=TOKEN_PLACEHOLDER,
@@ -320,6 +323,8 @@ def _join_prompts_by_member(
             requires_owner_open=room.requires_owner_open,
             opened_at=room.opened_at,
             consensus_floor=room.consensus_floor,
+            project=room.project,
+            group_name=room.group_name,
         )
         for agent_name in members
     }
@@ -362,6 +367,34 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
     # agreed yet.
     consensus_gate = await get_consensus_gate_status_op(db, room)
 
+    # ADR-0018 decisions 14/15: this room's current seat bindings (agent_name
+    # -> bound_machine_id, None for an open seat) plus the active-machine
+    # roster, so the Seats panel and the corrected copy-button labels can
+    # show the assigned/claimed machine's NAME, not just its id. Resolved
+    # only against ACTIVE machines (the dropdown's own roster) -- if a
+    # seat's bound machine has since been revoked, its name is simply
+    # omitted from this map (a revoked token can never authenticate again,
+    # app/auth.py's `authenticate`, so only the owner's release/reassign
+    # action can move that seat forward). IMPORTANT: the template must NOT
+    # treat an absent entry here as "open" -- it branches on
+    # `bound_machine_ids.get(m)` (this dict, which still holds the id) to
+    # decide bound-vs-open, and uses `bound_machine_names` only to resolve
+    # a NAME for display. A seat bound to a since-revoked machine is
+    # genuinely stuck (the FK has no `ondelete`, so `bound_machine_id`
+    # keeps pointing at the revoked row, and no other machine -- not even a
+    # freshly re-minted replacement with a new id -- can claim it until the
+    # owner releases or reassigns it) and must render as bound-but-needing-
+    # attention, never as "open (unclaimed)" -- reporting it as open would
+    # hide the exact recovery signal this ADR exists to surface.
+    bound_machine_ids = await get_member_bindings(db, room_id)
+    active_machines = await list_active_machines(db)
+    machines_by_id = {m.id: m for m in active_machines}
+    bound_machine_names = {
+        agent_name: machines_by_id[machine_id].name
+        for agent_name, machine_id in bound_machine_ids.items()
+        if machine_id is not None and machine_id in machines_by_id
+    }
+
     return {
         "room": room,
         "members": members,
@@ -372,6 +405,10 @@ async def _room_context(db: AsyncSession, request: Request, room_id: str) -> dic
         "messages": messages,
         "last_seq": last_seq,
         "join_prompts": _join_prompts_by_member(request, room, members, sides, attachments),
+        # ADR-0018: seats panel + copy-button label data.
+        "active_machines": active_machines,
+        "bound_machine_ids": bound_machine_ids,
+        "bound_machine_names": bound_machine_names,
         # ADR-0009: the switch-mode form's mode dropdown, sourced from the
         # same ROOM_MODES/ROOM_MODES_JSON the create-room form uses (never a
         # second, divergent mode list) -- see this module's docstring.
@@ -423,6 +460,13 @@ async def rooms_list(
             "room_modes_json": ROOM_MODES_JSON,
             "groups": groups,
             "group_filter": group,
+            # ADR-0018 decision 13: the create-room form's per-seat
+            # "Assign to machine" dropdowns (active machines only) and the
+            # project field's datalist (existing registered project names,
+            # a soft nudge toward the exact canonical spelling -- see
+            # decision 12 for why `project` is free text, not an FK).
+            "active_machines": await list_active_machines(db),
+            "project_names": await list_project_names(db),
         },
     )
 
@@ -473,6 +517,16 @@ async def rooms_create(
     # `_validate_group` re-validates it either way (length cap), same
     # reasoning as the topic field's own duplicated trim.
     group: str = Form(default=""),
+    # ADR-0018 decision 12: optional, free-form project label -- same
+    # "trim, blank -> None" pre-pass as `group` above; app.rooms.create_room's
+    # own `_validate_project` re-validates it either way.
+    project: str = Form(default=""),
+    # ADR-0018 decision 3: optional per-seat machine assignment -- one
+    # dropdown per agent slot (app_form's own <select>, values are machine
+    # ids or "" for "leave unassigned"). Blank means "open" (claim-on-
+    # first-write, the unchanged default) for that seat.
+    seat_a_machine_id: str = Form(default=""),
+    seat_b_machine_id: str = Form(default=""),
     session: dict = Depends(require_ui_session),
     _csrf: None = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
@@ -499,8 +553,19 @@ async def rooms_create(
 
     cleaned_topic = topic.strip() or None
     cleaned_group = group.strip() or None
+    cleaned_project = project.strip() or None
     sides = _sides_for_mode(mode, agent_a, agent_b)
     duration_seconds = _parse_duration_seconds(duration_preset, custom_duration_value, custom_duration_unit)
+
+    # ADR-0018 decision 3: only include a seat entry for a slot the owner
+    # actually picked a machine for -- an empty selection means "leave this
+    # seat open," not "assign it to machine ''" (create_room's own
+    # `_validate_seat_assignments` would reject the latter as malformed).
+    seat_machines: dict[str, str] = {}
+    if seat_a_machine_id.strip():
+        seat_machines[agent_a] = seat_a_machine_id.strip()
+    if seat_b_machine_id.strip():
+        seat_machines[agent_b] = seat_b_machine_id.strip()
 
     try:
         room = await create_room_op(
@@ -514,6 +579,8 @@ async def rooms_create(
             duration_seconds=duration_seconds,
             group=cleaned_group,
             consensus_floor=parsed_consensus_floor,
+            project=cleaned_project,
+            seat_machines=seat_machines or None,
         )
     except ApiError as exc:
         rows, next_cursor = await list_rooms_op(db, limit=ROOM_LIST_LIMIT)
@@ -540,11 +607,16 @@ async def rooms_create(
                     "custom_duration_value": custom_duration_value,
                     "custom_duration_unit": custom_duration_unit,
                     "group": group,
+                    "project": project,
+                    "seat_a_machine_id": seat_a_machine_id,
+                    "seat_b_machine_id": seat_b_machine_id,
                 },
                 "room_modes": ROOM_MODES,
                 "room_modes_json": ROOM_MODES_JSON,
                 "groups": groups,
                 "group_filter": None,
+                "active_machines": await list_active_machines(db),
+                "project_names": await list_project_names(db),
             },
             status_code=exc.status_code,
         )
@@ -793,6 +865,8 @@ async def rooms_assign_group(
                 "room_modes_json": ROOM_MODES_JSON,
                 "groups": groups,
                 "group_filter": None,
+                "active_machines": await list_active_machines(db),
+                "project_names": await list_project_names(db),
             },
             status_code=exc.status_code,
         )
@@ -1131,6 +1205,42 @@ async def room_set_open_gate(
     """
     try:
         await set_requires_owner_open_op(db, room_id, bool(required))
+    except ApiError as exc:
+        ctx = await _room_context(db, request, room_id)
+        if ctx is None:
+            raise HTTPException(status_code=404, detail=f"No room with id '{room_id}'.") from exc
+        return templates.TemplateResponse(
+            request,
+            "room_view.html",
+            {"csrf_token": session["csrf"], "error": exc.detail, "deposited": False, **ctx},
+            status_code=exc.status_code,
+        )
+    return RedirectResponse(url=f"/ui/rooms/{room_id}", status_code=303)
+
+
+# --- ADR-0018 decision 8: owner-only seat release/reassign ---
+
+
+@router.post("/{room_id}/members/{agent_name}/seat")
+async def room_set_member_seat(
+    room_id: str,
+    agent_name: str,
+    request: Request,
+    # Blank selection means "release" (unassigned, open again) -- the
+    # Seats panel's dropdown's first option is always "-- unassigned
+    # (open) --", value="".
+    machine_id: str = Form(default=""),
+    session: dict = Depends(require_ui_session),
+    _csrf: None = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner-only release/reassign of one seat's machine binding
+    (app/rooms.py's `set_room_member_seat`) -- same shape as
+    `room_set_agent_uploads_allowed`/`room_set_open_gate` above.
+    """
+    resolved_machine_id = machine_id.strip() or None
+    try:
+        await set_room_member_seat_op(db, room_id, agent_name, resolved_machine_id)
     except ApiError as exc:
         ctx = await _room_context(db, request, room_id)
         if ctx is None:

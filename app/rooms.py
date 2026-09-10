@@ -25,9 +25,10 @@ from app.attachments import release_blobs_for_deleted_room
 from app.auth import Principal
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
-from app.models import Room, RoomAttachment, RoomMember, RoomMessage
+from app.models import Machine, Room, RoomAttachment, RoomMember, RoomMessage
 from app.notify import notify_owner_open_pending, notify_room_closed
 from app.room_modes import DEFAULT_MODE, ROOM_MODES, role_text_for, validate_mode
+from app.room_seats import check_and_bind_seat
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,13 @@ MAX_DURATION_SECONDS = 30 * 24 * 3600
 # ADR-0008: free-form room group label. Owner-supplied free text, sane upper
 # bound just to keep it a short label, not a paragraph.
 MAX_GROUP_LENGTH = 100
+
+# ADR-0018 decision 12: an optional, free-form room project label. Capped at
+# 255 characters -- matching `Project.name`'s own column width (app/models.py)
+# so a room's `project` value is always at least *storable* as a real
+# registered project name, even though it is never required to already be
+# one (see that decision for why this is free text, not an FK).
+MAX_PROJECT_LENGTH = 255
 
 _RECOVERY_ROOM_MEMBERS = "resend `members` as exactly two distinct non-empty agent-name strings"
 
@@ -167,6 +175,97 @@ def _validate_group(group: str | None) -> str | None:
     return cleaned
 
 
+def _validate_project(project: str | None) -> str | None:
+    """ADR-0018 decision 12: same shape as `_validate_group` just above --
+    trims whitespace, treats a blank/empty (after trim) value as "no
+    project," and caps length. Free-form: NOT validated against the
+    `projects` registry (no `unknown_project` check here) -- see that
+    decision for why a room's stated project is deliberately allowed to not
+    (yet) exist as a registered project.
+    """
+    if project is None:
+        return None
+    if not isinstance(project, str):
+        raise ApiError(422, "invalid_room_project", f"`project` must be a string or null, got {project!r}.")
+    cleaned = project.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_PROJECT_LENGTH:
+        raise ApiError(
+            422,
+            "invalid_room_project",
+            f"`project` is {len(cleaned)} characters, exceeding the {MAX_PROJECT_LENGTH}-character cap. "
+            "Recovery: shorten it, resend.",
+        )
+    return cleaned
+
+
+async def _validate_seat_assignments(
+    db: AsyncSession, members: list[str], seats: dict[str, str] | None
+) -> dict[str, str | None]:
+    """ADR-0018 decision 3 (first path): optional, per-seat machine
+    assignment at room-creation time -- `{agent_name: machine_id}`, covering
+    zero, one, or both of `members`. Absent/empty `seats` (or a member with
+    no entry) resolves to `None` for that member -- the seat is left open,
+    identical to every room created before this ADR (decision 3, second
+    path: claim-on-first-write is always the default).
+
+    Rejects (self-explaining ApiError, same posture as `_validate_sides`
+    just below) an agent name in `seats` that isn't one of `members`, and a
+    `machine_id` that doesn't resolve to an existing, `status == 'active'`
+    machine -- assigning a seat to a revoked or nonexistent machine would
+    silently create a seat nothing can ever legitimately post to (a revoked
+    token can never authenticate again, `app/auth.py`'s `authenticate`), so
+    this is rejected outright rather than accepted and left to confuse the
+    owner later.
+    """
+    if not seats:
+        return dict.fromkeys(members)
+    if not isinstance(seats, dict):
+        raise ApiError(
+            422,
+            "invalid_room_seats",
+            f"`seats` must be an object of {{agent_name: machine_id}}, got {seats!r}.",
+        )
+    unknown_agents = sorted(set(seats) - set(members))
+    if unknown_agents:
+        raise ApiError(
+            422,
+            "invalid_room_seats",
+            f"`seats` named agent(s) {unknown_agents} not present in `members` {members}. Recovery: only "
+            "assign a seat for one of the room's own members.",
+        )
+
+    resolved: dict[str, str | None] = dict.fromkeys(members)
+    for agent_name, machine_id in seats.items():
+        if machine_id is None:
+            continue
+        if not isinstance(machine_id, str) or not machine_id.strip():
+            raise ApiError(
+                422,
+                "invalid_room_seats",
+                f"`seats['{agent_name}']` must be a non-empty machine id string or null, got {machine_id!r}.",
+            )
+        machine = await db.get(Machine, machine_id.strip())
+        if machine is None:
+            raise ApiError(
+                422,
+                "unknown_seat_machine",
+                f"No machine with id '{machine_id}' to assign to seat '{agent_name}'. Recovery: pick an "
+                "existing, active machine id (e.g. via GET /v1/machines), or omit this seat to leave it open.",
+            )
+        if machine.status != "active":
+            raise ApiError(
+                422,
+                "seat_machine_not_active",
+                f"Machine '{machine.name}' ({machine.id}) is not active (status: {machine.status}); only an "
+                "active machine may be assigned to a seat -- a revoked token can never authenticate again. "
+                "Recovery: pick an active machine, or omit this seat to leave it open.",
+            )
+        resolved[agent_name] = machine.id
+    return resolved
+
+
 def _validate_sides(mode: str, members: list[str], sides: dict[str, str] | None) -> dict[str, str | None]:
     """Symmetric modes (freeform, collaborate, brainstorm) ignore `sides`
     entirely -- every member's side is None. Asymmetric modes (debate,
@@ -253,6 +352,8 @@ async def create_room(
     expires_at: datetime | None = None,
     group: str | None = None,
     consensus_floor: int | None = None,
+    project: str | None = None,
+    seat_machines: dict[str, str] | None = None,
 ) -> Room:
     """ADR-0007 extends room creation with an optional mode+topic (shapes
     the join prompt's injected role text, app/onboarding.py) and an
@@ -294,6 +395,21 @@ async def create_room(
     Rejecting the whole `>=` range (not just `>`) avoids the room's
     ordinary message cap (decision 1, `_insert_message_and_maybe_close`)
     ever being able to fire before an agreed "done" could pass the gate.
+
+    ADR-0018 decision 12: `project` is an optional, free-form room-identity
+    label (validated by `_validate_project`, same "trim, blank->None,
+    length-capped" shape as `group`) -- surfaced in the join prompt's Layer
+    1 target check so a joining agent can compare it exactly against its
+    own known project, instead of only eyeballing `name`/`topic`.
+
+    ADR-0018 decision 3: `seat_machines`, when given, optionally
+    pre-assigns one or both seats to a specific, already-registered, active
+    machine (`_validate_seat_assignments`) -- `RoomMember.bound_machine_id`
+    is set for that member immediately, before any message exists, closing
+    the claim-on-first-write race entirely for that seat. A member with no
+    entry (or when `seat_machines` is omitted/empty) is left unassigned --
+    identical to every room created before this ADR: the seat binds to
+    whichever machine token posts as that member first.
     """
     if not name or not name.strip():
         raise ApiError(422, "invalid_room_name", "`name` must be non-empty. Recovery: resend with a non-empty name.")
@@ -303,7 +419,9 @@ async def create_room(
     cleaned_topic = _validate_topic(mode, topic)
     member_sides = _validate_sides(mode, cleaned_members, sides)
     cleaned_group = _validate_group(group)
+    cleaned_project = _validate_project(project)
     resolved_consensus_floor = _validate_consensus_floor(consensus_floor)
+    resolved_seats = await _validate_seat_assignments(db, cleaned_members, seat_machines)
     if mode in _CONSENSUS_GATED_MODES and resolved_consensus_floor >= resolved_max:
         raise ApiError(
             422,
@@ -349,6 +467,8 @@ async def create_room(
         # ADR-0017: stored for every room regardless of mode (see docstring
         # above) -- only ever read by the gate for debate/critique.
         consensus_floor=resolved_consensus_floor,
+        # ADR-0018 decision 12: optional, free-form project label.
+        project=cleaned_project,
     )
     db.add(room)
     await db.flush()  # room.id must exist before the member rows FK to it
@@ -361,6 +481,9 @@ async def create_room(
                 agent_name=agent_name,
                 created_at=now,
                 side=member_sides.get(agent_name),
+                # ADR-0018 decision 3: pre-set when the owner assigned this
+                # seat at creation; otherwise NULL (open, claim-on-first-write).
+                bound_machine_id=resolved_seats.get(agent_name),
             )
         )
 
@@ -400,6 +523,24 @@ async def get_member_sides(db: AsyncSession, room_id: str) -> dict[str, str | No
         )
     ).all()
     return {agent_name: side for agent_name, side in rows}
+
+
+async def get_member_bindings(db: AsyncSession, room_id: str) -> dict[str, str | None]:
+    """ADR-0018: `{agent_name: bound_machine_id}` for a room's members --
+    `bound_machine_id` is None for an open (unassigned, unclaimed) seat.
+    Backs the room view's Seats panel and the corrected copy-button labels
+    (decisions 14/15) -- a separate function from `get_member_sides`, same
+    "don't change an existing function's return shape" reasoning that
+    function's own docstring gives for not changing `get_members`.
+    """
+    rows = (
+        await db.execute(
+            select(RoomMember.agent_name, RoomMember.bound_machine_id)
+            .where(RoomMember.room_id == room_id)
+            .order_by(RoomMember.created_at)
+        )
+    ).all()
+    return {agent_name: bound_machine_id for agent_name, bound_machine_id in rows}
 
 
 async def get_member_sides_for_rooms(db: AsyncSession, room_ids: list[str]) -> dict[str, dict[str, str | None]]:
@@ -722,7 +863,7 @@ async def _next_seq(db: AsyncSession, room_id: str) -> int:
 
 
 async def _insert_message_and_maybe_close(
-    db: AsyncSession, room: Room, sender: str, text: str, kind: str, now: datetime
+    db: AsyncSession, room: Room, sender: str, text: str, kind: str, now: datetime, principal: Principal
 ) -> tuple[RoomMessage, str | None]:
     """The single insert-and-guardrail attempt, factored out so
     `post_message`'s retry loop below can catch exactly this call's
@@ -752,7 +893,23 @@ async def _insert_message_and_maybe_close(
     transaction) redoes it correctly against the freshly-`db.refresh`d room
     on the next attempt, exactly like `message_count`/the close guardrails
     already do.
+
+    ADR-0018 decisions 3/5/6: the seat bind-or-check (`check_and_bind_seat`,
+    `app/room_seats.py`) runs first, inside this same retried-as-a-unit
+    function -- not once before `post_message`'s retry loop -- for the
+    identical reason `room.opened_at` is set here rather than earlier: an
+    IntegrityError-triggered rollback undoes this attempt's seat-claim write
+    along with everything else in the transaction, and `check_and_bind_seat`
+    re-derives the seat's current state fresh (its own query, not a cached
+    object) on every call, so redoing it here means a retry always re-claims
+    or re-checks correctly against the freshly-committed state instead of
+    silently losing a claim that a rolled-back attempt appeared to make.
+    Raises (refusing the whole post) before anything else in this function
+    runs, same "reject before any row is written" posture every other
+    pre-insert check here already has.
     """
+    await check_and_bind_seat(db, room, sender, principal)
+
     if sender == "owner" and room.opened_at is None:
         room.opened_at = now
         if room.pending_duration_seconds is not None:
@@ -949,7 +1106,9 @@ async def post_message(
     close_reason: str | None = None
     for attempt in range(1, MAX_INSERT_ATTEMPTS + 1):
         try:
-            message, close_reason = await _insert_message_and_maybe_close(db, room, sender, text.strip(), kind, now)
+            message, close_reason = await _insert_message_and_maybe_close(
+                db, room, sender, text.strip(), kind, now, principal
+            )
         except IntegrityError:
             await db.rollback()
             await db.refresh(room)
@@ -1599,6 +1758,126 @@ async def set_requires_owner_open(db: AsyncSession, room_id: str, required: bool
 
     await db.commit()
     return room, announcement_text
+
+
+# --- POST /v1/rooms/{id}/members/{agent_name}/seat (ADR-0018 decision 8:
+# owner-only release/reassign of a seat's machine binding) ---
+
+
+def _seat_reassignment_announcement(agent_name: str, machine: Machine | None) -> str:
+    """The kind='system' announcement text `set_room_member_seat` posts --
+    same "agents are briefed, not just refused" posture every other mid-room
+    toggle in this file already takes. `machine` is the NEWLY bound machine
+    (already re-fetched fresh by the caller), or None for a release.
+    """
+    if machine is None:
+        return (
+            f"The seat '{agent_name}' has been released by the owner. It is open again -- the next machine "
+            f"token to post or attach as '{agent_name}' will claim it."
+        )
+    return (
+        f"The seat '{agent_name}' has been assigned by the owner to machine '{machine.name}'. Only that "
+        f"machine's token may now post or attach as '{agent_name}'."
+    )
+
+
+async def set_room_member_seat(db: AsyncSession, room_id: str, agent_name: str, machine_id: str | None) -> tuple[Room, RoomMember, str]:
+    """ADR-0018 decision 8: owner-only release (`machine_id=None`) or direct
+    reassignment (`machine_id=<id>`) of one seat's `bound_machine_id`. Same
+    shape as `set_agent_uploads_allowed`/`set_requires_owner_open` just
+    above: unlocked existence pre-check, room row lock, `room.status ==
+    'open'` guard (a closed room accepts no further posts/attachments of any
+    kind regardless of binding, so changing one is moot -- same posture
+    those two toggles already take), the mutation, and a `kind='system'`
+    announcement in the same commit.
+
+    `machine_id`, when given, must resolve to an existing, `status ==
+    'active'` machine -- same validation `_validate_seat_assignments` uses
+    at room-creation time (assigning a revoked or nonexistent machine would
+    create a seat nothing can ever legitimately post to).
+
+    Member rows are read (and the target member looked up) only now, under
+    the lock -- same ordering `switch_room_mode`'s own docstring establishes
+    for member-row reads that happen inside a mutator of member rows.
+
+    Returns (room, member, announcement_text).
+    """
+    # Unlocked pre-check: existence never needs the row lock to be correct
+    # (mirrors every other mutator's own "unlocked pre-checks" reasoning) --
+    # a 404 for a genuinely nonexistent room doesn't need serializing on
+    # anything.
+    room = await db.get(Room, room_id)
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+
+    # Serialization point: acquire the room's row lock, same pattern as
+    # every other mutator in this file.
+    room = await db.scalar(
+        select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+    )
+    if room is None:
+        raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
+    if room.status != "open":
+        raise ApiError(
+            409,
+            "room_closed",
+            f"Room '{room.name}' is closed; its seat assignments can no longer be changed.",
+        )
+
+    member = await db.scalar(
+        select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.agent_name == agent_name)
+    )
+    if member is None:
+        raise ApiError(
+            404,
+            "room_member_not_found",
+            f"'{agent_name}' is not a member of room '{room.name}'.",
+        )
+
+    machine: Machine | None = None
+    if machine_id is not None:
+        if not isinstance(machine_id, str) or not machine_id.strip():
+            raise ApiError(422, "invalid_seat_machine_id", "`machine_id` must be a non-empty string or null.")
+        machine = await db.get(Machine, machine_id.strip())
+        if machine is None:
+            raise ApiError(
+                422,
+                "unknown_seat_machine",
+                f"No machine with id '{machine_id}' to assign to seat '{agent_name}'. Recovery: pick an "
+                "existing, active machine id, or pass null to release the seat instead.",
+            )
+        if machine.status != "active":
+            raise ApiError(
+                422,
+                "seat_machine_not_active",
+                f"Machine '{machine.name}' ({machine.id}) is not active (status: {machine.status}); only an "
+                "active machine may be assigned to a seat. Recovery: pick an active machine, or pass null to "
+                "release the seat instead.",
+            )
+
+    member.bound_machine_id = machine.id if machine is not None else None
+    announcement_text = _seat_reassignment_announcement(agent_name, machine)
+
+    now = datetime.now(UTC)
+    seq = await _next_seq(db, room.id)
+    db.add(
+        RoomMessage(
+            id=str(ULID()),
+            room_id=room.id,
+            seq=seq,
+            sender="system",
+            text=announcement_text,
+            kind="system",
+            created_at=now,
+        )
+    )
+    room.message_count += 1
+    # Deliberately no done/cap guardrail check here -- same reasoning every
+    # other mid-room announcement in this file gives: this must never itself
+    # trip the cap and silently close the room it just changed.
+
+    await db.commit()
+    return room, member, announcement_text
 
 
 # --- ADR-0012 stage 3: kind='system' announcements when an attachment is

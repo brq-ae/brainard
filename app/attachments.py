@@ -88,6 +88,7 @@ from app.models import (
 )
 from app.reserved_machines import ensure_reserved_machine
 from app.room_export import safe_filename_component
+from app.room_seats import check_and_bind_seat
 from app.routers.deposits import create_deposit as apply_deposit
 from app.schemas import DepositRequest
 
@@ -985,6 +986,23 @@ async def add_room_attachment(
                 "is off.",
             )
 
+        # ADR-0018 decisions 3/5/6: the seat bind-or-check, under the same
+        # room lock, re-run every attempt (same reasoning as the membership/
+        # agent-uploads checks just above -- always observed fresh, never a
+        # stale read carried across a retry). No-ops for the owner and for a
+        # `sender` that isn't a real member (already rejected above); for a
+        # genuine machine principal posting as a real member, binds an open
+        # seat to this machine or raises `seat_bound_to_other_machine` if a
+        # different machine already holds (by assignment or claim) this
+        # seat. `check_and_bind_seat` re-derives the seat's state fresh
+        # (its own query) each call, so re-running it on a retry after
+        # `db.rollback()` is always correct, never a stale double-claim.
+        try:
+            await check_and_bind_seat(db, room, sender, principal)
+        except ApiError:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
         existing_count = await db.scalar(
             select(func.count()).select_from(RoomAttachment).where(RoomAttachment.room_id == room_id)
         )
@@ -1373,6 +1391,14 @@ async def add_attachment_from_brain_document(
                 f"'{cleaned_sender}' is not a member of room '{room.name}' and is not the literal 'owner'. "
                 "Recovery: attach as one of the room's members, or as 'owner'.",
             )
+
+        # ADR-0018 decisions 3/5/6: a third content-entry point discovered
+        # during implementation -- "Attach from Brain" links an existing
+        # Brain document into the room under this same row lock, exactly
+        # like `add_room_attachment`'s own upload path, so it is subject to
+        # the identical seat bind-or-check (same reasoning, same shared
+        # helper, re-run fresh every retry attempt).
+        await check_and_bind_seat(db, room, cleaned_sender, principal)
 
         existing_count = await db.scalar(
             select(func.count()).select_from(RoomAttachment).where(RoomAttachment.room_id == room_id)

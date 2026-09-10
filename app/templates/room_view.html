@@ -12,6 +12,7 @@
   <span id="room-count">{{ room.message_count }}</span>/{{ room.max_messages }} messages
   <span class="sep">·</span>
   {{ mode_label }}{% if room.topic %}: {{ room.topic }}{% endif %}
+  {% if room.project %}<span class="sep">·</span> project: {{ room.project }}{% endif %}
 </p>
 {% if room.expires_at %}
 <p class="meta" id="room-countdown-wrap">Closes in <span id="room-countdown">…</span></p>
@@ -77,8 +78,32 @@
        this comment intentionally avoids a live Jinja print expression --
        Jinja2 evaluates expressions inside HTML comments too, and `loop` is
        only defined inside the for-loop below. -->
+  <!-- ADR-0018 decision 15: the label is the side label when one exists
+       (unchanged for debate/critique/asymmetric rooms), or the member's
+       own agent_name when it doesn't (replacing the old "Agent N"
+       ordinal) -- and, when this seat is currently bound to a specific
+       machine (assigned or claimed, ADR-0018 decisions 3/13/14), that
+       machine's name is appended in parentheses so the owner can tell
+       which button is actually usable by which agent. bound_machine_names
+       is owner-authored content, rendered through ordinary Jinja2
+       autoescape only, same discipline as every other untrusted-but-
+       owner-supplied string on this page -- never |safe. -->
+  {#- Branch on `bound_machine_ids.get(m)` (holds the id for every bound
+      seat, active machine or not) to decide bound-vs-open -- NOT on
+      `bound_machine_names.get(m)`, which is only populated for machines
+      still in the active roster (see ui_rooms.py's `_room_context`). A
+      seat bound to a since-revoked machine still has a truthy id but no
+      name; rendering it with no parenthetical at all would read exactly
+      like an unbound seat, silently hiding a seat that is actually stuck
+      until the owner releases or reassigns it (revoked tokens can never
+      authenticate again). That case gets its own actionable parenthetical
+      instead, pointing at the Seats panel below. This is a Jinja comment
+      (stripped from output), unlike the HTML comment above, specifically
+      so its explanatory text -- which necessarily discusses both the
+      "open" and "revoked" wording -- can never leak into the rendered
+      page and be mistaken for a third seat state. -#}
   {% for m in members %}
-  <button type="button" class="btn" data-copy-target="join-prompt-{{ loop.index }}">Copy join prompt — {% if sides.get(m) %}{{ side_labels[sides[m]] }}{% else %}Agent {{ loop.index }}{% endif %}</button>
+  <button type="button" class="btn" data-copy-target="join-prompt-{{ loop.index }}">Copy join prompt — {% if sides.get(m) %}{{ side_labels[sides[m]] }}{% else %}{{ m }}{% endif %}{% if bound_machine_ids.get(m) %}{% if bound_machine_names.get(m) %} ({{ bound_machine_names[m] }}){% else %} (bound to a revoked machine — release/reassign in Seats panel){% endif %}{% endif %}</button>
   {% endfor %}
 </div>
 
@@ -199,6 +224,55 @@
     </label>
     <button type="submit" class="btn" {% if room.status != 'open' %}disabled{% endif %}>Update</button>
   </form>
+</div>
+
+<!-- ADR-0018 decision 14: per-seat assignment/release/reassign. A seat left
+     "-- unassigned (open) --" behaves exactly as every seat always has:
+     the first machine token to post or attach as that member claims it.
+     Selecting a specific active machine either assigns an open seat or
+     reassigns an already-bound one; the owner's own token is never subject
+     to this at all (ADR-0018 decision 6). Owner-only (this whole /ui/rooms
+     surface requires the owner cookie session), hidden once the room is
+     closed like every other mid-room toggle on this page. -->
+<div class="panel" id="room-seats-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>
+  <h2>Seats</h2>
+  <p class="meta">
+    Assign a seat to a specific machine so only that machine's token may post or attach as that member -- a
+    different machine is refused outright, even on its first message. Leave a seat unassigned to let the
+    first machine that posts as that agent claim it, as every room has always worked.
+  </p>
+  {% for m in members %}
+  <div class="row">
+    <span class="row-main">
+      <strong>{{ m }}</strong>
+      <span class="meta">
+        {#- Branch on `bound_machine_ids.get(m)` (holds the id for every
+            bound seat, active machine or not), not on
+            `bound_machine_names.get(m)` (only populated for machines still
+            in the active roster, ui_rooms.py's `_room_context`) -- a seat
+            bound to a since-revoked machine has a truthy id but no name,
+            and must never fall into the unbound/open branch: the seat is
+            genuinely stuck (no machine, not even a freshly re-minted
+            replacement, can claim it) until the owner uses the
+            release/reassign form directly below this line. Jinja comment
+            (stripped from output), not an HTML one, so this explanation --
+            which necessarily names both the "open" and "revoked" wording
+            below -- never leaks into the rendered page itself. -#}
+        {% if bound_machine_ids.get(m) %}{% if bound_machine_names.get(m) %}bound to {{ bound_machine_names[m] }}{% else %}bound to a revoked machine — release or reassign below to fix{% endif %}{% else %}open (unclaimed){% endif %}
+      </span>
+    </span>
+    <form method="post" action="/ui/rooms/{{ room.id }}/members/{{ m }}/seat" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <select name="machine_id" {% if room.status != 'open' %}disabled{% endif %}>
+        <option value="" {% if not bound_machine_ids.get(m) %}selected{% endif %}>— unassigned (open) —</option>
+        {% for machine in active_machines %}
+        <option value="{{ machine.id }}" {% if bound_machine_ids.get(m) == machine.id %}selected{% endif %}>{{ machine.name }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="btn" {% if room.status != 'open' %}disabled{% endif %}>Update</button>
+    </form>
+  </div>
+  {% endfor %}
 </div>
 
 <div class="panel" id="room-switch-mode-panel" {% if room.status != 'open' %}style="display:none"{% endif %}>

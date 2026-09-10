@@ -61,6 +61,20 @@ debate/critique room's "done" close is no longer unconditional, so both
 places now state the room's live consensus-floor-and-objections
 requirement concretely, before an agent could ever reach `post_message`'s
 `close_as_agreed_not_permitted` 409 backstop.
+
+ADR-0018 (Layer 1 -- the join prompt announces its target) adds one more
+paragraph, `_room_target_block`, placed AHEAD OF EVEN `intro` -- the very
+first thing a joining agent reads, a step further up than any prior
+addition to this function. It states the room's own identity (name, id,
+`project` if set, `group_name` if set, `topic` if set, and the full member
+list) and directs the agent to stop and tell its operator if this isn't the
+project/task it's currently working on -- the direct response to the real
+incident that motivated this ADR (a join prompt pasted into the wrong
+agent's tab). `project` (new on `Room`, ADR-0018 decision 12) lets this
+block state an exact, comparable fact when the owner set one; when it
+wasn't set, the block is honest about that too and falls back to asking the
+agent to judge the name/topic against its own work, same as the original
+(pre-ADR-0018) draft of this block did unconditionally.
 """
 
 from datetime import UTC, datetime
@@ -265,6 +279,66 @@ def _format_max_file_size(max_file_bytes: int) -> str:
     return f"{max_file_bytes // (1024 * 1024)} MB"
 
 
+def _room_target_block(
+    *,
+    room_id: str,
+    room_name: str,
+    agent_name: str,
+    members: list[str],
+    project: str | None,
+    group_name: str | None,
+    topic: str | None,
+) -> str:
+    """ADR-0018 decision 1's Layer 1 target-check paragraph -- placed AHEAD
+    OF EVEN `intro` in `generate_room_join_prompt` below (see that
+    function's docstring and this module's own docstring): the very first
+    thing a joining agent reads, because the mismatch it guards against has
+    to be caught before the agent absorbs ANY room-specific framing
+    (including `intro` itself, which already states facts -- "You are
+    '{agent_name}'..." -- that presume the reader is the right agent) as
+    this session's new task.
+
+    Two forms, depending on whether the room has a `project` set
+    (ADR-0018 decision 12): with one, the agent is told to compare it
+    EXACTLY against the project it's currently working on -- a precise,
+    binary check. Without one, the block is honest that no such precise
+    fact exists for this room and falls back to asking the agent to judge
+    the room's name/topic against its own work -- the same judgment-call
+    framing this block always had before `project` existed. Either way the
+    directive is identical: STOP, don't act, tell the operator.
+    """
+    identity_bits = [f'room "{room_name}" (id {room_id})']
+    if project:
+        identity_bits.append(f'project: "{project}"')
+    if group_name:
+        identity_bits.append(f'group "{group_name}"')
+    if topic:
+        identity_bits.append(f'topic: "{topic}"')
+    identity = ", ".join(identity_bits)
+    member_list = ", ".join(members)
+
+    if project:
+        compare = (
+            f"This room's stated project is '{project}' -- compare that, exactly, against the project you "
+            "are currently working on. If it does not match exactly, STOP: do not join this room, do not act "
+            "on anything below this line, and tell your operator immediately that you were pasted a join "
+            "prompt for a different project."
+        )
+    else:
+        compare = (
+            "This room has no stated project -- compare its name and topic above against what you are "
+            "currently working on, using your own judgment. If this doesn't look like your work, STOP: do "
+            "not join this room, do not act on anything below this line, and tell your operator immediately "
+            "that you were pasted a join prompt for a different room/project."
+        )
+
+    return (
+        f"STOP AND CHECK BEFORE READING ANY FURTHER. This join prompt is for {identity}. Members: "
+        f"{member_list}. It would join you as '{agent_name}'. This prompt was written for whichever agent is "
+        f"working on that room's subject -- not necessarily the session you are running in right now. {compare}"
+    )
+
+
 def _room_open_gate_policy_block(*, requires_owner_open: bool, opened_at: datetime | None) -> str:
     """ADR-0014 decision 2's owner-open-gate paragraph -- placed immediately
     after `intro` and AHEAD of even `_room_attachments_policy_block` (see
@@ -365,6 +439,7 @@ def generate_room_join_prompt(
     *,
     base_url: str,
     room_id: str,
+    room_name: str,
     agent_name: str,
     partner_name: str,
     token: str = TOKEN_PLACEHOLDER,
@@ -377,6 +452,8 @@ def generate_room_join_prompt(
     requires_owner_open: bool = True,
     opened_at: datetime | None = None,
     consensus_floor: int = 20,
+    project: str | None = None,
+    group_name: str | None = None,
 ) -> str:
     """Builds the full room-join prompt (ADR-0006, phase C, decision 7): the
     complete copy-paste prompt that drops an agent into a room's long-poll
@@ -433,6 +510,16 @@ def generate_room_join_prompt(
     `how_to` step 4 below, which reads differently for debate/critique than
     for the other three modes since this ADR replaces those two modes'
     previously-unconditional, ungated close.
+
+    ADR-0018: `project` (the room's live `Room.project`, default None
+    matching a room with no stated project) and `group_name` (the room's
+    live `Room.group_name`) drive `_room_target_block` -- inserted AHEAD OF
+    EVEN `intro`, the very first paragraph in the returned prompt (see this
+    module's docstring for why). This is Layer 1 of ADR-0018's response to
+    a real incident (a join prompt pasted into the wrong agent's tab):
+    nothing server-side can prevent the paste, so the only real defence is
+    the agent recognising the mismatch before it acts on anything else in
+    this prompt.
     """
     base = base_url.rstrip("/")
 
@@ -508,10 +595,24 @@ def generate_room_join_prompt(
     )
 
     session_block = _room_session_block(mode, topic, side, partner_name, deadline, consensus_floor)
+
+    # ADR-0018 decision 1: the target-check block is placed AHEAD OF EVEN
+    # `intro` -- the very first paragraph in the whole prompt, because the
+    # mismatch it guards against has to be caught before the agent absorbs
+    # any room-specific framing (intro included) as its new task.
+    target_block = _room_target_block(
+        room_id=room_id,
+        room_name=room_name,
+        agent_name=agent_name,
+        members=[agent_name, partner_name],
+        project=project,
+        group_name=group_name,
+        topic=topic,
+    )
     # ADR-0014 decision 2: the open-gate paragraph is placed right after
     # intro, AHEAD OF EVEN the file policy block -- it governs whether
     # anything else here (including the file policy) may be acted on yet.
-    paragraphs = [intro, open_gate_block, file_policy_block]
+    paragraphs = [target_block, intro, open_gate_block, file_policy_block]
     if session_block is not None:
         paragraphs.append(session_block)
     paragraphs.extend([how_to, keep_me_informed, _MODE_SWITCH_PRIMING])

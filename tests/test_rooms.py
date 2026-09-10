@@ -1519,8 +1519,42 @@ RACE_TRIALS = 3
 # claim to (fix for the sender="owner" impersonation bug); the concurrency
 # invariant under test here is unrelated to that identity check, so a
 # single fixed machine principal is reused across all of them.
-_RACE_MACHINE_PRINCIPAL = Principal(kind="machine", machine=Machine(id=str(ULID())))
+_RACE_MACHINE_ID = str(ULID())
+_RACE_MACHINE_TOKEN = generate_machine_token()
+_RACE_MACHINE_PRINCIPAL = Principal(kind="machine", machine=Machine(id=_RACE_MACHINE_ID))
 _RACE_OWNER_PRINCIPAL = Principal(kind="owner")
+
+
+async def _ensure_race_machine(db_session) -> None:
+    """ADR-0018: `check_and_bind_seat` now writes `principal.machine.id`
+    into `RoomMember.bound_machine_id`, an FK to `machines.id` -- so every
+    race test below that posts via `_RACE_MACHINE_PRINCIPAL` needs a REAL,
+    persisted machine row at that fixed id, not just an in-memory ORM
+    object that only ever satisfied the `Principal.kind == "machine"` type
+    check before this ADR. Idempotent (checks existence first), so it's
+    safe to call at the top of every race test in this module.
+    """
+    existing = await db_session.get(Machine, _RACE_MACHINE_ID)
+    if existing is None:
+        db_session.add(
+            Machine(id=_RACE_MACHINE_ID, name="race-test-machine", token_hash=hash_token(_RACE_MACHINE_TOKEN), status="active")
+        )
+        await db_session.commit()
+
+
+async def _race_machine_headers(db_session) -> dict:
+    """ADR-0018: bearer headers for the SAME machine `_RACE_MACHINE_PRINCIPAL`
+    identifies -- for tests that need to set up some pre-race state over
+    HTTP (`client`) as the identical machine identity the race itself later
+    posts as via `_RACE_MACHINE_PRINCIPAL`. Using a DIFFERENT machine for
+    HTTP setup than for the direct-call race would claim the seat for the
+    wrong machine (ADR-0018 seat binding) and make the race's own
+    `_RACE_MACHINE_PRINCIPAL` posts spuriously refused with
+    `seat_bound_to_other_machine` -- a real bug this helper exists to avoid,
+    not a hypothetical one.
+    """
+    await _ensure_race_machine(db_session)
+    return {"Authorization": f"Bearer {_RACE_MACHINE_TOKEN}"}
 
 
 async def _open_room_direct(room_id: str) -> None:
@@ -1560,6 +1594,7 @@ async def test_delete_room_race_delete_wins_against_post_message_done(client, db
     message.
     """
     owner_headers = await _owner_headers(db_session)
+    await _ensure_race_machine(db_session)
 
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
@@ -1613,6 +1648,7 @@ async def test_delete_room_race_post_message_done_wins_against_delete(client, db
     violation.
     """
     owner_headers = await _owner_headers(db_session)
+    await _ensure_race_machine(db_session)
 
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
@@ -2061,6 +2097,7 @@ async def test_switch_mode_race_switch_wins_against_post_message(client, db_sess
     lost update.
     """
     owner_headers = await _owner_headers(db_session)
+    await _ensure_race_machine(db_session)
 
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
@@ -2110,6 +2147,7 @@ async def test_switch_mode_race_post_message_wins_against_switch(client, db_sess
     message_count/seq (no lost update).
     """
     owner_headers = await _owner_headers(db_session)
+    await _ensure_race_machine(db_session)
 
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
@@ -3201,6 +3239,7 @@ async def test_delete_message_race_concurrent_deletes_of_same_message_never_doub
     never goes negative (ADR-0015 decision 8).
     """
     owner_headers = await _owner_headers(db_session)
+    await _ensure_race_machine(db_session)
 
     for _ in range(RACE_TRIALS):
         room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"], max_messages=10)
@@ -3702,7 +3741,7 @@ async def test_close_as_agreed_gate_race_two_concurrent_done_posts_at_floor(clie
     message_count/seq.
     """
     owner_headers = await _owner_headers(db_session)
-    machine_headers = await _machine_headers(db_session)
+    machine_headers = await _race_machine_headers(db_session)
     room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
     room_id = room["id"]
 
@@ -3769,7 +3808,7 @@ async def test_close_as_agreed_gate_race_objection_wins_against_pending_done(cli
     and, the floor already being met, succeed.
     """
     owner_headers = await _owner_headers(db_session)
-    machine_headers = await _machine_headers(db_session)
+    machine_headers = await _race_machine_headers(db_session)
     room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
     room_id = room["id"]
 
@@ -3831,7 +3870,7 @@ async def test_close_as_agreed_gate_race_done_wins_against_pending_objection(cli
     delayed commit, without changing what the check actually decides.
     """
     owner_headers = await _owner_headers(db_session)
-    machine_headers = await _machine_headers(db_session)
+    machine_headers = await _race_machine_headers(db_session)
     room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
     room_id = room["id"]
 
@@ -3906,6 +3945,7 @@ async def test_close_as_agreed_gate_race_delete_wins_against_pending_done(client
     read straddling the decrement), and correctly reject.
     """
     owner_headers = await _owner_headers(db_session)
+    await _ensure_race_machine(db_session)
     machine_headers = await _machine_headers(db_session)
     room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
     room_id = room["id"]
@@ -3962,7 +4002,7 @@ async def test_close_as_agreed_gate_race_done_wins_against_pending_delete(client
     concurrency rather than sequentially).
     """
     owner_headers = await _owner_headers(db_session)
-    machine_headers = await _machine_headers(db_session)
+    machine_headers = await _race_machine_headers(db_session)
     room = await _create_debate_room(client, owner_headers, consensus_floor=3, max_messages=50)
     room_id = room["id"]
 

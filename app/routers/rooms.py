@@ -16,6 +16,7 @@ from app.db import get_db
 from app.errors import ApiError
 from app.rooms import (
     create_room,
+    get_member_bindings,
     get_member_sides,
     get_member_sides_for_rooms,
     get_members,
@@ -31,6 +32,7 @@ from app.rooms import list_rooms as list_rooms_op
 from app.rooms import poll_messages as poll_messages_op
 from app.rooms import post_message as post_message_op
 from app.rooms import set_requires_owner_open as set_requires_owner_open_op
+from app.rooms import set_room_member_seat as set_room_member_seat_op
 from app.rooms import switch_room_mode as switch_room_mode_op
 from app.schemas import (
     RoomCloseRequest,
@@ -43,6 +45,8 @@ from app.schemas import (
     RoomGroupAssignResponse,
     RoomListItem,
     RoomListResponse,
+    RoomMemberSeatRequest,
+    RoomMemberSeatResponse,
     RoomMessageDeleteResponse,
     RoomMessageOut,
     RoomMessagesPollResponse,
@@ -75,9 +79,12 @@ async def create_room_endpoint(
         expires_at=body.expires_at,
         group=body.group,
         consensus_floor=body.consensus_floor,
+        project=body.project,
+        seat_machines=body.seats,
     )
     members = await get_members(db, room.id)
     sides = await get_member_sides(db, room.id)
+    seats = await get_member_bindings(db, room.id)
     return RoomCreateResponse(
         id=room.id,
         name=room.name,
@@ -90,6 +97,8 @@ async def create_room_endpoint(
         sides=sides,
         group=room.group_name,
         consensus_floor=room.consensus_floor,
+        project=room.project,
+        seats=seats,
     )
 
 
@@ -124,6 +133,7 @@ async def list_rooms_endpoint(
                 sides=sides_by_room.get(r.id, {}),
                 group=r.group_name,
                 consensus_floor=r.consensus_floor,
+                project=r.project,
             )
             for r in rows
         ],
@@ -162,6 +172,7 @@ async def get_room_endpoint(
         raise ApiError(404, "room_not_found", f"No room with id '{room_id}'.")
     members = await get_members(db, room_id)
     sides = await get_member_sides(db, room_id)
+    seats = await get_member_bindings(db, room_id)
     messages = await get_recent_messages(db, room_id)
     return RoomDetailResponse(
         id=room.id,
@@ -183,6 +194,8 @@ async def get_room_endpoint(
         opened_at=room.opened_at,
         requires_owner_open=room.requires_owner_open,
         consensus_floor=room.consensus_floor,
+        project=room.project,
+        seats=seats,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
     )
 
@@ -253,6 +266,26 @@ async def set_room_open_gate_endpoint(
         opened_at=room.opened_at,
         expires_at=room.expires_at,
         announcement=announcement,
+    )
+
+
+@router.post("/{room_id}/members/{agent_name}/seat", response_model=RoomMemberSeatResponse)
+async def set_room_member_seat_endpoint(
+    room_id: str,
+    agent_name: str,
+    body: RoomMemberSeatRequest,
+    _owner: Principal = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+) -> RoomMemberSeatResponse:
+    """ADR-0018 decision 8: owner-only release (`machine_id: null`) or
+    direct reassignment (`machine_id: "<id>"`) of one seat's binding -- see
+    app/rooms.py's `set_room_member_seat` for the validation/locking/
+    announcement logic; this route only wires the request/response shapes
+    to it.
+    """
+    room, member, announcement = await set_room_member_seat_op(db, room_id, agent_name, body.machine_id)
+    return RoomMemberSeatResponse(
+        room_id=room.id, agent_name=member.agent_name, bound_machine_id=member.bound_machine_id, announcement=announcement
     )
 
 

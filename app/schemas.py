@@ -581,6 +581,21 @@ class RoomCreateRequest(BaseModel):
     # debate/critique (app/rooms.py's create_room). None -> the domain's
     # own DEFAULT_CONSENSUS_FLOOR (20).
     consensus_floor: int | None = None
+    # ADR-0018 decision 12: optional, free-form project label (NOT a
+    # `projects`-registry FK -- see that decision) -- lets the join prompt's
+    # Layer 1 target check state a precise, comparable fact. Trimmed,
+    # blank/empty treated as "no project", validated in app/rooms.py's
+    # `_validate_project` (same self-explaining-ApiError reasoning as
+    # `group` above).
+    project: str | None = None
+    # ADR-0018 decision 3: optional per-seat machine assignment,
+    # {agent_name: machine_id}, covering zero, one, or both of `members`. A
+    # member with no entry (or an omitted/empty `seats`) is left unassigned
+    # -- the seat binds to whichever machine token posts as that member
+    # first (claim-on-first-write, unchanged default). Validated in
+    # app/rooms.py's `_validate_seat_assignments` (machine must exist and
+    # be `status == 'active'`).
+    seats: dict[str, str] | None = None
 
 
 class RoomCreateResponse(BaseModel):
@@ -599,6 +614,11 @@ class RoomCreateResponse(BaseModel):
     # for every room regardless of mode, only read by the gate for
     # debate/critique.
     consensus_floor: int
+    # ADR-0018 decision 12: see RoomCreateRequest.project.
+    project: str | None
+    # ADR-0018 decision 3: {agent_name: bound_machine_id} as resolved at
+    # creation -- null for a member left unassigned (open, claim-on-first-write).
+    seats: dict[str, str | None]
 
 
 class RoomListItem(BaseModel):
@@ -617,6 +637,8 @@ class RoomListItem(BaseModel):
     group: str | None
     # ADR-0017: see RoomCreateResponse.consensus_floor.
     consensus_floor: int
+    # ADR-0018 decision 12: see RoomCreateRequest.project.
+    project: str | None
 
 
 class RoomListResponse(BaseModel):
@@ -667,6 +689,11 @@ class RoomDetailResponse(BaseModel):
     requires_owner_open: bool
     # ADR-0017: see RoomCreateResponse.consensus_floor.
     consensus_floor: int
+    # ADR-0018 decision 12: see RoomCreateRequest.project.
+    project: str | None
+    # ADR-0018 decision 3: {agent_name: bound_machine_id} -- null for an
+    # open (unassigned, unclaimed) seat, same shape as RoomCreateResponse.seats.
+    seats: dict[str, str | None]
     # Most recent N messages, oldest first (chat reading order).
     messages: list[RoomMessageOut]
 
@@ -868,6 +895,25 @@ class RoomOpenGateResponse(BaseModel):
     # The kind='system' announcement text posted into the room's transcript
     # by this toggle (ADR-0014 decision 4) -- same shape as
     # RoomAgentUploadsResponse.announcement.
+    announcement: str
+
+
+# --- ADR-0018 decision 8: owner-only seat release/reassign ---
+
+
+class RoomMemberSeatRequest(BaseModel):
+    # null releases the seat (open again, claim-on-first-write); a machine
+    # id directly reassigns it -- must be an existing, active machine
+    # (app/rooms.py's set_room_member_seat).
+    machine_id: str | None = None
+
+
+class RoomMemberSeatResponse(BaseModel):
+    room_id: str
+    agent_name: str
+    bound_machine_id: str | None
+    # The kind='system' announcement text posted into the room's transcript
+    # by this action -- same shape as RoomOpenGateResponse.announcement.
     announcement: str
 
 

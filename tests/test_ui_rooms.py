@@ -81,6 +81,8 @@ async def _create_room_via_api(
     duration_seconds=None,
     group=None,
     consensus_floor=None,
+    project=None,
+    seats=None,
 ) -> dict:
     """Room setup via the phase-A /v1/rooms API -- used by UI tests that need
     a room already in a particular mode/topic/sides/deadline state to then
@@ -103,6 +105,10 @@ async def _create_room_via_api(
         body["group"] = group
     if consensus_floor is not None:
         body["consensus_floor"] = consensus_floor
+    if project is not None:
+        body["project"] = project
+    if seats is not None:
+        body["seats"] = seats
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == 201, resp.json()
     return resp.json()
@@ -1089,12 +1095,25 @@ def _fake_room(**overrides) -> Room:
         expires_at=None,
         closing_warned_at=None,
         group_name=None,
+        project=None,
     )
     defaults.update(overrides)
     return Room(**defaults)
 
 
-def _render_room_view(*, room, members, sides, side_labels, join_prompts, messages=(), mode_label="Freeform") -> str:
+def _render_room_view(
+    *,
+    room,
+    members,
+    sides,
+    side_labels,
+    join_prompts,
+    messages=(),
+    mode_label="Freeform",
+    active_machines=None,
+    bound_machine_ids=None,
+    bound_machine_names=None,
+) -> str:
     """Renders room_view.html directly (bypassing the /ui/rooms/{id} route
     entirely) so the new per-participant copy-button loop (ADR-0013
     decision 2) can be exercised with a member list shape the domain layer
@@ -1128,6 +1147,9 @@ def _render_room_view(*, room, members, sides, side_labels, join_prompts, messag
         project_names=[],
         error=None,
         deposited=False,
+        active_machines=active_machines or [],
+        bound_machine_ids=bound_machine_ids or {},
+        bound_machine_names=bound_machine_names or {},
     )
 
 
@@ -1156,14 +1178,15 @@ def test_room_view_copy_buttons_generated_dynamically_for_more_than_two_members_
 
     assert "Copy join prompt — Commander" in html_out
     assert "Copy join prompt — Builder" in html_out
-    # `observer` has no side -> ordinal fallback, per decision 3.
-    assert "Copy join prompt — Agent 3" in html_out
+    # `observer` has no side -> its own agent_name (ADR-0018 decision 15),
+    # not a generic ordinal.
+    assert "Copy join prompt — observer" in html_out
 
 
-def test_room_view_copy_button_labels_fall_back_to_agent_ordinal_without_roles():
+def test_room_view_copy_button_labels_fall_back_to_agent_name_without_roles():
     """A room with no roles at all (freeform, `sides` all falsy) must label
-    every button "Agent N", never the bare member name and never a blank
-    label -- the fallback branch of decision 3.
+    every button with the member's own agent_name (ADR-0018 decision 15 --
+    replacing the old "Agent N" ordinal fallback), never a blank label.
     """
     room = _fake_room(message_count=0)
     members = ["alpha", "beta", "gamma", "delta"]
@@ -1172,10 +1195,208 @@ def test_room_view_copy_button_labels_fall_back_to_agent_ordinal_without_roles()
 
     html_out = _render_room_view(room=room, members=members, sides=sides, side_labels=None, join_prompts=join_prompts)
 
-    assert "Copy join prompt — Agent 1" in html_out
-    assert "Copy join prompt — Agent 2" in html_out
-    assert "Copy join prompt — Agent 3" in html_out
-    assert "Copy join prompt — Agent 4" in html_out
+    assert "Copy join prompt — alpha" in html_out
+    assert "Copy join prompt — beta" in html_out
+    assert "Copy join prompt — gamma" in html_out
+    assert "Copy join prompt — delta" in html_out
+    assert "Agent 1" not in html_out
+    assert "Agent 2" not in html_out
+
+
+def test_room_view_copy_button_labels_append_bound_machine_name():
+    """When a seat is bound (assigned or claimed, ADR-0018), the button
+    label appends the machine's name in parentheses -- both for a member
+    with a side label and one without, per decision 15's own example
+    format.
+    """
+    room = _fake_room(message_count=0)
+    members = ["Commander", "builder"]
+    sides = {"Commander": None, "builder": None}
+    join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
+    # Realistic shape: `bound_machine_names` is always derived FROM
+    # `bound_machine_ids` (ui_rooms.py's `_room_context`), so a bound seat's
+    # id must be present here too -- the Fix 1 rewrite branches on
+    # `bound_machine_ids.get(m)` first, `bound_machine_names.get(m)` only
+    # for the display name (see the revoked-machine tests just below for
+    # the case where the two disagree).
+    bound_machine_ids = {"Commander": "active-machine-id", "builder": None}
+    bound_machine_names = {"Commander": "Rankati - Commander LXC109 - Capital NUC"}
+
+    html_out = _render_room_view(
+        room=room,
+        members=members,
+        sides=sides,
+        side_labels=None,
+        join_prompts=join_prompts,
+        bound_machine_ids=bound_machine_ids,
+        bound_machine_names=bound_machine_names,
+    )
+
+    assert "Copy join prompt — Commander (Rankati - Commander LXC109 - Capital NUC)" in html_out
+    # `builder`'s seat is unbound -- no parenthetical.
+    assert "Copy join prompt — builder</button>" in html_out
+
+
+def test_room_view_copy_button_label_shows_revoked_machine_needs_attention_not_omitted():
+    """Independent-review fix (Fix 1): a seat bound to a since-revoked
+    machine has a truthy `bound_machine_ids` entry but NO entry in
+    `bound_machine_names` (ui_rooms.py's `_room_context` resolves names
+    only against `list_active_machines()`). Before the fix, the copy-button
+    loop branched on `bound_machine_names.get(m)` alone, so this case
+    rendered with no parenthetical at all -- indistinguishable from a
+    genuinely unbound seat. It must instead render an actionable
+    parenthetical, and must never look identical to `builder`'s truly
+    unbound seat below.
+    """
+    room = _fake_room(message_count=0)
+    members = ["Commander", "builder"]
+    sides = {"Commander": None, "builder": None}
+    join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
+    # `Commander`'s seat IS bound (id present) but the machine is not in the
+    # active roster -- exactly the revoked-machine shape.
+    bound_machine_ids = {"Commander": "revoked-machine-id", "builder": None}
+    bound_machine_names = {}  # revoked machine's name is absent, by design
+
+    html_out = _render_room_view(
+        room=room,
+        members=members,
+        sides=sides,
+        side_labels=None,
+        join_prompts=join_prompts,
+        bound_machine_ids=bound_machine_ids,
+        bound_machine_names=bound_machine_names,
+    )
+
+    assert "Copy join prompt — Commander (bound to a revoked machine — release/reassign in Seats panel)" in html_out
+    # `builder` is genuinely unbound -- no parenthetical at all, and
+    # distinguishable from Commander's revoked-but-bound state.
+    assert "Copy join prompt — builder</button>" in html_out
+
+
+def test_room_view_seats_panel_bound_active_shows_machine_name():
+    """Seats panel sibling of the copy-button test above: a seat bound to
+    an active machine still renders "bound to <name>", unchanged by the
+    Fix 1 branch-on-id rewrite.
+    """
+    room = _fake_room(message_count=0)
+    members = ["Commander", "builder"]
+    sides = {"Commander": None, "builder": None}
+    join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
+    bound_machine_ids = {"Commander": "active-machine-id", "builder": None}
+    bound_machine_names = {"Commander": "Rankati - Commander LXC109 - Capital NUC"}
+
+    html_out = _render_room_view(
+        room=room,
+        members=members,
+        sides=sides,
+        side_labels=None,
+        join_prompts=join_prompts,
+        bound_machine_ids=bound_machine_ids,
+        bound_machine_names=bound_machine_names,
+    )
+
+    assert "bound to Rankati - Commander LXC109 - Capital NUC" in html_out
+
+
+def test_room_view_seats_panel_bound_revoked_shows_needs_attention_not_open():
+    """The Fix 1 bug, reproduced directly against the Seats panel: a seat
+    bound to a since-revoked machine (id present, name absent) must render
+    as bound-but-needing-attention, never fall into the "open (unclaimed)"
+    branch -- the seat is genuinely stuck (RoomMember.bound_machine_id has
+    no ondelete, so it still points at the revoked row) until the owner
+    uses the release/reassign form on this same row.
+    """
+    room = _fake_room(message_count=0)
+    members = ["Commander", "builder"]
+    sides = {"Commander": None, "builder": None}
+    join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
+    bound_machine_ids = {"Commander": "revoked-machine-id", "builder": None}
+    bound_machine_names = {}
+
+    html_out = _render_room_view(
+        room=room,
+        members=members,
+        sides=sides,
+        side_labels=None,
+        join_prompts=join_prompts,
+        bound_machine_ids=bound_machine_ids,
+        bound_machine_names=bound_machine_names,
+    )
+
+    # Isolate the Seats panel so the copy-button row above (which mentions
+    # "revoked machine" too) can't make this assertion pass by accident.
+    seats_panel = html_out.split('id="room-seats-panel"', 1)[1]
+    commander_row = seats_panel.split("<strong>Commander</strong>", 1)[1].split("<strong>builder</strong>", 1)[0]
+    assert "bound to a revoked machine" in commander_row
+    assert "open (unclaimed)" not in commander_row
+
+
+def test_room_view_seats_panel_unbound_seat_still_shows_open():
+    """Control case: a genuinely unbound seat (no id at all) still renders
+    "open (unclaimed)" -- proves the Fix 1 rewrite (branching on
+    `bound_machine_ids.get(m)`) didn't flip this case to look bound.
+    """
+    room = _fake_room(message_count=0)
+    members = ["Commander", "builder"]
+    sides = {"Commander": None, "builder": None}
+    join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
+
+    html_out = _render_room_view(
+        room=room, members=members, sides=sides, side_labels=None, join_prompts=join_prompts
+    )
+
+    seats_panel = html_out.split('id="room-seats-panel"', 1)[1]
+    commander_row = seats_panel.split("<strong>Commander</strong>", 1)[1].split("<strong>builder</strong>", 1)[0]
+    assert "open (unclaimed)" in commander_row
+    assert "bound to" not in commander_row
+
+
+async def test_room_view_seat_bound_to_revoked_machine_end_to_end(client, db_session):
+    """End-to-end sibling of the template-level tests above (real
+    /ui/rooms/{id} route, real create-room + seat-assignment + revoke
+    paths): mirrors this fleet's actual practice of revoking and re-minting
+    machines (ADR-0018's own Context section verified this directly against
+    the live `machines` table). A seat assigned to a machine that is later
+    revoked must show up as bound-but-needs-attention in both the Seats
+    panel and the copy-button label -- never as "open (unclaimed)", which
+    would hide that the seat is stuck until the owner releases/reassigns
+    it.
+    """
+    owner_headers = await _owner_headers_and_login(client, db_session)
+    machine_token = generate_machine_token()
+    machine_id = str(ULID())
+    db_session.add(
+        Machine(id=machine_id, name="soon-to-be-revoked", token_hash=hash_token(machine_token), status="active")
+    )
+    await db_session.commit()
+
+    room = await _create_room_via_api(
+        client,
+        owner_headers,
+        name="revoked-seat-room",
+        members=["agent-a", "agent-b"],
+        seats={"agent-a": machine_id},
+    )
+
+    from app.machines import revoke_machine
+
+    await revoke_machine(db_session, machine_id)
+
+    resp = await client.get(f"/ui/rooms/{room['id']}")
+    assert resp.status_code == 200
+    text = resp.text
+
+    seats_panel = text.split('id="room-seats-panel"', 1)[1].split('id="room-switch-mode-panel"', 1)[0]
+    agent_a_row = seats_panel.split("<strong>agent-a</strong>", 1)[1].split("<strong>agent-b</strong>", 1)[0]
+    agent_b_row = seats_panel.split("<strong>agent-b</strong>", 1)[1]
+
+    assert "bound to a revoked machine" in agent_a_row
+    assert "open (unclaimed)" not in agent_a_row
+    # `agent-b`'s seat was never assigned -- still genuinely open.
+    assert "open (unclaimed)" in agent_b_row
+
+    assert "Copy join prompt — agent-a (bound to a revoked machine — release/reassign in Seats panel)" in text
+    assert "Copy join prompt — agent-b</button>" in text
 
 
 async def test_room_view_copy_button_labels_use_role_in_real_debate_room(client, db_session):
@@ -1204,17 +1425,20 @@ async def test_room_view_copy_button_labels_use_role_in_real_debate_room(client,
 
 
 async def test_room_view_copy_button_labels_fall_back_in_real_freeform_room(client, db_session):
-    """End-to-end sibling: a freeform (no-roles) two-member room falls back
-    to "Agent 1"/"Agent 2" through the real route, same as the template-
-    level test above.
+    """End-to-end sibling: a freeform (no-roles) two-member room labels
+    each button with its own agent_name (ADR-0018 decision 15) through the
+    real route, same as the template-level test above -- no more "Agent
+    1"/"Agent 2" ordinal.
     """
     owner_headers = await _owner_headers_and_login(client, db_session)
     room = await _create_room_via_api(client, owner_headers, name="freeform-copy-buttons", members=["agent-a", "agent-b"])
 
     resp = await client.get(f"/ui/rooms/{room['id']}")
     assert resp.status_code == 200
-    assert "Copy join prompt — Agent 1" in resp.text
-    assert "Copy join prompt — Agent 2" in resp.text
+    assert "Copy join prompt — agent-a" in resp.text
+    assert "Copy join prompt — agent-b" in resp.text
+    assert "Copy join prompt — Agent 1" not in resp.text
+    assert "Copy join prompt — Agent 2" not in resp.text
 
 
 async def test_room_view_copy_button_click_target_matches_bottom_section_join_prompt(client, db_session):

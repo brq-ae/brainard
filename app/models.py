@@ -610,6 +610,19 @@ class Room(Base):
     # 1-10000 validated the same shape `_validate_max_messages` already
     # uses for `max_messages`.
     consensus_floor: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
+    # ADR-0018 decision 12: an optional, free-form (NOT a `projects`-registry
+    # FK -- see that decision for why: the exactness the join-prompt target
+    # check needs comes from what string is stored, not from a DB
+    # constraint, and a room legitimately predates its project's first
+    # deposit) project label, so the Layer 1 join-prompt target check can
+    # state a precise, comparable fact ("this room's project is X") instead
+    # of only a name/topic an agent has to eyeball. Same free-text, trimmed,
+    # blank-becomes-None, length-capped shape as `group_name` above (ADR-0008
+    # decision 3's already-settled posture on this exact table) -- validated
+    # by app/rooms.py's `_validate_project`. Fixed at creation; no mutator
+    # exists to change it mid-room, same posture `topic`/`mode` have outside
+    # `switch_room_mode`'s deliberate exception.
+    project: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
 
     __table_args__ = (
         CheckConstraint("status IN ('open', 'closed')", name="ck_rooms_status"),
@@ -641,6 +654,24 @@ class RoomMember(Base):
     # ROOM_MODES[mode].sides. NULL for symmetric modes (collaborate,
     # brainstorm) and freeform.
     side: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ADR-0018: this seat's bound machine, if any. NULL means "open" -- no
+    # machine has posted as this member yet, and the owner has not assigned
+    # one at create time either; the seat binds to whichever machine token
+    # next posts or attaches as this member (app/room_seats.py's
+    # `check_and_bind_seat`). Non-NULL means EITHER the owner assigned this
+    # seat to a specific machine at room-creation time (decision 3, first
+    # path) OR a machine already claimed it by posting first (decision 3,
+    # second path) -- both paths write this same column, and
+    # `check_and_bind_seat` enforces it identically either way: only this
+    # machine's token may post/attach as this member from here on. Cleared
+    # (back to NULL, "open" again) or set directly to a different machine
+    # only by the owner's release/reassign action (decision 8,
+    # `app/rooms.py`'s `set_room_member_seat`) -- never cleared by anything
+    # else. No `ondelete`: `machines` rows are never deleted (only revoked,
+    # `Machine.status`), so this FK's default RESTRICT should never fire.
+    bound_machine_id: Mapped[str | None] = mapped_column(
+        String(26), ForeignKey("machines.id"), nullable=True, index=True
+    )
 
     __table_args__ = (Index("ix_room_members_room_agent", "room_id", "agent_name", unique=True),)
 

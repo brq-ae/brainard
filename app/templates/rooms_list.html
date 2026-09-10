@@ -39,6 +39,38 @@
         <input type="text" id="agent_b" name="agent_b" value="{{ form.agent_b or '' }}" required>
       </div>
     </div>
+    <!-- ADR-0018 decision 13: optional per-seat machine assignment, active
+         machines only (see app/machines.py's list_active_machines -- also
+         what keeps a revoked machine that shares a name with an active
+         replacement from ever appearing here, ambiguously or otherwise).
+         Left on "-- unassigned (open) --" (the default, value="") means
+         claim-on-first-write, unchanged from every room created before
+         this ADR. -->
+    <div class="grid cols-2">
+      <div class="field">
+        <label for="seat_a_machine_id">Assign Agent 1's seat to (optional)</label>
+        <select id="seat_a_machine_id" name="seat_a_machine_id">
+          <option value="" {% if not form.seat_a_machine_id %}selected{% endif %}>— unassigned (open) —</option>
+          {% for m in active_machines %}
+          <option value="{{ m.id }}" {% if form.seat_a_machine_id == m.id %}selected{% endif %}>{{ m.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="seat_b_machine_id">Assign Agent 2's seat to (optional)</label>
+        <select id="seat_b_machine_id" name="seat_b_machine_id">
+          <option value="" {% if not form.seat_b_machine_id %}selected{% endif %}>— unassigned (open) —</option>
+          {% for m in active_machines %}
+          <option value="{{ m.id }}" {% if form.seat_b_machine_id == m.id %}selected{% endif %}>{{ m.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <p class="meta">
+      An assigned seat only accepts writes from that machine's own token -- a different machine is refused
+      outright, even on its first message (ADR-0018). Leave unassigned to let the first machine that posts as
+      that agent claim the seat, as every room has always worked.
+    </p>
     <div class="field">
       <label for="max_messages">Max messages</label>
       <input type="text" id="max_messages" name="max_messages" class="mono" value="{{ form.max_messages or '' }}" placeholder="100">
@@ -52,6 +84,20 @@
       <label for="group">Group (optional)</label>
       <input type="text" id="group" name="group" list="existing-groups" value="{{ form.group or '' }}" placeholder="e.g. schema-debates" maxlength="100">
       <p class="meta">Free-form label (ADR-0008) -- point an observer AI at just this group's rooms via <code>GET /v1/rooms?group=...</code>.</p>
+    </div>
+    <div class="field">
+      <label for="project">Project (optional)</label>
+      <input type="text" id="project" name="project" list="existing-projects" value="{{ form.project or '' }}" placeholder="e.g. bernard-ai" maxlength="255">
+      <p class="meta">
+        Free-form, but pick an exact, existing project name if one applies (ADR-0018) -- a joining agent's join
+        prompt compares this exactly against the project it's currently working on, and tells it to stop if it
+        doesn't match.
+      </p>
+      <datalist id="existing-projects">
+        {% for p in project_names %}
+        <option value="{{ p }}">
+        {% endfor %}
+      </datalist>
     </div>
     <div class="field">
       <label for="duration_preset">Time limit</label>

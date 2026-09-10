@@ -25,6 +25,22 @@ async def list_machines(db: AsyncSession) -> list[Machine]:
     return list(result)
 
 
+async def list_active_machines(db: AsyncSession) -> list[Machine]:
+    """Active (non-revoked) machines, alphabetical by name -- backs the room
+    seat-assignment dropdown (ADR-0018 decision 13): the owner assigns a
+    specific machine to a room seat at creation or via release/reassign, and
+    only an active machine may be assigned (a revoked one's token can never
+    authenticate again anyway, app/auth.py's `authenticate`). Filtering to
+    `status == 'active'` here, before rendering, is also what keeps the
+    dropdown unambiguous when a revoked and an active machine happen to
+    share the same display name (a re-minted replacement for the same
+    agent, e.g. this deployment's own 'Rankati - Commander LXC109 - Capital
+    NUC') -- the revoked duplicate is simply never listed.
+    """
+    result = await db.scalars(select(Machine).where(Machine.status == "active").order_by(Machine.name))
+    return list(result)
+
+
 async def mint_machine(
     db: AsyncSession,
     name: str,
