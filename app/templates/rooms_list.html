@@ -61,6 +61,22 @@
       <label for="topic" id="topic-label">Topic</label>
       <input type="text" id="topic" name="topic" value="{{ form.topic or '' }}" placeholder="Required for non-freeform modes">
     </div>
+    <!-- ADR-0019 decision (2026-09-10 revision): an optional opening
+         message, posted as the OWNER's own first message the instant the
+         room is created (app/routers/ui_rooms.py's rooms_create) -- this is
+         what actually opens the room to agents (ADR-0014's owner-open
+         gate). Populated by the paste parser (app/static/room_setup_paste.js)
+         like every other field; left blank means "create the room gated,
+         I'll post my own opening message later," the same as today. -->
+    <div class="field">
+      <label for="opening_message">Opening message (optional)</label>
+      <textarea id="opening_message" name="opening_message" rows="4" maxlength="20000" placeholder="Posted as you (the owner) the moment the room is created -- this is what opens it to agents (ADR-0014). Leave blank to create the room gated and post it yourself later.">{{ form.opening_message or '' }}</textarea>
+      <p class="meta">
+        Posted as your own first message the instant this room is created, which opens it to agents (ADR-0014: a
+        room refuses agent messages until you've posted). Leave blank to create the room gated, same as today --
+        you can always post the opening message yourself from the room page afterward.
+      </p>
+    </div>
     <div class="grid cols-2">
       <div class="field">
         <label for="agent_a" id="agent_a_label">Agent 1 (name)</label>

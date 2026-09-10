@@ -34,10 +34,16 @@
   var SENTINEL_START = "BRAINARD-ROOM-SETUP-v1";
   var SENTINEL_END = "END-BRAINARD-ROOM-SETUP";
 
-  // The ten fixed keys (app/room_setup_briefing.py's REPLY_FORMAT_KEYS) --
-  // kept as a literal list here (not fetched) since this file has no
-  // server round trip at all; app/room_setup_briefing.py is the single
-  // source of the *text* format, this is its client-side parser.
+  // The eleven fixed keys (app/room_setup_briefing.py's REPLY_FORMAT_KEYS,
+  // extended by the 2026-09-10 revision with `opening_message`) -- kept as
+  // a literal list here (not fetched) since this file has no server round
+  // trip at all; app/room_setup_briefing.py is the single source of the
+  // *text* format, this is its client-side parser. A reply produced by an
+  // OLDER copy of the briefing (before `opening_message` existed) simply
+  // never has that key present -- same as any other absent key, that means
+  // "leave this field alone" (point 8 below), not an error, so no sentinel
+  // version bump was needed for this to keep working (app/room_setup_briefing
+  // .py's module docstring has the full reasoning).
   var VALID_KEYS = [
     "name",
     "mode",
@@ -49,6 +55,7 @@
     "group",
     "project",
     "duration_minutes",
+    "opening_message",
   ];
   var INTEGER_KEYS = ["max_messages", "consensus_floor", "duration_minutes"];
   var KEY_PATTERN = /^[A-Za-z0-9_]+$/;
@@ -67,6 +74,7 @@
     consensus_floor: "consensus_floor",
     group: "group",
     project: "project",
+    opening_message: "opening_message",
   };
 
   var NOT_FOUND_MESSAGE =
@@ -77,8 +85,8 @@
     "Found more than one BRAINARD-ROOM-SETUP-v1 … END-BRAINARD-ROOM-SETUP block in the pasted text; " +
     "paste only the LLM's final answer.";
   var SUCCESS_MESSAGE =
-    "Parsed — review the filled-in fields, then fill in the agent names, group, and project yourself " +
-    "before creating the room.";
+    "Parsed — review the filled-in fields (including the proposed agent names and opening message), then " +
+    "fill in the group and project yourself before creating the room.";
 
   var textarea = document.getElementById("room-setup-paste-input");
   var button = document.getElementById("room-setup-paste-button");
@@ -182,6 +190,36 @@
         return { ok: false, message: "The key '" + key + "' appears more than once in the pasted block." };
       }
       seenKeys[key] = true;
+
+      if (key === "opening_message") {
+        // opening_message is the one field allowed to be free-form,
+        // possibly multi-line/multi-paragraph prose (app/room_setup_briefing
+        // .py's REPLY_FORMAT_TEMPLATE) -- everything from this line's value
+        // to the end of the block belongs to it, not to any further "key:
+        // value" line. It must therefore be the LAST field in the block; a
+        // recognized key found further down is reported as a hard failure
+        // (not silently swallowed into this value) so a misordered reply
+        // never loses a field the owner or LLM meant to set.
+        var openingFirstPart = trimmedLine.slice(colonIdx + 1).trim();
+        var restLines = lines.slice(i + 1);
+        for (var r = 0; r < restLines.length; r++) {
+          var laterTrimmed = restLines[r].trim();
+          if (laterTrimmed === "") continue;
+          var laterColonIdx = laterTrimmed.indexOf(":");
+          var laterKey = laterColonIdx === -1 ? "" : laterTrimmed.slice(0, laterColonIdx).trim();
+          if (laterColonIdx !== -1 && VALID_KEYS.indexOf(laterKey) !== -1) {
+            return {
+              ok: false,
+              message:
+                "The `opening_message` field must be the last field in the pasted block, but a `" + laterKey +
+                "` field appears after it. Recovery: move `opening_message` to the end of the block.",
+            };
+          }
+        }
+        fields[key] = [openingFirstPart].concat(restLines).join("\n").trim();
+        break; // everything remaining belongs to opening_message, not to further lines
+      }
+
       fields[key] = trimmedLine.slice(colonIdx + 1).trim();
     }
 

@@ -534,6 +534,12 @@ async def rooms_create(
     # first-write, the unchanged default) for that seat.
     seat_a_machine_id: str = Form(default=""),
     seat_b_machine_id: str = Form(default=""),
+    # ADR-0019 decision (2026-09-10 revision): optional opening message,
+    # posted as the OWNER's own first message immediately after the room is
+    # created below -- see that block for why this is create-then-post
+    # (best-effort, with a clear warning on failure), never a single atomic
+    # transaction with create_room_op.
+    opening_message: str = Form(default=""),
     session: dict = Depends(require_ui_session),
     _csrf: None = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
@@ -617,6 +623,7 @@ async def rooms_create(
                     "project": project,
                     "seat_a_machine_id": seat_a_machine_id,
                     "seat_b_machine_id": seat_b_machine_id,
+                    "opening_message": opening_message,
                 },
                 "room_modes": ROOM_MODES,
                 "room_modes_json": ROOM_MODES_JSON,
@@ -628,6 +635,63 @@ async def rooms_create(
             },
             status_code=exc.status_code,
         )
+
+    # ADR-0019 decision (2026-09-10 revision): if an opening message was
+    # given, post it as the OWNER's own first message -- this is what opens
+    # the room to agents at all (ADR-0014's gate: a room refuses every
+    # agent message until room.opened_at is set, which only ever happens on
+    # an owner-authenticated `sender="owner"` post, never here directly).
+    #
+    # Deliberately create-then-post, NOT one atomic transaction: create_room
+    # (above) and post_message (below) are each already a complete,
+    # self-contained commit in app/rooms.py -- forcing them into one
+    # transaction would mean either reaching into post_message to skip its
+    # own commit (exactly the "do NOT bypass validation, the row lock, or
+    # the message cap" this feature is required not to do) or duplicating
+    # its insert-and-guardrail logic here, a second, divergent copy of code
+    # this codebase's own discipline (this module's docstring, repeatedly)
+    # says never to have. The failure mode this has to guard against is a
+    # HALF-CREATED room -- and there isn't one: `room` above is already a
+    # complete, valid, usable row the instant create_room_op returns,
+    # whether or not the message that follows succeeds. A room with no
+    # opening message is exactly today's status quo (gated, waiting for the
+    # owner) and is fully recoverable by posting from the room page -- so a
+    # failure here is a best-effort miss, not data loss. On failure, the
+    # owner lands on the room they just created (never a bare error page,
+    # never a silent drop) with a clear explanation of what happened and
+    # what to do next, through the same ApiError -> re-render-in-place
+    # pattern every other action in this file already uses (e.g. `room_post`
+    # below) -- the room stays exactly as `create_room_op` left it (still
+    # gated per ADR-0014, since the post that would have opened it never
+    # committed).
+    cleaned_opening_message = opening_message.strip() or None
+    if cleaned_opening_message:
+        try:
+            # principal=owner: this route is guarded by require_ui_session,
+            # which only ever accepts the owner's UI cookie (see the
+            # identical note on room_post below) -- sender="owner" is
+            # genuinely who's authenticated here (commit 8c61790).
+            await post_message_op(db, room.id, "owner", cleaned_opening_message, principal=Principal(kind="owner"))
+        except ApiError as exc:
+            ctx = await _room_context(db, request, room.id)
+            if ctx is None:
+                raise HTTPException(status_code=404, detail=f"No room with id '{room.id}'.") from exc
+            return templates.TemplateResponse(
+                request,
+                "room_view.html",
+                {
+                    "csrf_token": session["csrf"],
+                    "error": (
+                        f"Room '{room.name}' was created, but the opening message could not be posted: "
+                        f"{exc.detail} The room still requires your first message before agents may post "
+                        "(ADR-0014) -- post it below to open the room."
+                    ),
+                    "deposited": False,
+                    **ctx,
+                },
+                status_code=exc.status_code,
+            )
+
     return RedirectResponse(url=f"/ui/rooms/{room.id}", status_code=303)
 
 

@@ -418,6 +418,177 @@ async def test_create_room_form_without_csrf_rejected(client, db_session):
     assert len(rows) == 0
 
 
+# --- create room form: opening message (ADR-0019 decision 0, 2026-09-10
+# revision) -- posted as the OWNER's own first message immediately after
+# create_room succeeds, which is what opens the room per ADR-0014's gate. ---
+
+
+async def test_create_room_form_with_opening_message_posts_as_owner_and_opens_room(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "opened-by-message",
+            "agent_a": "alpha",
+            "agent_b": "beta",
+            "opening_message": "Let's work through the migration plan together.",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room is not None
+    assert room.opened_at is not None  # ADR-0014: posting as owner opens the room
+
+    rows = (await db_session.execute(RoomMessage.__table__.select().where(RoomMessage.room_id == room_id))).all()
+    assert len(rows) == 1
+    assert rows[0].sender == "owner"
+    assert rows[0].text == "Let's work through the migration plan together."
+
+    # The room is genuinely open now -- an agent may post (would 403 with
+    # room_not_opened otherwise, see the next test).
+    machine_headers = await _machine_headers(db_session)
+    agent_resp = await client.post(
+        f"/v1/rooms/{room_id}/messages",
+        json={"sender": "alpha", "text": "starting now", "kind": "message"},
+        headers=machine_headers,
+    )
+    assert agent_resp.status_code == 200, agent_resp.json()
+
+
+async def test_create_room_form_without_opening_message_leaves_room_gated(client, db_session):
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={"name": "not-opened", "agent_a": "alpha", "agent_b": "beta", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+
+    room = await db_session.get(Room, room_id)
+    assert room.opened_at is None
+
+    machine_headers = await _machine_headers(db_session)
+    agent_resp = await client.post(
+        f"/v1/rooms/{room_id}/messages",
+        json={"sender": "alpha", "text": "starting now", "kind": "message"},
+        headers=machine_headers,
+    )
+    assert agent_resp.status_code == 403
+    assert agent_resp.json()["error"]["code"] == "room_not_opened"
+
+
+async def test_create_room_form_blank_opening_message_leaves_room_gated(client, db_session):
+    """Whitespace-only is treated as blank -- same 'leave it alone' posture
+    every other optional field on this form already has.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "blank-opening",
+            "agent_a": "alpha",
+            "agent_b": "beta",
+            "opening_message": "   \n  ",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    room_id = resp.headers["location"].rsplit("/", 1)[-1]
+    room = await db_session.get(Room, room_id)
+    assert room.opened_at is None
+
+
+async def test_create_room_form_opening_message_post_failure_shows_warning_room_still_created_and_gated(
+    client, db_session
+):
+    """ADR-0019 decision 6: create-then-post, best-effort, never atomic. A
+    too-large opening message fails post_message's own MAX_TEXT_BYTES check
+    -- the room must still exist (not half-created, not rolled back), stay
+    gated exactly as if no opening message had been given, and the owner
+    must land on the real room page with a clear, visible explanation, never
+    a bare error page and never a silent drop.
+    """
+    from app.rooms import MAX_TEXT_BYTES
+
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    too_large = "x" * (MAX_TEXT_BYTES + 1)
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "oversized-opening",
+            "agent_a": "alpha",
+            "agent_b": "beta",
+            "opening_message": too_large,
+            "csrf_token": csrf,
+        },
+    )
+    assert resp.status_code == 422
+    assert "oversized-opening" in resp.text  # the real room page rendered, not a bare error page
+    assert "could not be posted" in resp.text
+    assert "exceeding the" in resp.text  # message_text_too_large's own detail, surfaced verbatim
+
+    rows = (await db_session.execute(Room.__table__.select().where(Room.name == "oversized-opening"))).all()
+    assert len(rows) == 1  # the room WAS created -- create-then-post, not atomic (decision 6)
+    assert rows[0].opened_at is None  # the failed post never opened it
+
+    msg_rows = (
+        await db_session.execute(RoomMessage.__table__.select().where(RoomMessage.room_id == rows[0].id))
+    ).all()
+    assert len(msg_rows) == 0  # the failed post inserted nothing
+
+
+async def test_create_room_form_error_rerender_preserves_opening_message(client, db_session):
+    """create_room_op's own validation failure (duplicate members) must
+    re-render the form with the opening_message the owner already typed
+    still in the textarea -- same round-trip discipline every other field
+    on this form already has.
+    """
+    await _login(client, db_session)
+    page = await client.get("/ui/rooms")
+    csrf = _extract_csrf(page.text)
+
+    resp = await client.post(
+        "/ui/rooms",
+        data={
+            "name": "dupe-with-opening",
+            "agent_a": "same",
+            "agent_b": "same",
+            "opening_message": "do not lose this text",
+            "csrf_token": csrf,
+        },
+    )
+    assert resp.status_code == 422
+    assert "do not lose this text" in resp.text
+
+
+async def test_room_setup_paste_box_includes_opening_message_target(client, db_session):
+    """The opening_message textarea must exist on the page with the exact id
+    the client-side parser (app/static/room_setup_paste.js) targets."""
+    await _login(client, db_session)
+    resp = await client.get("/ui/rooms")
+    assert resp.status_code == 200
+    assert 'id="opening_message"' in resp.text
+    assert 'name="opening_message"' in resp.text
+
+
 # --- create room form: modes, sides, time limits (ADR-0007, Part 2 UI) ---
 
 
