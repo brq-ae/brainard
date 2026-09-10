@@ -81,6 +81,7 @@ async def create_room_endpoint(
         consensus_floor=body.consensus_floor,
         project=body.project,
         seat_machines=body.seats,
+        stall_notify_secs=body.stall_notify_secs,
     )
     members = await get_members(db, room.id)
     sides = await get_member_sides(db, room.id)
@@ -99,6 +100,7 @@ async def create_room_endpoint(
         consensus_floor=room.consensus_floor,
         project=room.project,
         seats=seats,
+        stall_notify_secs=room.stall_notify_secs,
     )
 
 
@@ -134,6 +136,7 @@ async def list_rooms_endpoint(
                 group=r.group_name,
                 consensus_floor=r.consensus_floor,
                 project=r.project,
+                stall_notify_secs=r.stall_notify_secs,
             )
             for r in rows
         ],
@@ -196,6 +199,7 @@ async def get_room_endpoint(
         consensus_floor=room.consensus_floor,
         project=room.project,
         seats=seats,
+        stall_notify_secs=room.stall_notify_secs,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
     )
 
@@ -331,11 +335,23 @@ async def poll_room_messages_endpoint(
     room_id: str,
     since: int = Query(default=0, ge=0),
     wait: int = Query(default=0, ge=0),
-    _principal: Principal = Depends(require_machine_or_owner),
+    # ADR-0020 decision 2: optional, additive -- omitted (an observer,
+    # ADR-0008, or an old client) behaves exactly as before. Bounded the
+    # same shape as `RoomPostMessageRequest.sender` (255 chars): this is a
+    # client-supplied, untrusted string that -- via ADR-0020's "free win" --
+    # can now reach the same owner-facing ntfy push `sender` already does
+    # (app/notify.py's `notify_owner_open_pending`), so it is capped at the
+    # API boundary before it ever reaches that path, same reasoning as
+    # `sender`'s own cap.
+    agent_name: str | None = Query(default=None, min_length=1, max_length=255),
+    principal: Principal = Depends(require_machine_or_owner),
 ) -> RoomMessagesPollResponse:
-    room, messages, open_gate_notice = await poll_messages_op(room_id, since, wait)
+    room, messages, open_gate_notice, partner_working = await poll_messages_op(
+        room_id, since, wait, agent_name=agent_name, principal=principal
+    )
     return RoomMessagesPollResponse(
         room_status=room.status,
         messages=[RoomMessageOut.model_validate(m) for m in messages],
         open_gate_notice=open_gate_notice,
+        partner_working=partner_working,
     )

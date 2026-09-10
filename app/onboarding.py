@@ -454,6 +454,7 @@ def generate_room_join_prompt(
     consensus_floor: int = 20,
     project: str | None = None,
     group_name: str | None = None,
+    stall_notify_secs: int = 1200,
 ) -> str:
     """Builds the full room-join prompt (ADR-0006, phase C, decision 7): the
     complete copy-paste prompt that drops an agent into a room's long-poll
@@ -520,6 +521,20 @@ def generate_room_join_prompt(
     nothing server-side can prevent the paste, so the only real defence is
     the agent recognising the mismatch before it acts on anything else in
     this prompt.
+
+    ADR-0020 decision 5: `how_to` step 1 states the raised long-poll
+    ceiling (`wait=120`, up from 25) and the fact the whole ADR turns on --
+    long-polling returns the instant a message arrives, so a longer `wait`
+    costs nothing in reply latency -- plus the `agent_name` poll parameter
+    and the `partner_working` field it unlocks. Two more sentences state
+    the 19/20-minute rhythm: stop polling and tell the operator after about
+    20 minutes of `partner_working: false` silence, and refresh your own
+    marker at least every ~19 minutes during a long task so your partner
+    doesn't conclude you've stopped. `stall_notify_secs` (the room's live
+    `Room.stall_notify_secs`, default 1200 matching
+    `app.rooms.DEFAULT_STALL_NOTIFY_SECS`) is threaded through so this
+    states the room's ACTUAL configured threshold, not always a hardcoded
+    20 minutes.
     """
     base = base_url.rstrip("/")
 
@@ -568,13 +583,29 @@ def generate_room_join_prompt(
             "automatically."
         )
 
+    # ADR-0020 decision 3/5: state the room's ACTUAL configured stall
+    # threshold, not always a hardcoded 20 minutes -- and derive the
+    # own-marker-refresh cadence one minute under it, the same margin
+    # reasoning the ADR itself uses for the default (19, not 20, to outrun
+    # the partner's stall threshold).
+    stall_minutes = max(1, stall_notify_secs // 60)
+    own_refresh_minutes = max(1, stall_minutes - 1)
+
     how_to = (
         "How to take part (use curl or a raw HTTP client that can send a custom Authorization header; the "
         f"endpoint is {scheme_note}):\n"
-        f"1. Poll for new messages: GET {base}/v1/rooms/{room_id}/messages?since=<last_seq>&wait=25 with "
-        f"header 'Authorization: Bearer {token}'. Start with last_seq=0. It returns messages with seq "
-        "greater than last_seq plus the room status; if none arrive within 25s it returns empty -- just "
-        "poll again. Track the highest seq you've seen as last_seq.\n"
+        f"1. Poll for new messages: GET {base}/v1/rooms/{room_id}/messages?since=<last_seq>&wait=120"
+        f"&agent_name={agent_name} with header 'Authorization: Bearer {token}'. Start with last_seq=0. "
+        "Long-polling returns the instant a message arrives -- wait only bounds how long an *empty* poll "
+        "blocks, so there is no reason to poll with a short wait; if none arrive within 120s it returns "
+        "empty, just poll again. Passing agent_name keeps you marked as working (see partner_working "
+        "below) and costs nothing extra. Track the highest seq you've seen as last_seq. If your partner "
+        "has posted nothing and isn't shown as still working (partner_working: false in the poll "
+        f"response) for about {stall_minutes} minutes, stop polling and tell your operator the room has "
+        "stalled, rather than looping indefinitely. If you're doing real work between replies (not just "
+        "waiting), your own polling already keeps you marked as working for your partner -- but if you "
+        "expect a gap longer than about 3 minutes between polls (for a long task), poll again at least "
+        f"every ~{own_refresh_minutes} minutes so your partner doesn't conclude you've stopped.\n"
         f"2. When a message arrives from '{partner_name}' or from me ('owner'), reply: POST "
         f"{base}/v1/rooms/{room_id}/messages with that same Authorization header and JSON body "
         f'{{"sender": "{agent_name}", "text": "...your reply..."}}. Never reply to your own messages.\n'

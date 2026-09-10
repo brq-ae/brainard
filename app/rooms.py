@@ -26,7 +26,7 @@ from app.auth import Principal
 from app.db import AsyncSessionLocal
 from app.errors import ApiError
 from app.models import Machine, Room, RoomAttachment, RoomMember, RoomMessage
-from app.notify import notify_owner_open_pending, notify_room_closed
+from app.notify import notify_owner_open_pending, notify_room_closed, notify_room_stalled
 from app.room_modes import DEFAULT_MODE, ROOM_MODES, role_text_for, validate_mode
 from app.room_seats import check_and_bind_seat
 
@@ -70,6 +70,20 @@ MAX_GROUP_LENGTH = 100
 # registered project name, even though it is never required to already be
 # one (see that decision for why this is free text, not an FK).
 MAX_PROJECT_LENGTH = 255
+
+# ADR-0020 decision 3: how long (seconds) a room may sit with no new
+# message AND no member showing a live working lease before the server
+# pings the owner (`Room.stall_notify_secs`). Same bounds-checked,
+# owner-settable-per-room shape as `consensus_floor` just above. Min is a
+# sane floor above `WORKING_LEASE_SECS` (below) so the threshold can never
+# be shorter than one lease window (which would make the check meaningless
+# -- a member's lease could look expired between two of its own, perfectly
+# healthy polls); max is a generous week, since "how long is quiet before
+# it's worth a ping" is a judgment call this ADR deliberately leaves to the
+# owner, not a mechanical limit like `MAX_WAIT_SECS` below.
+STALL_NOTIFY_SECS_MIN = 300
+STALL_NOTIFY_SECS_MAX = 7 * 24 * 3600
+DEFAULT_STALL_NOTIFY_SECS = 1200
 
 _RECOVERY_ROOM_MEMBERS = "resend `members` as exactly two distinct non-empty agent-name strings"
 
@@ -131,6 +145,30 @@ def _validate_consensus_floor(consensus_floor: int | None) -> int:
             f"({DEFAULT_CONSENSUS_FLOOR}).",
         )
     return consensus_floor
+
+
+def _validate_stall_notify_secs(stall_notify_secs: int | None) -> int:
+    """ADR-0020 decision 3: same shape as `_validate_consensus_floor` just
+    above -- an out-of-range or non-int value is rejected with a
+    self-explaining ApiError, not clamped or silently substituted. `None`
+    (omitted) resolves to `DEFAULT_STALL_NOTIFY_SECS`. Accepted and stored
+    for every room regardless of mode -- the stall check (app/rooms.py's
+    `poll_messages`/`_maybe_ping_owner_stalled_room`) applies uniformly,
+    unlike `consensus_floor`'s debate/critique-only gate.
+    """
+    if stall_notify_secs is None:
+        return DEFAULT_STALL_NOTIFY_SECS
+    if not isinstance(stall_notify_secs, int) or isinstance(stall_notify_secs, bool) or not (
+        STALL_NOTIFY_SECS_MIN <= stall_notify_secs <= STALL_NOTIFY_SECS_MAX
+    ):
+        raise ApiError(
+            422,
+            "invalid_stall_notify_secs",
+            f"`stall_notify_secs` must be an integer between {STALL_NOTIFY_SECS_MIN} and {STALL_NOTIFY_SECS_MAX}, "
+            f"got {stall_notify_secs!r}. Recovery: resend within range, or omit it to use the default "
+            f"({DEFAULT_STALL_NOTIFY_SECS}).",
+        )
+    return stall_notify_secs
 
 
 def _validate_topic(mode: str, topic: str | None) -> str | None:
@@ -354,6 +392,7 @@ async def create_room(
     consensus_floor: int | None = None,
     project: str | None = None,
     seat_machines: dict[str, str] | None = None,
+    stall_notify_secs: int | None = None,
 ) -> Room:
     """ADR-0007 extends room creation with an optional mode+topic (shapes
     the join prompt's injected role text, app/onboarding.py) and an
@@ -410,6 +449,13 @@ async def create_room(
     entry (or when `seat_machines` is omitted/empty) is left unassigned --
     identical to every room created before this ADR: the seat binds to
     whichever machine token posts as that member first.
+
+    ADR-0020 decision 3: `stall_notify_secs` (default
+    `DEFAULT_STALL_NOTIFY_SECS`, bounds-checked by
+    `_validate_stall_notify_secs` the same shape as `consensus_floor`) is
+    accepted and stored for every room regardless of mode -- how long the
+    room may sit quiet before the server's own stall backstop pings the
+    owner (`poll_messages`/`_maybe_ping_owner_stalled_room` below).
     """
     if not name or not name.strip():
         raise ApiError(422, "invalid_room_name", "`name` must be non-empty. Recovery: resend with a non-empty name.")
@@ -421,6 +467,7 @@ async def create_room(
     cleaned_group = _validate_group(group)
     cleaned_project = _validate_project(project)
     resolved_consensus_floor = _validate_consensus_floor(consensus_floor)
+    resolved_stall_notify_secs = _validate_stall_notify_secs(stall_notify_secs)
     resolved_seats = await _validate_seat_assignments(db, cleaned_members, seat_machines)
     if mode in _CONSENSUS_GATED_MODES and resolved_consensus_floor >= resolved_max:
         raise ApiError(
@@ -469,6 +516,8 @@ async def create_room(
         consensus_floor=resolved_consensus_floor,
         # ADR-0018 decision 12: optional, free-form project label.
         project=cleaned_project,
+        # ADR-0020 decision 3: stored for every room regardless of mode.
+        stall_notify_secs=resolved_stall_notify_secs,
     )
     db.add(room)
     await db.flush()  # room.id must exist before the member rows FK to it
@@ -1968,20 +2017,174 @@ async def post_attachment_removed_message(
 # --- GET /v1/rooms/{id}/messages -- the long-poll ---
 
 POLL_INTERVAL_SECS = 1
-MAX_WAIT_SECS = 30
+# ADR-0020 decision 1: raised from 30 to 120. Verified against what a
+# 120-second-open request actually costs: NOT a DB connection/session --
+# `poll_messages` takes no `db: AsyncSession` and each iteration below
+# opens, queries, and closes its own short-lived `AsyncSessionLocal()`
+# before the `asyncio.sleep` even runs (see that function's own "CRITICAL"
+# docstring paragraph), so raising the ceiling only increases how many
+# times, in the worst case, that already-released-every-second pattern
+# repeats -- never how long any single iteration pins a connection. What
+# IS held longer is one open HTTP request/handler coroutine per polling
+# agent, for up to 120s instead of up to 30s -- acceptable at the owner's
+# actual scale (two agents per room, a handful of rooms open at once), not
+# yet worth a config knob (see the ADR's decision 1 for the full
+# reasoning and the "revisit if concurrency grows" note).
+MAX_WAIT_SECS = 120
+# ADR-0020 decision 2: a member's "working" lease window -- set to
+# slightly longer than MAX_WAIT_SECS so a member polling in a steady loop
+# at the new default wait never has its own marker lapse in the gap
+# between one poll returning and the next one landing, even accounting for
+# normal request/processing latency.
+WORKING_LEASE_SECS = 180
 
 
-async def _room_and_messages_since(room_id: str, since: int) -> tuple[Room | None, list[RoomMessage]]:
+def _member_is_working(member: RoomMember, now: datetime) -> bool:
+    """ADR-0020 decision 2: a member is "working" exactly when its
+    `working_until` lease hasn't expired -- no separate sweep/TTL job
+    needed, the same the-value-itself-expires shape `Room.expires_at`
+    already uses, just per-member.
+    """
+    return member.working_until is not None and member.working_until > now
+
+
+def _last_activity_at(last_message_at: datetime | None, members: list[RoomMember]) -> datetime | None:
+    """The later of the room's most recent message and a BOUND member's
+    most recent poll -- shared by `_room_and_messages_since`'s unlocked
+    precheck and `_maybe_ping_owner_stalled_room`'s locked re-check, so the
+    two can never drift apart on what counts as "activity."
+
+    INDEPENDENT-REVIEW FIX (ADR-0020 Consequences): only a seat with
+    `bound_machine_id IS NOT NULL` may contribute its `working_until` here.
+    An UNBOUND seat's marker can be refreshed by ANY machine token that
+    names it in `agent_name` (`_maybe_refresh_working_marker` -- there is
+    no narrower credential to check yet, since no machine has claimed that
+    seat). Any machine token can already read any room (ADR-0008), so
+    discovering a room's id and member names costs an unrelated or buggy
+    agent nothing; if an unbound seat's marker counted here, that same
+    token could poll forever naming the open seat and hold off the stall
+    alarm indefinitely for a room that has, in fact, gone silent -- exactly
+    the safety net this check exists to provide when a client's own
+    client-side stop never fires. A BOUND seat has no such hole: only that
+    seat's own bound machine can ever refresh its marker
+    (`app/models.py`'s `working_until` column comment), so a bound seat's
+    live lease is trustworthy evidence that someone with a real claim on
+    this room is still around. An unbound seat's marker is still read
+    elsewhere for the purely cosmetic `partner_working` display -- being
+    briefly, harmlessly wrong about "is my partner thinking" is a
+    different, much lower stake than silencing the owner's one safety net.
+    """
+    candidates = [t for t in (last_message_at,) if t is not None]
+    candidates.extend(
+        m.working_until - timedelta(seconds=WORKING_LEASE_SECS)
+        for m in members
+        if m.working_until is not None and m.bound_machine_id is not None
+    )
+    return max(candidates) if candidates else None
+
+
+async def _maybe_refresh_working_marker(room_id: str, agent_name: str | None, principal: Principal | None) -> None:
+    """ADR-0020 decision 2: a poll call that supplies `agent_name` refreshes
+    THAT member's own `working_until` lease, as a side effect, once per
+    poll call (not once per internal 1-second iteration `poll_messages`
+    loops through below) -- own short-lived session, same "opens fresh,
+    does its one query/write, closes" shape `_room_and_messages_since`
+    uses.
+
+    SECURITY (independent review discipline, same posture as
+    `app/room_seats.py`'s `check_and_bind_seat`, which this mirrors):
+    keyed on the AUTHENTICATED `principal`, never on the bare `agent_name`
+    string alone -- an agent may only mark ITSELF. No-ops entirely when
+    `principal` is missing or not a machine principal (an owner-token poll
+    keying `agent_name` isn't a real agent identity to mark, same
+    `principal.kind != "machine"` no-op `check_and_bind_seat` already
+    uses), and when `agent_name` names no real member of this room.
+    Refreshes an "unbound-or-matching" seat (ADR-0020 decision 2's own
+    wording): a still-open (NULL `bound_machine_id`) seat may be refreshed
+    by whichever machine names it (identical to that seat's write-side
+    claim-on-first-write posture, ADR-0018 decision 3 -- there is no
+    narrower credential to check yet, since no machine has claimed it).
+    Once a seat IS bound (assigned or claimed), only that seat's own bound
+    machine may refresh it -- a DIFFERENT machine naming that `agent_name`
+    is a silent no-op, never an error: a poll is a read, and must not
+    become a covert error oracle for probing other members' identities.
+
+    Deliberately does NOT itself write `bound_machine_id` -- ADR-0018
+    decision 7 ("reads stay open -- binding applies to writes only") is
+    unchanged by this ADR: only `post_message`/`add_room_attachment`
+    (via `check_and_bind_seat`) ever claim a seat.
+
+    KEPT deliberately, on independent review, even though an unbound seat's
+    marker can be set by any machine naming it: `_last_activity_at` (below)
+    excludes every unbound seat's marker from the stall-alarm computation,
+    so the worst this refresh can do for an unbound seat is a briefly wrong
+    cosmetic `partner_working` for the legitimate partner -- never a
+    suppressed stall notification. Removing it entirely would also be
+    honest, but would make `partner_working` needlessly blind for the
+    common, harmless case of two cooperating agents polling before either
+    has posted yet (i.e. before `check_and_bind_seat` has bound either
+    seat) -- keeping it preserves that signal at a cost this ADR's other
+    fix has already made safe to pay.
+    """
+    if agent_name is None or principal is None or principal.kind != "machine":
+        return
+    async with AsyncSessionLocal() as session:
+        member = await session.scalar(
+            select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.agent_name == agent_name)
+        )
+        if member is None:
+            return
+        if member.bound_machine_id is not None and member.bound_machine_id != principal.machine.id:
+            return
+        member.working_until = datetime.now(UTC) + timedelta(seconds=WORKING_LEASE_SECS)
+        await session.commit()
+
+
+async def _room_and_messages_since(
+    room_id: str, since: int, agent_name: str | None
+) -> tuple[Room | None, list[RoomMessage], bool, datetime | None, bool]:
     """One poll-iteration check, on its own short-lived session that the
     `async with` below closes (returning its pooled connection) before this
     call even returns -- well before the caller's next `asyncio.sleep`. See
     `poll_messages` docstring for why this must never be the request-scoped
     `get_db` session.
+
+    ADR-0020: also computes, in this SAME session (no extra round trips
+    beyond what this iteration already pays for), two more read-only facts
+    every iteration needs:
+
+    - `partner_working` (decision 2): true when the OTHER member's
+      `working_until` lease is currently live -- never the caller's own.
+      When `agent_name` doesn't identify a real member of this room (an
+      observer, ADR-0008, or an old/unrecognised client), "the other
+      member" has no distinguished meaning, so this degrades to "is ANY
+      member currently working" -- the closest honest answer available
+      without a caller identity to exclude.
+    - `last_activity_at` (decision 3): the later of the room's own most
+      recent message and a BOUND member's most recent poll -- the input
+      `poll_messages`'s stall precheck needs. A member's most recent poll
+      is reconstructed EXACTLY (not just a proxy) as
+      `working_until - WORKING_LEASE_SECS`, since that is precisely the
+      value `_maybe_refresh_working_marker` set it to; no separate
+      `last_polled_at` column exists or is needed (see the ADR's
+      Consequences, which leaves this exact implementation choice open).
+      None when neither a message nor any bound member's poll has ever
+      happened. UNBOUND seats are deliberately excluded here -- see
+      `_last_activity_at`'s own docstring for why (an independent-review
+      fix: an unbound seat's marker is settable by any machine naming it,
+      so it must never hold off the stall alarm).
+    - `agent_name_is_member` (the ADR's "free win"): true exactly when
+      `agent_name` names a real member of this room -- lets
+      `poll_messages`'s not-yet-opened branch attribute ADR-0014's park
+      ping to a genuine member (closing that ADR's Consequences gap)
+      without ever naming an arbitrary, unverified caller-supplied string,
+      the same "only ping/name a genuine member" discipline
+      `post_message`'s own not-opened check already applies.
     """
     async with AsyncSessionLocal() as session:
         room = await session.get(Room, room_id)
         if room is None:
-            return None, []
+            return None, [], False, None, False
         rows = (
             await session.scalars(
                 select(RoomMessage)
@@ -1989,7 +2192,79 @@ async def _room_and_messages_since(room_id: str, since: int) -> tuple[Room | Non
                 .order_by(RoomMessage.seq)
             )
         ).all()
-        return room, list(rows)
+        messages = list(rows)
+
+        members = (await session.scalars(select(RoomMember).where(RoomMember.room_id == room_id))).all()
+        now = datetime.now(UTC)
+        others = [m for m in members if m.agent_name != agent_name] if agent_name is not None else members
+        partner_working = any(_member_is_working(m, now) for m in others)
+
+        last_message_at = await session.scalar(
+            select(func.max(RoomMessage.created_at)).where(RoomMessage.room_id == room_id)
+        )
+        last_activity_at = _last_activity_at(last_message_at, members)
+        agent_name_is_member = agent_name is not None and any(m.agent_name == agent_name for m in members)
+
+        return room, messages, partner_working, last_activity_at, agent_name_is_member
+
+
+async def _maybe_ping_owner_stalled_room(room_id: str) -> None:
+    """ADR-0020 decision 3: best-effort, one-shot owner ntfy ping when a
+    room has gone silent -- no new message, no BOUND member with a live
+    working lease (an unbound seat's marker doesn't count -- see
+    `_last_activity_at`) -- for longer than `room.stall_notify_secs`. Mirrors
+    `_maybe_ping_owner_room_not_opened`'s exact pattern: own short-lived
+    session, `SELECT ... FOR UPDATE` row lock, re-check the FULL stall
+    condition again under the lock (the caller's own unlocked precheck in
+    `poll_messages`'s loop may already be stale by the time this runs),
+    check-and-set the one-shot guard before the best-effort send, never
+    raises.
+
+    Deliberately its OWN guard column, `Room.stall_notify_sent_at` -- NOT
+    `owner_open_reminder_sent_at` (ADR-0014 decision 8's park-notification
+    guard). Reusing that column would either block this ping forever on a
+    room that already sent an unrelated open-pending reminder, or block a
+    FUTURE open-pending reminder because this ping fired first -- see the
+    ADR's decision 3 for the full reasoning. The two are mutually
+    exclusive in practice, not just in schema: the park path only fires
+    while `opened_at is None` (room never started); this path only fires
+    once `opened_at is not None` (room has real activity to have gone
+    quiet FROM) -- a room is never eligible for both pings at once.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            locked_room = await session.scalar(
+                select(Room).where(Room.id == room_id).with_for_update().execution_options(populate_existing=True)
+            )
+            if (
+                locked_room is None
+                or locked_room.status != "open"
+                or locked_room.opened_at is None
+                or locked_room.stall_notify_sent_at is not None
+            ):
+                return
+            last_message_at = await session.scalar(
+                select(func.max(RoomMessage.created_at)).where(RoomMessage.room_id == room_id)
+            )
+            members = (await session.scalars(select(RoomMember).where(RoomMember.room_id == room_id))).all()
+            # Same bound-seats-only rule as `_room_and_messages_since`'s
+            # unlocked precheck -- see `_last_activity_at`'s docstring.
+            last_activity_at = _last_activity_at(last_message_at, list(members))
+            if last_activity_at is None:
+                return
+            elapsed = (datetime.now(UTC) - last_activity_at).total_seconds()
+            if elapsed < locked_room.stall_notify_secs:
+                return
+            locked_room.stall_notify_sent_at = datetime.now(UTC)
+            await session.commit()
+            # Best-effort itself; never raises -- see app/notify.py's module
+            # docstring.
+            await notify_room_stalled(session, locked_room)
+    except Exception:
+        logger.exception(
+            "best-effort stall notification failed for room %s -- request still handled normally",
+            room_id,
+        )
 
 
 # ADR-0014 decision 3: the poll-side twin of `_ROOM_NOT_OPENED_DIRECTIVE`
@@ -2015,20 +2290,53 @@ def _room_gone_detail(room_id: str) -> str:
     )
 
 
-async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list[RoomMessage], str | None]:
+async def poll_messages(
+    room_id: str,
+    since: int,
+    wait: int,
+    *,
+    agent_name: str | None = None,
+    principal: Principal | None = None,
+) -> tuple[Room, list[RoomMessage], str | None, bool]:
     """Long-poll for messages with seq > `since`. Returns as soon as any
     exist, OR the room is no longer open, OR `wait` seconds have elapsed
-    (capped at MAX_WAIT_SECS), OR (ADR-0014 decision 3) the room requires
+    (capped at MAX_WAIT_SECS -- 120, ADR-0020 decision 1: `wait` is a
+    CEILING, not a delay -- a message arriving at second 1 of a 120-second
+    wait returns at second 1, not second 120; only an empty poll ever
+    blocks for the full `wait`), OR (ADR-0014 decision 3) the room requires
     the owner to open it and hasn't yet -- whichever comes first. The last
     case is checked first and short-circuits even the FIRST iteration: it
     never enters `asyncio.sleep` below, unlike the other three, which is the
     whole point (decision 3: a room nobody has started yet must not be what
-    burns an agent's session in 30-second waits). Returns a third element,
+    burns an agent's session in long waits). Returns a third element,
     `open_gate_notice` -- the same stop directive `post_message`'s 403
     backstop carries (`_ROOM_NOT_OPENED_DIRECTIVE` above), non-None exactly
     when that early return is why this call returned, None in every other
     case (including once the room later opens: normal long-polling resumes
     unchanged, per the ADR).
+
+    ADR-0020 decision 2: `agent_name` (optional, additive -- an observer,
+    ADR-0008, or an old client that omits it behaves exactly as before) is
+    this member's OWN claimed identity, used for two things: (a) a side
+    effect, once per call and BEFORE the wait loop below, refreshing that
+    member's own `working_until` lease (`_maybe_refresh_working_marker`,
+    which enforces "an agent may only mark itself" -- see its own
+    docstring); (b) computed fresh every iteration alongside the messages
+    query, a fourth return element, `partner_working` -- true when the
+    OTHER member currently has a live lease, per `_room_and_messages_since`.
+
+    ADR-0020 decision 3: also checked every iteration (cheap: an unlocked
+    precheck using data this iteration already fetched, only escalating to
+    `_maybe_ping_owner_stalled_room`'s own locked session on the rare
+    "looks stalled" case) -- a room that has had no new message and no live
+    BOUND member lease (`_last_activity_at`) for longer than
+    `room.stall_notify_secs` fires a best-effort, one-shot owner ping. This
+    does NOT stop the poll itself
+    (the server has no lever to force a client's read loop to stop, per
+    the ADR's decision 3/Alternatives Considered); it only makes a stalled
+    room discoverable even if the polling agent's own client-side stop
+    (briefed in the join prompt) never fires or the session has already
+    gone away.
 
     CRITICAL: this function takes no `db: AsyncSession` -- there is no
     request-scoped session held across the `asyncio.sleep` calls below. Each
@@ -2041,8 +2349,12 @@ async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list
     wait = max(0, min(wait, MAX_WAIT_SECS))
     deadline = time.monotonic() + wait
 
+    await _maybe_refresh_working_marker(room_id, agent_name, principal)
+
     while True:
-        room, messages = await _room_and_messages_since(room_id, since)
+        room, messages, partner_working, last_activity_at, agent_name_is_member = await _room_and_messages_since(
+            room_id, since, agent_name
+        )
         if room is None:
             # ADR-0014 decision 10: a clear stop, not a bare "not found" a
             # mechanically-retrying agent might treat as transient.
@@ -2051,13 +2363,31 @@ async def poll_messages(room_id: str, since: int, wait: int) -> tuple[Room, list
         not_opened = room.status == "open" and room.requires_owner_open and room.opened_at is None
         if not_opened:
             # Best-effort, one-shot (own row lock inside) -- never raises.
-            # `agent_name=None`: a read carries no sender (see docstring's
-            # "honest limitation" note and app/notify.py's own docstring).
-            await _maybe_ping_owner_room_not_opened(room, agent_name=None)
-            return room, messages, _POLL_NOT_OPENED_NOTICE
+            # ADR-0020's "free win" (closes ADR-0014 Consequences gap (b)):
+            # now that a poll can carry `agent_name`, name the waiting
+            # agent when it's a genuine member -- same "only attribute to a
+            # verified member" discipline `post_message`'s own not-opened
+            # check already applies; an unrecognised/absent name still
+            # degrades to the honest "An agent" fallback
+            # (`notify_owner_open_pending`), exactly as before this ADR.
+            await _maybe_ping_owner_room_not_opened(
+                room, agent_name=agent_name if agent_name_is_member else None
+            )
+            return room, messages, _POLL_NOT_OPENED_NOTICE, partner_working
+
+        # ADR-0020 decision 3: stall backstop. Unlocked precheck using data
+        # this iteration already fetched -- only a room that looks stalled
+        # RIGHT NOW pays for the extra locked session/re-verify below.
+        if (
+            room.opened_at is not None
+            and room.stall_notify_sent_at is None
+            and last_activity_at is not None
+            and (datetime.now(UTC) - last_activity_at).total_seconds() >= room.stall_notify_secs
+        ):
+            await _maybe_ping_owner_stalled_room(room.id)
 
         if messages or room.status != "open" or time.monotonic() >= deadline:
-            return room, messages, None
+            return room, messages, None, partner_working
         await asyncio.sleep(POLL_INTERVAL_SECS)
 
 

@@ -57,6 +57,7 @@ async def _create_room(
     expires_at=None,
     group=None,
     consensus_floor=None,
+    stall_notify_secs=None,
     expect_status=201,
 ) -> dict:
     body: dict = {"name": name, "members": members if members is not None else ["agent-a", "agent-b"]}
@@ -76,6 +77,8 @@ async def _create_room(
         body["group"] = group
     if consensus_floor is not None:
         body["consensus_floor"] = consensus_floor
+    if stall_notify_secs is not None:
+        body["stall_notify_secs"] = stall_notify_secs
     resp = await client.post("/v1/rooms", json=body, headers=owner_headers)
     assert resp.status_code == expect_status, resp.json()
     return resp.json()
@@ -93,6 +96,32 @@ async def _open_room(client, owner_headers, room_id: str, *, text="starting now"
     )
     assert resp.status_code == 200, resp.json()
     return resp.json()
+
+
+async def _bind_both_seats(client, owner_headers, db_session, *, agent_a="agent-a", agent_b="agent-b") -> tuple:
+    """ADR-0020's working-marker security tests need two DISTINCT,
+    already-bound seats (not just two member names) -- creates and opens a
+    room, then has each of two DISTINCT machine tokens claim its own seat
+    via an ordinary post (claim-on-first-write, ADR-0018 decision 3). This
+    is what makes `check_and_bind_seat`/`_maybe_refresh_working_marker`'s
+    "only this seat's own machine" check meaningful to test at all: an
+    unbound seat has no "other machine" to wrongly refresh it.
+
+    Returns (room, agent_a_machine_headers, agent_b_machine_headers).
+    """
+    room = await _create_room(client, owner_headers, members=[agent_a, agent_b])
+    await _open_room(client, owner_headers, room["id"])
+    machine_a_headers = await _machine_headers(db_session, name=f"{agent_a}-machine")
+    machine_b_headers = await _machine_headers(db_session, name=f"{agent_b}-machine")
+    resp_a = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": agent_a, "text": "hi"}, headers=machine_a_headers
+    )
+    assert resp_a.status_code == 200, resp_a.json()
+    resp_b = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": agent_b, "text": "hi"}, headers=machine_b_headers
+    )
+    assert resp_b.status_code == 200, resp_b.json()
+    return room, machine_a_headers, machine_b_headers
 
 
 async def _configure_notifications(client, owner_headers) -> None:
@@ -915,10 +944,43 @@ async def test_long_poll_returns_immediately_before_the_room_opens(client, db_se
     assert elapsed < 1  # must NOT have entered the sleep loop at all
 
 
-async def test_long_poll_wait_is_capped_at_30(client, db_session):
-    import app.rooms as rooms_module
+async def test_long_poll_wait_is_capped_at_120(client, db_session):
+    assert rooms_module.MAX_WAIT_SECS == 120
 
-    assert rooms_module.MAX_WAIT_SECS == 30
+
+async def test_long_poll_wait_request_above_max_is_clamped(client, db_session, monkeypatch):
+    """ADR-0020 decision 1: MAX_WAIT_SECS raised to 120 -- a caller asking
+    for far more (99999) must be silently clamped, not honored. Verified
+    BEHAVIORALLY (not just by asserting the constant, the test above
+    already does that): `wait = max(0, min(wait, MAX_WAIT_SECS))` reads
+    the module-level `MAX_WAIT_SECS` fresh on every call, so monkeypatching
+    it down to a small, real value and measuring REAL elapsed time proves
+    a too-large request is actually clamped to whatever that ceiling is --
+    without faking `time.monotonic` globally (which, tried first, turned
+    out to also perturb asyncpg/anyio's own internal use of the monotonic
+    clock and made the loop exit almost immediately for the wrong reason).
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    opened = await _open_room(client, owner_headers, room["id"])
+
+    monkeypatch.setattr(rooms_module, "MAX_WAIT_SECS", 2)
+
+    start = time.monotonic()
+    # since=opened["seq"]: skip past the owner's own opening message so
+    # this poll genuinely sees nothing new and has to run out its wait.
+    # Requesting 99999 -- if the clamp didn't apply, this would hang far
+    # longer than any reasonable test timeout.
+    room_row, messages, notice, partner_working = await rooms_module.poll_messages(room["id"], opened["seq"], 99999)
+    elapsed = time.monotonic() - start
+
+    assert messages == []
+    assert notice is None
+    assert room_row.status == "open"
+    # Genuinely bounded by the (patched) 2-second ceiling, not the 99999
+    # requested -- a generous upper bound that would still fail fast if the
+    # clamp silently stopped applying.
+    assert 2 <= elapsed < 10
 
 
 async def test_long_poll_returns_promptly_when_message_posted_during_wait(client, db_session):
@@ -4043,3 +4105,784 @@ async def test_close_as_agreed_gate_race_done_wins_against_pending_delete(client
         assert final_room.close_reason == "done"
         # 3 pre-race + the done (count 4) - the delete's decrement (count 3).
         assert final_room.message_count == 3
+
+
+# --- ADR-0020: 120s long-poll ceiling, the "working" marker, partner_working,
+# and the sustained-silence stall notification ---
+
+
+async def test_poll_with_agent_name_refreshes_own_working_marker(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room, machine_a_headers, _machine_b_headers = await _bind_both_seats(client, owner_headers, db_session)
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_a_headers,
+    )
+    assert resp.status_code == 200
+
+    async with AsyncSessionLocal() as session:
+        member = await session.scalar(
+            select(RoomMember).where(RoomMember.room_id == room["id"], RoomMember.agent_name == "agent-a")
+        )
+        assert member.working_until is not None
+        now = datetime.now(UTC)
+        assert member.working_until > now
+        assert member.working_until <= now + timedelta(seconds=rooms_module.WORKING_LEASE_SECS + 5)
+
+
+async def test_poll_with_agent_name_cannot_set_another_members_marker(client, db_session):
+    """SECURITY: an agent may only mark ITSELF as working -- the new
+    `agent_name` poll parameter must not become a way to set another
+    member's marker. Machine B (bound to agent-b's seat) polls claiming
+    `agent_name=agent-a` (a DIFFERENT, already-bound seat); agent-a's own
+    marker must stay untouched. ADR-0018's seat binding is what makes this
+    enforceable rather than merely a convention a client could ignore --
+    `_maybe_refresh_working_marker` checks the AUTHENTICATED `principal`
+    against `RoomMember.bound_machine_id`, never the bare claimed name.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room, _machine_a_headers, machine_b_headers = await _bind_both_seats(client, owner_headers, db_session)
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_b_headers,  # machine B, claiming to be agent-a
+    )
+    assert resp.status_code == 200  # a poll is a read -- silent no-op, never an error
+
+    async with AsyncSessionLocal() as session:
+        member_a = await session.scalar(
+            select(RoomMember).where(RoomMember.room_id == room["id"], RoomMember.agent_name == "agent-a")
+        )
+        assert member_a.working_until is None  # untouched: machine B is not agent-a's bound machine
+
+
+async def test_poll_with_agent_name_as_owner_principal_does_not_set_marker(client, db_session):
+    """`check_and_bind_seat`'s own posture (ADR-0018 decision 6) is
+    mirrored here: an owner-authenticated poll naming `agent_name` never
+    sets a marker, regardless of which name it claims -- keyed on
+    `principal.kind`, never on the `sender`/`agent_name` string.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=owner_headers,
+    )
+    assert resp.status_code == 200
+
+    async with AsyncSessionLocal() as session:
+        member = await session.scalar(
+            select(RoomMember).where(RoomMember.room_id == room["id"], RoomMember.agent_name == "agent-a")
+        )
+        assert member.working_until is None
+
+
+async def test_poll_with_agent_name_not_a_member_is_a_no_op(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "not-a-member-at-all"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 200
+    async with AsyncSessionLocal() as session:
+        members = (await session.scalars(select(RoomMember).where(RoomMember.room_id == room["id"]))).all()
+        assert all(m.working_until is None for m in members)
+
+
+async def test_poll_with_agent_name_on_unclaimed_seat_still_refreshes_it(client, db_session):
+    """The ADR's own "unbound-or-matching" wording (decision 2): a seat
+    nobody has posted as yet (`bound_machine_id IS NULL`) may still be
+    refreshed by whichever machine names it -- identical to that seat's
+    write-side claim-on-first-write posture (ADR-0018 decision 3). This is
+    NOT a hole in the "only mark yourself" rule above -- there is no
+    narrower credential to check yet, since no machine has claimed the
+    seat. Crucially, the poll itself must NOT claim the seat (ADR-0018
+    decision 7: reads stay open, binding applies to writes only) --
+    `bound_machine_id` stays NULL even though `working_until` is set.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])  # neither seat has been posted-as yet
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 200
+
+    async with AsyncSessionLocal() as session:
+        member = await session.scalar(
+            select(RoomMember).where(RoomMember.room_id == room["id"], RoomMember.agent_name == "agent-a")
+        )
+        assert member.working_until is not None
+        assert member.bound_machine_id is None  # poll never claims -- write-side binding is untouched
+
+
+async def test_poll_without_agent_name_observer_is_unaffected(client, db_session):
+    """ADR-0008: reads stay open. An observer (no `agent_name` at all)
+    polling a room with two already-bound seats must behave exactly as
+    before this ADR -- no marker touched for either member, and the
+    response still carries a well-formed (if degraded) `partner_working`.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room, _machine_a_headers, _machine_b_headers = await _bind_both_seats(client, owner_headers, db_session)
+    observer_headers = await _machine_headers(db_session, name="observer-machine")
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=observer_headers
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["partner_working"] is False  # neither member has ever had its marker refreshed
+
+    async with AsyncSessionLocal() as session:
+        members = (await session.scalars(select(RoomMember).where(RoomMember.room_id == room["id"]))).all()
+        assert all(m.working_until is None for m in members)
+
+
+async def test_partner_working_reflects_the_other_member_and_expires(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room, machine_a_headers, machine_b_headers = await _bind_both_seats(client, owner_headers, db_session)
+
+    # agent-a polls first, refreshing its OWN marker as a side effect.
+    # Neither member has polled with agent_name before this point (posting
+    # a message, which `_bind_both_seats` used to claim both seats, never
+    # sets a marker) -- so agent-a's own poll must NOT see itself reflected
+    # back: its partner (agent-b) isn't working yet.
+    resp_a = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_a_headers,
+    )
+    assert resp_a.status_code == 200
+    assert resp_a.json()["partner_working"] is False
+
+    # agent-b polls next -- ITS partner (agent-a) is now live (refreshed
+    # by resp_a above), so agent-b sees partner_working True.
+    resp_b = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-b"},
+        headers=machine_b_headers,
+    )
+    assert resp_b.json()["partner_working"] is True
+
+    # agent-a polls again -- NOW agent-b's own marker is live too (set by
+    # resp_b, as a side effect of agent-b's own poll above), so agent-a's
+    # partner (agent-b) reads as working.
+    resp_a2 = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_a_headers,
+    )
+    assert resp_a2.json()["partner_working"] is True
+
+    # Expire agent-a's lease directly (same "backdate a timestamp" pattern
+    # this file's sweeper-adjacent tests already use) -- agent-b's next
+    # poll must now see partner_working flip to false.
+    async with AsyncSessionLocal() as session:
+        member_a = await session.scalar(
+            select(RoomMember).where(RoomMember.room_id == room["id"], RoomMember.agent_name == "agent-a")
+        )
+        member_a.working_until = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    resp_b2 = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-b"},
+        headers=machine_b_headers,
+    )
+    assert resp_b2.json()["partner_working"] is False
+
+
+async def test_partner_working_degrades_to_any_member_for_an_observer(client, db_session):
+    """When `agent_name` doesn't identify a real member (an observer, or
+    an unrecognised name), "the other member" has no distinguished
+    meaning -- `partner_working` degrades to "is ANY member currently
+    working" per `_room_and_messages_since`'s own documented behavior.
+    """
+    owner_headers = await _owner_headers(db_session)
+    room, machine_a_headers, _machine_b_headers = await _bind_both_seats(client, owner_headers, db_session)
+    observer_headers = await _machine_headers(db_session, name="observer-machine")
+
+    resp_a = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_a_headers,
+    )
+    assert resp_a.status_code == 200
+
+    resp_observer = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=observer_headers
+    )
+    assert resp_observer.json()["partner_working"] is True  # agent-a is working; observer has no self to exclude
+
+
+# --- ADR-0020 decision 3: sustained-silence stall notification ---
+
+
+def _stall_room_kwargs(**overrides) -> dict:
+    return {"stall_notify_secs": rooms_module.STALL_NOTIFY_SECS_MIN, **overrides}
+
+
+async def _backdate_all_messages(db_session, room_id: str, when) -> None:
+    """The stall check reads `max(RoomMessage.created_at)` across the WHOLE
+    room -- backdating only the newest message would leave an earlier one
+    (e.g. the owner's own opening message) as the most recent real
+    timestamp, silently defeating the backdate. Every message in the room
+    gets set to `when`, matching this file's other "backdate a timestamp
+    directly" tests (see test_room_sweeper.py's `_backdate_expires_at`).
+    """
+    messages = (await db_session.scalars(select(RoomMessage).where(RoomMessage.room_id == room_id))).all()
+    for message in messages:
+        message.created_at = when
+    await db_session.commit()
+
+
+async def test_stall_ping_fires_once_after_sustained_silence(client, db_session, monkeypatch):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="stall-room", **_stall_room_kwargs())
+    await _open_room(client, owner_headers, room["id"])
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 200
+
+    await _backdate_all_messages(
+        db_session, room["id"], datetime.now(UTC) - timedelta(seconds=rooms_module.STALL_NOTIFY_SECS_MIN + 5)
+    )
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    for _ in range(3):
+        poll_resp = await client.get(
+            f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+        )
+        assert poll_resp.status_code == 200
+
+    assert len(calls) == 1  # one-shot -- not one per poll
+    _, title, body = calls[0]
+    assert title == "Brain room stalled: stall-room"
+    assert "stall-room" in body
+
+    async with AsyncSessionLocal() as session:
+        final_room = await session.get(Room, room["id"])
+        assert final_room.stall_notify_sent_at is not None
+
+
+async def test_stall_ping_does_not_fire_before_the_threshold(client, db_session, monkeypatch):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="not-yet-stalled", **_stall_room_kwargs())
+    await _open_room(client, owner_headers, room["id"])
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 200
+
+    # Well under the threshold -- room is quiet, but not for long enough.
+    await _backdate_all_messages(
+        db_session, room["id"], datetime.now(UTC) - timedelta(seconds=rooms_module.STALL_NOTIFY_SECS_MIN - 60)
+    )
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    poll_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert poll_resp.status_code == 200
+    assert calls == []
+
+    async with AsyncSessionLocal() as session:
+        final_room = await session.get(Room, room["id"])
+        assert final_room.stall_notify_sent_at is None
+
+
+async def test_stall_ping_suppressed_while_a_member_is_still_working(client, db_session, monkeypatch):
+    """The room's last MESSAGE is old, but a member's `working_until`
+    lease is still live -- ADR-0020 decision 3's `last_activity_at` counts
+    either member's most recent poll, not just messages, so this must NOT
+    read as stalled.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_a_headers = await _machine_headers(db_session, name="agent-a-machine")
+    machine_b_headers = await _machine_headers(db_session, name="agent-b-machine")
+    await _configure_notifications(client, owner_headers)
+
+    room = await _create_room(
+        client, owner_headers, name="still-working-room", members=["agent-a", "agent-b"], **_stall_room_kwargs()
+    )
+    await _open_room(client, owner_headers, room["id"])
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_a_headers
+    )
+    assert resp.status_code == 200
+    await _backdate_all_messages(
+        db_session, room["id"], datetime.now(UTC) - timedelta(seconds=rooms_module.STALL_NOTIFY_SECS_MIN + 5)
+    )
+    # agent-a polls right now, refreshing its own marker -- this counts as
+    # activity (decision 3: "either member's most recent poll").
+    fresh_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_a_headers,
+    )
+    assert fresh_resp.status_code == 200
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    poll_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_b_headers
+    )
+    assert poll_resp.status_code == 200
+    assert calls == []  # agent-a's fresh poll counts as activity -- not stalled
+
+
+async def test_stall_ping_not_suppressed_by_unrelated_machine_forging_unbound_seat_marker(
+    client, db_session, monkeypatch
+):
+    """INDEPENDENT-REVIEW FIX (ADR-0020 Consequences, "unbound-seat
+    carve-out"): before this fix, `last_activity_at` counted EVERY
+    member's `working_until`, bound or not. An unbound seat's marker can
+    be refreshed by ANY machine naming it (`_maybe_refresh_working_marker`
+    has no narrower credential to check before a seat is claimed) -- and
+    any machine token can already read any room (ADR-0008), so an outsider
+    with zero relationship to this room can discover its id and member
+    names for free. That outsider polling forever, naming the still-open
+    seat, used to hold `last_activity_at` perpetually fresh and
+    permanently suppress the stall ping -- silencing the exact safety net
+    decision 3 exists for. This proves the fix: the forged marker on the
+    UNBOUND seat is genuinely set (the poll is not rejected, and
+    `working_until` really is refreshed -- confirming this isn't a hole
+    that got closed by accident by rejecting the poll outright), but the
+    stall ping still fires anyway, because only a BOUND seat's marker may
+    count toward `last_activity_at`.
+    """
+    owner_headers = await _owner_headers(db_session)
+    outsider_headers = await _machine_headers(db_session, name="outsider-machine")
+    await _configure_notifications(client, owner_headers)
+
+    room = await _create_room(
+        client, owner_headers, name="forged-unbound-marker", members=["agent-a", "agent-b"], **_stall_room_kwargs()
+    )
+    await _open_room(client, owner_headers, room["id"])
+    # Neither seat has been posted-as yet -- both remain unbound.
+    await _backdate_all_messages(
+        db_session, room["id"], datetime.now(UTC) - timedelta(seconds=rooms_module.STALL_NOTIFY_SECS_MIN + 5)
+    )
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    # The outsider names agent-b's (unbound, unrelated-to-it) seat.
+    poll_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-b"},
+        headers=outsider_headers,
+    )
+    assert poll_resp.status_code == 200
+
+    async with AsyncSessionLocal() as session:
+        member_b = await session.scalar(
+            select(RoomMember).where(RoomMember.room_id == room["id"], RoomMember.agent_name == "agent-b")
+        )
+        # The forgery really did land -- this is not a case of the poll
+        # being rejected outright.
+        assert member_b.working_until is not None
+        assert member_b.bound_machine_id is None  # still unbound -- a poll never claims a seat
+
+    # ... yet the stall ping still fired: the forged marker held no sway.
+    assert len(calls) == 1
+    _, title, _ = calls[0]
+    assert title == "Brain room stalled: forged-unbound-marker"
+
+    async with AsyncSessionLocal() as session:
+        final_room = await session.get(Room, room["id"])
+        assert final_room.stall_notify_sent_at is not None
+
+
+async def test_partner_working_still_reflects_an_unbound_seats_forged_marker(client, db_session, monkeypatch):
+    """Explicit statement of the deliberate half of the fix: an unbound
+    seat's marker is EXCLUDED from the stall computation (previous test),
+    but deliberately still drives the purely cosmetic `partner_working`
+    display -- kept because it costs nothing more than a legitimate
+    partner briefly seeing "partner_working: true" from an unrelated
+    machine's poll, a materially smaller and more honest cost than
+    blinding the field for the ordinary case of two agents polling before
+    either has posted (see `_maybe_refresh_working_marker`'s docstring for
+    the "kept deliberately" reasoning).
+    """
+    owner_headers = await _owner_headers(db_session)
+    outsider_headers = await _machine_headers(db_session, name="outsider-machine")
+    agent_a_headers = await _machine_headers(db_session, name="agent-a-machine")
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
+
+    # An unrelated machine forges agent-b's (unbound) marker.
+    forge_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-b"},
+        headers=outsider_headers,
+    )
+    assert forge_resp.status_code == 200
+
+    # agent-a's own poll reads its partner (agent-b) as working -- the
+    # cosmetic display is, deliberately, fooled by the forged marker.
+    resp_a = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=agent_a_headers,
+    )
+    assert resp_a.status_code == 200
+    assert resp_a.json()["partner_working"] is True
+
+
+async def test_stall_ping_distinct_from_park_ping_independent_guards(client, db_session, monkeypatch):
+    """A room can hit the stall threshold without ever touching the park
+    (owner-open) guard, and vice versa -- separate columns, separate
+    triggers, neither suppresses the other (ADR-0020 decision 3's own
+    reasoning for NOT reusing `owner_open_reminder_sent_at`).
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+
+    # Room 1: never opened -- hits the PARK gate only.
+    parked_room = await _create_room(client, owner_headers, name="parked-only")
+
+    # Room 2: opened, real activity, then gone quiet past the threshold --
+    # hits the STALL gate only.
+    stalled_room = await _create_room(client, owner_headers, name="stalled-only", **_stall_room_kwargs())
+    await _open_room(client, owner_headers, stalled_room["id"])
+    resp = await client.post(
+        f"/v1/rooms/{stalled_room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 200
+    await _backdate_all_messages(
+        db_session, stalled_room["id"], datetime.now(UTC) - timedelta(seconds=rooms_module.STALL_NOTIFY_SECS_MIN + 5)
+    )
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    park_resp = await client.get(
+        f"/v1/rooms/{parked_room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert park_resp.status_code == 200
+    stall_resp = await client.get(
+        f"/v1/rooms/{stalled_room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert stall_resp.status_code == 200
+
+    # Both fired -- one park, one stall, neither suppressed by the other.
+    assert len(calls) == 2
+    titles = {c[1] for c in calls}
+    assert "Brain room waiting: parked-only" in titles
+    assert "Brain room stalled: stalled-only" in titles
+
+    async with AsyncSessionLocal() as session:
+        parked_row = await session.get(Room, parked_room["id"])
+        stalled_row = await session.get(Room, stalled_room["id"])
+        assert parked_row.owner_open_reminder_sent_at is not None
+        assert parked_row.stall_notify_sent_at is None  # never opened -- stall path is unreachable for it
+        assert stalled_row.stall_notify_sent_at is not None
+        assert stalled_row.owner_open_reminder_sent_at is None  # opened cleanly -- park path never applied
+
+
+async def test_one_room_hits_both_one_shot_guards_over_its_lifetime(client, db_session, monkeypatch):
+    """The test above proves the two guards don't SHARE state, using two
+    separate rooms -- it does not prove the ADR's actual claim, that a
+    SINGLE room can legitimately pass through both phases of its own
+    lifecycle: parked while unopened, then opened, then later stalled.
+    This test is that lifecycle, on one room, in order: park ping while
+    unopened -> owner opens it -> real activity -> goes quiet past the
+    stall threshold -> stall ping. Both one-shot guard columns end up set
+    on the SAME row, from two DISTINCT notifications, in the order the
+    ADR's decision 3 says they're mutually exclusive in time (never both
+    reachable at once) but not mutually exclusive over the room's life.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+
+    room = await _create_room(
+        client, owner_headers, name="lifecycle-both-guards", members=["agent-a", "agent-b"], **_stall_room_kwargs()
+    )
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    # Phase 1: still unopened -- a poll trips the PARK guard.
+    park_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert park_resp.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][1] == "Brain room waiting: lifecycle-both-guards"
+
+    async with AsyncSessionLocal() as session:
+        mid_room = await session.get(Room, room["id"])
+        assert mid_room.owner_open_reminder_sent_at is not None
+        assert mid_room.stall_notify_sent_at is None  # not reachable yet -- room still unopened
+
+    # Phase 2: the owner opens the room -- real activity begins.
+    await _open_room(client, owner_headers, room["id"])
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 200
+
+    # A poll right now must NOT re-trip the park guard (already set) and
+    # must NOT trip the stall guard (room isn't quiet yet).
+    fresh_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert fresh_resp.status_code == 200
+    assert len(calls) == 1  # unchanged -- neither guard tripped again
+
+    # Phase 3: the room goes quiet past the stall threshold.
+    await _backdate_all_messages(
+        db_session, room["id"], datetime.now(UTC) - timedelta(seconds=rooms_module.STALL_NOTIFY_SECS_MIN + 5)
+    )
+    stall_resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert stall_resp.status_code == 200
+
+    assert len(calls) == 2  # the SAME room, a second, distinct notification
+    titles = [c[1] for c in calls]
+    assert titles == ["Brain room waiting: lifecycle-both-guards", "Brain room stalled: lifecycle-both-guards"]
+
+    async with AsyncSessionLocal() as session:
+        final_room = await session.get(Room, room["id"])
+        assert final_room.owner_open_reminder_sent_at is not None  # still set, from phase 1
+        assert final_room.stall_notify_sent_at is not None  # now also set, from phase 3
+
+
+async def test_stall_ping_race_two_concurrent_triggers_send_exactly_one_ping(client, db_session, monkeypatch):
+    """Same discipline as `test_park_ping_race_two_concurrent_triggers_send_exactly_one_ping`
+    (`_delayed_commit_session` + `asyncio.gather`, monkeypatching
+    `app.rooms.AsyncSessionLocal` to hand out a delayed-commit session to
+    the first caller and a plain one to the second) -- proves the one-shot
+    guard (`Room.stall_notify_sent_at`) holds under GENUINE concurrency,
+    not just sequential calls.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="stall-race", **_stall_room_kwargs())
+    await _open_room(client, owner_headers, room["id"])
+    resp = await client.post(
+        f"/v1/rooms/{room['id']}/messages", json={"sender": "agent-a", "text": "hi"}, headers=machine_headers
+    )
+    assert resp.status_code == 200
+    await _backdate_all_messages(
+        db_session, room["id"], datetime.now(UTC) - timedelta(seconds=rooms_module.STALL_NOTIFY_SECS_MIN + 5)
+    )
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    winner_session = _delayed_commit_session(COMMIT_DELAY)
+    loser_session = AsyncSessionLocal()
+    sessions_in_call_order = [winner_session, loser_session]
+
+    def fake_session_local():
+        return sessions_in_call_order.pop(0)
+
+    monkeypatch.setattr(rooms_module, "AsyncSessionLocal", fake_session_local)
+
+    async def run_first():
+        await rooms_module._maybe_ping_owner_stalled_room(room["id"])
+
+    async def run_second():
+        await asyncio.sleep(HEAD_START)
+        await rooms_module._maybe_ping_owner_stalled_room(room["id"])
+
+    start = time.monotonic()
+    await asyncio.gather(run_first(), run_second())
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= COMMIT_DELAY
+    assert len(calls) == 1
+
+    async with AsyncSessionLocal() as check_session:
+        final_room = await check_session.get(Room, room["id"])
+        assert final_room.stall_notify_sent_at is not None
+
+
+# --- ADR-0020 "free win": the park ping now names the polling agent ---
+
+
+async def test_park_ping_names_the_agent_when_triggered_by_a_poll_with_agent_name(client, db_session, monkeypatch):
+    """Closes ADR-0014's Consequences gap (b): a poll-triggered park
+    notification can now name a genuine, real member of the room, not just
+    say "An agent" -- the exact free win ADR-0020 decision 2 surfaced.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-named-via-poll", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "agent-a"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["open_gate_notice"] is not None
+
+    assert len(calls) == 1
+    _, _, body = calls[0]
+    assert "agent-a" in body
+    assert "an agent" not in body.lower()
+
+
+async def test_park_ping_falls_back_to_an_agent_when_poll_agent_name_is_not_a_member(client, db_session, monkeypatch):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-not-a-member-via-poll", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": "impostor-not-a-real-member"},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 200
+
+    assert len(calls) == 1
+    _, _, body = calls[0]
+    assert "an agent" in body.lower()
+    assert "impostor-not-a-real-member" not in body
+
+
+async def test_park_ping_still_falls_back_to_an_agent_when_poll_omits_agent_name(client, db_session, monkeypatch):
+    """Unchanged pre-ADR-0020 behavior for a caller that doesn't supply
+    `agent_name` at all -- the honest "An agent" fallback still applies.
+    """
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    await _configure_notifications(client, owner_headers)
+    room = await _create_room(client, owner_headers, name="parked-no-agent-name", members=["agent-a", "agent-b"])
+
+    calls = []
+
+    async def fake_send(url, title, body):
+        calls.append((url, title, body))
+
+    monkeypatch.setattr(notify_module, "_send_ntfy", fake_send)
+
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages", params={"since": 0, "wait": 0}, headers=machine_headers
+    )
+    assert resp.status_code == 200
+
+    assert len(calls) == 1
+    _, _, body = calls[0]
+    assert "an agent" in body.lower()
+
+
+# --- ADR-0020 decision 3: create-time stall_notify_secs validation ---
+
+
+async def test_create_room_stall_notify_secs_defaults_to_1200(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers)
+    assert room["stall_notify_secs"] == 1200
+    assert rooms_module.DEFAULT_STALL_NOTIFY_SECS == 1200
+
+
+async def test_create_room_accepts_custom_stall_notify_secs(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(client, owner_headers, stall_notify_secs=600)
+    assert room["stall_notify_secs"] == 600
+
+    detail_resp = await client.get(f"/v1/rooms/{room['id']}", headers=owner_headers)
+    assert detail_resp.json()["stall_notify_secs"] == 600
+
+
+async def test_create_room_rejects_out_of_range_stall_notify_secs(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    room = await _create_room(
+        client, owner_headers, stall_notify_secs=rooms_module.STALL_NOTIFY_SECS_MIN - 1, expect_status=422
+    )
+    assert room["error"]["code"] == "invalid_stall_notify_secs"
+
+
+# --- ADR-0020 decision 2/ADR-0008: agent_name query param bounded like sender ---
+
+
+async def test_poll_agent_name_over_max_length_is_rejected_422(client, db_session):
+    owner_headers = await _owner_headers(db_session)
+    machine_headers = await _machine_headers(db_session)
+    room = await _create_room(client, owner_headers, members=["agent-a", "agent-b"])
+    await _open_room(client, owner_headers, room["id"])
+
+    overlong = "a" * 300
+    resp = await client.get(
+        f"/v1/rooms/{room['id']}/messages",
+        params={"since": 0, "wait": 0, "agent_name": overlong},
+        headers=machine_headers,
+    )
+    assert resp.status_code == 422

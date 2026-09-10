@@ -326,6 +326,7 @@ def _join_prompts_by_member(
             consensus_floor=room.consensus_floor,
             project=room.project,
             group_name=room.group_name,
+            stall_notify_secs=room.stall_notify_secs,
         )
         for agent_name in members
     }
@@ -664,7 +665,12 @@ async def room_messages_json(
     _session: dict = Depends(require_ui_session),
 ) -> JSONResponse:
     try:
-        room, messages, _open_gate_notice = await poll_messages_op(room_id, since, SHORT_POLL_WAIT)
+        # ADR-0020: the owner's browser is never a room member (no
+        # `agent_name`) and this cookie session has no `Principal` (owner
+        # UI, not a machine/owner bearer token) -- both new poll
+        # parameters are left at their default-off values, same as every
+        # pre-ADR-0020 caller.
+        room, messages, _open_gate_notice, _partner_working = await poll_messages_op(room_id, since, SHORT_POLL_WAIT)
     except ApiError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     return JSONResponse(

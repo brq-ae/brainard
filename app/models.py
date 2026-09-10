@@ -623,6 +623,22 @@ class Room(Base):
     # exists to change it mid-room, same posture `topic`/`mode` have outside
     # `switch_room_mode`'s deliberate exception.
     project: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    # ADR-0020 decision 3: how long (seconds) a room may sit with no new
+    # message AND no member showing a live `working_until` lease
+    # (RoomMember, below) before the server fires a best-effort, one-shot
+    # owner ntfy ping (app/rooms.py's `_maybe_ping_owner_stalled_room`).
+    # Owner-settable, bounds-checked, per-room, same "judgment call that
+    # reasonably differs per room" posture `consensus_floor` above already
+    # has -- not-null, default 1200 (20 minutes,
+    # `app.rooms.DEFAULT_STALL_NOTIFY_SECS`). `stall_notify_sent_at` is the
+    # one-shot guard, same nullable-timestamp shape as
+    # `owner_open_reminder_sent_at` above -- DELIBERATELY its own column,
+    # not a reuse of that one: the two guard different, mutually-exclusive-
+    # in-practice owner-facing events (ADR-0014's "room never opened" vs.
+    # this ADR's "room went quiet after opening") and reusing one column for
+    # both would let either silently suppress the other.
+    stall_notify_secs: Mapped[int] = mapped_column(Integer, nullable=False, default=1200)
+    stall_notify_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN ('open', 'closed')", name="ck_rooms_status"),
@@ -672,6 +688,34 @@ class RoomMember(Base):
     bound_machine_id: Mapped[str | None] = mapped_column(
         String(26), ForeignKey("machines.id"), nullable=True, index=True
     )
+    # ADR-0020 decision 2: this seat's "working" lease -- a forward-looking
+    # EXPIRY timestamp, not a boolean flag (a flag would need an explicit
+    # clear a crashed/killed agent never gets to perform, leaving a
+    # false-positive "still working" forever; an expiry needs no separate
+    # sweep -- a member is working exactly when `working_until is not None
+    # and working_until > now()`, the same the-value-itself-expires shape
+    # `Room.expires_at` already uses, just per-member). Refreshed to
+    # `now() + WORKING_LEASE_SECS` (app/rooms.py) as a SIDE EFFECT of that
+    # member polling with a matching `agent_name` -- never set by posting a
+    # message, and never set by anything other than the member's own poll
+    # (see `app/rooms.py`'s `_maybe_refresh_working_marker`: keyed on the
+    # AUTHENTICATED `principal`, same posture `bound_machine_id`'s own
+    # `check_and_bind_seat` already uses). Precise carve-out (see
+    # `_maybe_refresh_working_marker`'s own docstring at
+    # app/rooms.py:2072-2084 for the full reasoning): once this seat IS
+    # bound, only ITS bound machine can ever refresh this column -- a
+    # different machine naming it is a silent no-op. Before it's bound
+    # (`bound_machine_id IS NULL`), there is no narrower credential to
+    # check yet, so ANY machine naming this seat's `agent_name` can refresh
+    # it -- identical to that seat's write-side claim-on-first-write
+    # posture (ADR-0018 decision 3). This is why the stall-notification
+    # computation (`app/rooms.py`'s `_last_activity_at`) only trusts a
+    # BOUND seat's marker: an unbound seat's marker has no caller identity
+    # narrow enough to rule out an unrelated token holding off that alarm.
+    # NULL means "never polled with `agent_name` since this column
+    # existed" -- the correct, no-backfill-needed state for every seat
+    # that predates this column.
+    working_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (Index("ix_room_members_room_agent", "room_id", "agent_name", unique=True),)
 

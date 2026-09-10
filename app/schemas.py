@@ -613,6 +613,12 @@ class RoomCreateRequest(BaseModel):
     # app/rooms.py's `_validate_seat_assignments` (machine must exist and
     # be `status == 'active'`).
     seats: dict[str, str] | None = None
+    # ADR-0020 decision 3: how long (seconds) this room may sit with no new
+    # message and no member showing a live working lease before the server
+    # pings the owner. None -> the domain's own DEFAULT_STALL_NOTIFY_SECS
+    # (1200 -- 20 minutes). Bounds-checked in app/rooms.py's
+    # `_validate_stall_notify_secs`, same shape as `consensus_floor` above.
+    stall_notify_secs: int | None = None
 
 
 class RoomCreateResponse(BaseModel):
@@ -636,6 +642,9 @@ class RoomCreateResponse(BaseModel):
     # ADR-0018 decision 3: {agent_name: bound_machine_id} as resolved at
     # creation -- null for a member left unassigned (open, claim-on-first-write).
     seats: dict[str, str | None]
+    # ADR-0020 decision 3: the resolved (default-applied) stall-notify
+    # threshold.
+    stall_notify_secs: int
 
 
 class RoomListItem(BaseModel):
@@ -656,6 +665,8 @@ class RoomListItem(BaseModel):
     consensus_floor: int
     # ADR-0018 decision 12: see RoomCreateRequest.project.
     project: str | None
+    # ADR-0020 decision 3: see RoomCreateResponse.stall_notify_secs.
+    stall_notify_secs: int
 
 
 class RoomListResponse(BaseModel):
@@ -711,6 +722,8 @@ class RoomDetailResponse(BaseModel):
     # ADR-0018 decision 3: {agent_name: bound_machine_id} -- null for an
     # open (unassigned, unclaimed) seat, same shape as RoomCreateResponse.seats.
     seats: dict[str, str | None]
+    # ADR-0020 decision 3: see RoomCreateResponse.stall_notify_secs.
+    stall_notify_secs: int
     # Most recent N messages, oldest first (chat reading order).
     messages: list[RoomMessageOut]
 
@@ -776,6 +789,15 @@ class RoomMessagesPollResponse(BaseModel):
     # every other case, including once the room opens (normal long-polling
     # resumes unchanged).
     open_gate_notice: str | None = None
+    # ADR-0020 decision 2: true when the OTHER member of this room (never
+    # the caller's own `agent_name`) currently has a live `working_until`
+    # lease -- "polled recently enough to plausibly still be active," not a
+    # guarantee. When `agent_name` was omitted or doesn't identify a real
+    # member (an observer, or an old client), this degrades to "is ANY
+    # member currently working" -- there is no distinguished caller to
+    # exclude. Always present (never null): false is itself meaningful
+    # ("no partner, or no live lease"), not a missing-data marker.
+    partner_working: bool = False
 
 
 # --- Mid-session mode switch (ADR-0009) ---

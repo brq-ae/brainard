@@ -1,5 +1,7 @@
-"""Best-effort owner notification on room close (ADR-0006 decisions 5-6), and
-on an agent parking against the owner-open gate (ADR-0014 decision 8).
+"""Best-effort owner notification on room close (ADR-0006 decisions 5-6), on
+an agent parking against the owner-open gate (ADR-0014 decision 8), and on a
+room going quiet for a sustained stretch after it opened (ADR-0020
+decision 3).
 
 Reads the CURRENT notification_config (app/notifications.py's
 `current_config` -- the owner-managed ntfy channel, same one bootstrap's
@@ -154,6 +156,47 @@ async def notify_owner_open_pending(db: AsyncSession, room: Room, agent_name: st
         logger.exception(
             "best-effort owner-open-pending notification failed for room %s ('%s') -- request still handled "
             "normally",
+            room.id,
+            room.name,
+        )
+
+
+async def notify_room_stalled(db: AsyncSession, room: Room) -> None:
+    """ADR-0020 decision 3: best-effort ntfy ping fired when a room has gone
+    quiet -- no new message, no member with a live working lease -- for
+    longer than `room.stall_notify_secs`. Same "read current_config, POST
+    to it, swallow every failure" shape as `notify_room_closed`/
+    `notify_owner_open_pending` above -- only the trigger and message
+    differ. The one-shot guard (`Room.stall_notify_sent_at`) is the
+    CALLER's responsibility (app/rooms.py's `_maybe_ping_owner_stalled_room`,
+    which sets it under the room's row lock before ever calling this) --
+    this function only sends, unconditionally, same division of labor the
+    other two notify functions here already have with their own callers.
+
+    Unlike `notify_owner_open_pending`, this never carries an untrusted,
+    client-supplied name to sanitise -- the message names only the room
+    (owner-authored `room.name`, already rendered elsewhere in this module
+    without sanitisation, e.g. `notify_room_closed`'s own title/body).
+    """
+    try:
+        config = await current_config(db)
+        if config is None:
+            logger.info(
+                "room %s ('%s') has gone quiet -- no notification channel configured, skipping ping",
+                room.id,
+                room.name,
+            )
+            return
+        url = f"{config.ntfy_url}/{config.topic}"
+        title = f"Brain room stalled: {room.name}"
+        minutes = max(1, room.stall_notify_secs // 60)
+        body = f"Room '{room.name}' has had no new message and no active participant for about {minutes} minute(s)."
+        await _send_ntfy(url, title, body)
+    except Exception:
+        # Best-effort: same posture as the other two notify functions above
+        # -- must never turn a room's real poll response into a 500.
+        logger.exception(
+            "best-effort stall notification failed for room %s ('%s') -- request still handled normally",
             room.id,
             room.name,
         )
