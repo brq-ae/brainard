@@ -120,8 +120,8 @@ _MODES_BLOCK = "\n".join(_describe_mode(key) for key in ROOM_MODES)
 _VALID_MODE_NAMES = ", ".join(f'"{key}"' for key in ROOM_MODES)
 
 ROOM_SETUP_BRIEFING = f"""You are helping me prepare the configuration for a "room" in a private tool I run \
-called Brainard. Nothing about Brainard, or what we've been discussing, needs to leave this conversation -- \
-you don't have access to it and never will. I just need this one thing translated into a fixed format.
+called Brainard. You don't need any access to it for this -- I just need this one thing translated into a \
+fixed format.
 
 A room is a structured, bounded chat session between two AI agents I already have set up, working through a \
 topic, shaped by a "mode" that determines how they relate to each other.
