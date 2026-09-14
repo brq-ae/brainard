@@ -114,7 +114,20 @@
 
     var meta = document.createElement("span");
     meta.className = "meta";
-    meta.textContent = m.created_at;
+    // Local-timezone display (display-only; m.created_at itself is the
+    // untouched UTC ISO instant the poll API returns -- see
+    // app/static/localtime.js's module docstring). Same <time datetime=...>
+    // element + conversion the server-rendered transcript rows use (see
+    // app/templates_env.py's human_ts filter), so a message that just
+    // arrived reads in the same local time as one rendered when the page
+    // loaded -- never a transcript mixing local and raw-UTC rows.
+    var timeEl = document.createElement("time");
+    timeEl.setAttribute("datetime", m.created_at);
+    timeEl.textContent = m.created_at; // textContent -- inert even if hostile; overwritten below when available
+    if (window.BrainTime && window.BrainTime.convertOne) {
+      window.BrainTime.convertOne(timeEl);
+    }
+    meta.appendChild(timeEl);
 
     li.appendChild(main);
     li.appendChild(meta);

@@ -31,14 +31,31 @@ def _md_filter(text: str | None) -> Markup:
     return Markup(render_markdown(text or ""))
 
 
-def _human_ts_filter(value: datetime | None) -> str:
-    """Human-readable UTC timestamp, e.g. '2026-08-06 14:32 UTC'. Every
-    stored timestamp is already timezone-aware UTC; this only formats it."""
+def _human_ts_filter(value: datetime | None) -> Markup:
+    """Human-readable UTC timestamp, wrapped for client-side local-timezone
+    display. Storage/API/agent-facing output is completely untouched by
+    this -- this filter only ever affects the owner-facing HTML the browser
+    renders.
+
+    Emits e.g. '<time datetime="2026-08-06T14:32:00+00:00" data-local-ts>2026-08-06 14:32 UTC</time>'.
+    The `datetime` attribute carries the exact UTC instant in ISO-8601 --
+    the machine-readable value app/static/localtime.js reads to convert the
+    element's visible text to the viewer's own timezone on page load (and,
+    for room transcript rows appended live by app/static/rooms.js, on
+    arrival too). The element's own text is the *same* human-readable UTC
+    string this filter has always produced -- with JS disabled, or before
+    localtime.js runs, the owner sees exactly today's rendering, never a
+    blank element or a raw ISO string. `data-local-ts` is the marker
+    localtime.js's querySelectorAll looks for.
+    """
     if value is None:
-        return "—"
+        return Markup("—")
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    value = value.astimezone(UTC)
+    iso = value.isoformat()
+    text = value.strftime("%Y-%m-%d %H:%M UTC")
+    return Markup('<time datetime="{}" data-local-ts>{}</time>').format(iso, text)
 
 
 templates.env.filters["md"] = _md_filter
