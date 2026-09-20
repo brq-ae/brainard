@@ -1566,7 +1566,7 @@ def test_room_view_copy_button_labels_append_bound_machine_name():
     # for the display name (see the revoked-machine tests just below for
     # the case where the two disagree).
     bound_machine_ids = {"Commander": "active-machine-id", "builder": None}
-    bound_machine_names = {"Commander": "Rankati - Commander LXC109 - Capital NUC"}
+    bound_machine_names = {"Commander": "Meridian - Commander LXC204 - Home NUC"}
 
     html_out = _render_room_view(
         room=room,
@@ -1578,7 +1578,7 @@ def test_room_view_copy_button_labels_append_bound_machine_name():
         bound_machine_names=bound_machine_names,
     )
 
-    assert "Copy join prompt — Commander (Rankati - Commander LXC109 - Capital NUC)" in html_out
+    assert "Copy join prompt — Commander (Meridian - Commander LXC204 - Home NUC)" in html_out
     # `builder`'s seat is unbound -- no parenthetical.
     assert "Copy join prompt — builder</button>" in html_out
 
@@ -1629,7 +1629,7 @@ def test_room_view_seats_panel_bound_active_shows_machine_name():
     sides = {"Commander": None, "builder": None}
     join_prompts = {m: f"JOIN PROMPT FOR {m}" for m in members}
     bound_machine_ids = {"Commander": "active-machine-id", "builder": None}
-    bound_machine_names = {"Commander": "Rankati - Commander LXC109 - Capital NUC"}
+    bound_machine_names = {"Commander": "Meridian - Commander LXC204 - Home NUC"}
 
     html_out = _render_room_view(
         room=room,
@@ -1641,7 +1641,7 @@ def test_room_view_seats_panel_bound_active_shows_machine_name():
         bound_machine_names=bound_machine_names,
     )
 
-    assert "bound to Rankati - Commander LXC109 - Capital NUC" in html_out
+    assert "bound to Meridian - Commander LXC204 - Home NUC" in html_out
 
 
 def test_room_view_seats_panel_bound_revoked_shows_needs_attention_not_open():

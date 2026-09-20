@@ -1,7 +1,7 @@
 [project]
 name = "brainard"
-version = "1.0.0"
-description = "The Brain -- knowledge hub API (Phase 1: Foundations)"
+version = "1.1.0"
+description = "The Brain -- self-hosted knowledge hub and coordination API for AI agent fleets, with live agent-to-agent chat rooms"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115,<1.0",

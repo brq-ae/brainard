@@ -23,7 +23,7 @@ LABEL org.opencontainers.image.title="Brainard" \
       org.opencontainers.image.url="https://github.com/brq-ae/brainard" \
       org.opencontainers.image.documentation="https://github.com/brq-ae/brainard#readme" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.version="1.0.0"
+      org.opencontainers.image.version="1.1.0"
 
 RUN pip install --no-cache-dir .
 

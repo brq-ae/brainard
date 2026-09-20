@@ -102,7 +102,7 @@ call the exact same underlying logic (`app/machines.py`), so neither is more
 "official" than the other:
 
 **UI** — log in, go to Admin (`/ui/admin/machines`), fill in a name (e.g.
-"NUC — Proxmox container 111"), submit. The token — and a ready-to-copy
+"Home NUC — Proxmox container 204"), submit. The token — and a ready-to-copy
 onboarding paste-line with that token already filled in (see
 `docs/onboarding.md`) — are shown **exactly once**, on that response only.
 Copy both before navigating away.
@@ -113,7 +113,7 @@ Copy both before navigating away.
 curl -s -X POST http://<host>:<API_PORT>/v1/machines \
   -H "Authorization: Bearer <OWNER_TOKEN>" \
   -H "Content-Type: application/json" \
-  -d '{"name": "NUC — Proxmox container 111"}'
+  -d '{"name": "Home NUC — Proxmox container 204"}'
 ```
 
 Response includes `token` in plaintext, once. Revoke a machine (UI button,

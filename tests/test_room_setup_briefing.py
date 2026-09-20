@@ -41,18 +41,18 @@ from app.rooms import (
 
 JS_DIR = Path(__file__).resolve().parent.parent / "app" / "static"
 
-# Real fleet-identifying strings actually present in this codebase's OWN
-# fixtures/docstrings (not hypothetical examples): app/machines.py's
-# docstring and tests/test_room_seats.py both cite the live deployment's
-# own 'Rankati - Commander LXC109 - Capital NUC' machine name verbatim
-# (mirroring a real, previously-revoked+re-minted machine); "bernard-ai" is
-# used throughout tests/test_room_seats.py and tests/test_onboarding.py as
-# this deployment's own real project name (this repo's own name). If the
+# Fleet-shaped strings this codebase's OWN fixtures/docstrings actually use
+# (not hypothetical examples): app/machines.py's docstring and
+# tests/test_room_seats.py both cite the same realistic 'Meridian -
+# Commander LXC204 - Home NUC' machine name verbatim (mirroring a
+# revoked+re-minted machine); "bernard-ai" is used throughout
+# tests/test_room_seats.py and tests/test_onboarding.py as this
+# deployment's own real project name (this repo's own name). If the
 # briefing ever regresses to the original, rejected, fleet-data-driven
 # design (ADR-0019's "Alternatives Considered"), one of these would appear.
-_REAL_MACHINE_NAME = "Rankati - Commander LXC109 - Capital NUC"
+_REAL_MACHINE_NAME = "Meridian - Commander LXC204 - Home NUC"
 _REAL_PROJECT_NAME = "bernard-ai"
-_REAL_MACHINE_SUBSTRINGS = ["Rankati", "LXC109", "Capital NUC"]
+_REAL_MACHINE_SUBSTRINGS = ["Meridian", "LXC204", "Home NUC"]
 
 
 # --- decision 2: zero fleet data ---

@@ -34,8 +34,9 @@ async def list_active_machines(db: AsyncSession) -> list[Machine]:
     `status == 'active'` here, before rendering, is also what keeps the
     dropdown unambiguous when a revoked and an active machine happen to
     share the same display name (a re-minted replacement for the same
-    agent, e.g. this deployment's own 'Rankati - Commander LXC109 - Capital
-    NUC') -- the revoked duplicate is simply never listed.
+    agent, e.g. a machine name like 'Meridian - Commander LXC204 - Home
+    NUC' reused after a token rotation) -- the revoked duplicate is simply
+    never listed.
     """
     result = await db.scalars(select(Machine).where(Machine.status == "active").order_by(Machine.name))
     return list(result)

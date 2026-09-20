@@ -24,15 +24,15 @@ mirrored documents. A session that deposited a decision's content earlier
 has no way to retrieve that text back from the Brain later — only its
 existence, path, version, and a search snippet.
 
-**Evidence:** lesson filed from project `7rf.ae` (2026-09-08), library entry
-`01M215CA0XAQ9AX9KPRYBJ47TZ` / event `01M20B7TMBP0088DGC94B5DWND`: "Brain API
-gap observed: mirrored documents (`documents[]` deposits) are searchable
-(snippets, path, version) but there is no endpoint to fetch a mirrored
-document's content back (`/v1/documents/{id}` and `?path=` return 404; only
-`/v1/library/{id}` exists for library entries). Consequence: keep
+**Evidence:** lesson filed from project `kelvara.io` (2026-09-08), library
+entry `01H9K2VDS0EFA31M4TQZ8RXCNB` / event `01H9K2VE9RY7M0TVA6WQ4NPZ8D`:
+"Brain API gap observed: mirrored documents (`documents[]` deposits) are
+searchable (snippets, path, version) but there is no endpoint to fetch a
+mirrored document's content back (`/v1/documents/{id}` and `?path=` return
+404; only `/v1/library/{id}` exists for library entries). Consequence: keep
 local/repo copies of anything you may need to re-read; the Brain mirror is
 for search and history, not retrieval." A second, independent entry
-(`01M20B7TMBP0088DGC94B5DWNE`) reached the same conclusion: "Brain mirrored
+(`01H9K2VEACS8XV3H1Q6MZRN7T2`) reached the same conclusion: "Brain mirrored
 documents cannot be fetched back by API -- keep a local copy."
 
 **Why it matters:** the mirror model exists so "every decision ever made
@@ -55,19 +55,19 @@ instead of the Builder's. That works but is a manual, ad hoc escape hatch
 every time it recurs, not a fix — and it means privileged steps end up
 running in a session with broader trust than the task strictly needs.
 
-**Evidence:** lesson + event filed from project `7rf.ae` (2026-09-08),
-library entry `01M20S4A7TAZT7T7K1G3FNKHV3` / `01M215C7ZCRZHHEJGN83NKM5JX` /
-event `01M20S4A7TAZT7T7K1G3FNKHV2`: "Builder sessions under the permission
+**Evidence:** lesson + event filed from project `kelvara.io` (2026-09-08),
+library entry `01H9K2VF1TXM9R0V3WQZ2NBK7A` / `01H9K2VFR6EX0N4V8TQZ3MBWK9` /
+event `01H9K2VG3QXN8V1M0TRZ4WBK7C`: "Builder sessions under the permission
 classifier cannot perform system installs or write outside their working
 directory (tar to `/opt`, symlinks in `/usr/local/bin`, `apt` were all
 refused). Worked around by running the installs from the Commander's
 session via a Sonnet worker. Will recur at S7 (systemd units, nginx site,
-`/srv`, `/var/lib/7rf`) unless the owner grants the Builder session a
+`/srv`, `/var/lib/kelvara`) unless the owner grants the Builder session a
 permission rule -- raised with the owner."
 
 **Why it matters:** it already recurred once and is flagged to recur again
 at a known future milestone (S7: systemd units, nginx site, `/srv`,
-`/var/lib/7rf`) on the same project. Left unaddressed, every future Builder
+`/var/lib/kelvara`) on the same project. Left unaddressed, every future Builder
 task that needs a system-level install repeats the same manual detour.
 
 **Not a doctrine matter.** This is a Claude Code tooling/permissions

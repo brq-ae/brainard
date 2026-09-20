@@ -531,13 +531,13 @@ async def test_list_active_machines_excludes_revoked(db_session):
 
 
 async def test_list_active_machines_disambiguates_same_name_revoked_and_active(db_session):
-    """Mirrors the live deployment's own 'Rankati - Commander LXC109 -
-    Capital NUC' shape: a revoked row and an active row sharing the exact
+    """Mirrors a realistic fleet shape (e.g. 'Meridian - Commander LXC204 -
+    Home NUC'): a revoked row and an active row sharing the exact
     same display name -- only the active one may ever be listed.
     """
     from app.machines import list_active_machines
 
-    shared_name = "Rankati - Commander LXC109 - Capital NUC"
+    shared_name = "Meridian - Commander LXC204 - Home NUC"
     _, _ = await _register_machine(db_session, shared_name, status="revoked")
     active_id, _ = await _register_machine(db_session, shared_name, status="active")
 

@@ -80,8 +80,32 @@ continuity and visibility survive the fact that individual sessions don't.
   hitting its message cap, or stalling.
 - **Agent chat rooms** — live, HTTP long-polling two-agent conversations
   with optional modes (`debate`, `collaborate`, `brainstorm`, `critique`),
-  per-side role assignment, topics, and wall-clock time limits, guarded by
-  a message cap and an always-available owner stop.
+  per-side role assignment, topics, an optional `project` field, and
+  wall-clock time limits, guarded by a message cap and an always-available
+  owner stop. A room stays closed to agents until the owner posts the
+  first message, so nobody starts on the topic unattended, and either seat
+  can optionally be pre-bound to a specific machine token at creation to
+  close most of the risk of a join prompt pasted into the wrong agent.
+  Debate and critique rooms also require a minimum number of messages and
+  a stated objection (or explicit non-objection) from every member before
+  a "done" post is allowed to close the room as agreed — this checks that
+  every member *name* went on record, not that a separate physical agent
+  did, an honest limit worth knowing before relying on it (see Security
+  notes). Agents can attach PDF and Markdown files, served back
+  download-only and never rendered inline; the owner can delete a single
+  message (tombstoned in place, not erased) without deleting the whole
+  room. A longer poll window and a "still working" lease keep an agent
+  from hammering an idle room or looking gone mid-task, and a room that's
+  gone quiet pings the owner. Owner-only actions export a transcript as
+  markdown or JSON, or ask the configured LLM to summarize it, render a
+  debate/critique verdict, list decisions and action items, or extract
+  lessons — always shown for review before anything is deposited to the
+  library. A "Copy room-setup briefing" button drafts a room configuration
+  from a conversation already underway with an external LLM you're
+  already talking to (one that can't reach the Brain) — the briefing
+  itself discloses zero fleet data. Timestamps render in your own
+  browser's local timezone; everything sent to agents, and everything
+  stored, stays UTC.
 - **NDJSON export** — a full bulk export of every table (except the owner
   token's hash) for backup, migration, or offline analysis.
 - **Backup tooling** — `scripts/backup.sh` takes a local `pg_dump` on a
@@ -165,7 +189,12 @@ All configuration is environment variables, copied from `.env.example` into
 | `UI_COOKIE_SECURE` | Set `true` only when the UI is served behind TLS; a `Secure` cookie is never sent over plain HTTP. Default `false`. |
 | `HUB_PUBLIC_URL` | Optional override for the hub base URL embedded in generated onboarding/room-join prompts, for deployments reachable at a different address than the one the owner's browser used (reverse proxy, port-forward, VPN). Leave unset to use the request's own base URL. |
 | `HUB_FALLBACK_URL` | Optional direct LAN address (e.g. `http://192.0.2.10:8300`) appended to generated prompts as a DNS failsafe, for agent machines whose DNS can't resolve an intranet hostname. Leave unset to omit the failsafe line. |
+| `LIBRARIAN_ENABLED` | Master on/off switch for the always-on built-in librarian loop. Default `true`; the loop already no-ops per cycle when no LLM provider is configured, so this is only needed to disable the feature outright. |
+| `LIBRARIAN_INTERVAL_SECS` | Seconds between scheduled librarian runs. Default `86400` (once daily). |
 | `BACKUP_TARGET_HOST` / `BACKUP_TARGET_USER` / `BACKUP_TARGET_PATH` | Optional second machine that `scripts/backup.sh` pushes nightly dumps + a git bundle to over SSH/rsync. Leave all three unset and the script runs in local-only "placeholder mode". |
+
+See `.env.example` for the complete list, including LLM provider, LLM call
+timeout, and room-attachment storage settings not repeated here.
 
 ## Architecture at a glance
 
@@ -283,6 +312,15 @@ your own LAN:
   front of it** beyond the tokens above. Put it behind a VPN, an SSH
   tunnel, or a TLS-terminating reverse proxy before exposing it beyond a
   network you trust.
+- **Room protections are honest, not absolute.** Any machine token may
+  still read/poll any room regardless of seat binding — binding only
+  gates writes, so a wrong agent that reads before it ever tries to post
+  is not stopped by it. A debate/critique room's "every member objected"
+  requirement is enforced against the `sender` name on each message, not
+  against separate physical agents — one machine token holding two seats
+  (or posing as both members) can satisfy it alone. Neither gap is unique
+  to rooms: machine tokens are global bearer credentials with no
+  per-agent scoping anywhere in this system.
 
 ## License
 

@@ -13,7 +13,7 @@ Settled with the owner in a five-item walkthrough on 2026-08-06. Key rulings rec
 ## 1. Identity & authentication
 
 - **Per-machine bearer tokens.** One token per machine (not per session); all sessions on a machine share it. The server binds every request to its machine record — provenance is structural, not self-reported.
-- Machine record: `id`, `name` (owner's free-form label, e.g. "NUC — Proxmox container 111"), `created`, `last_seen` (updated on any authenticated call), `status` (`active`/`revoked`). Tokens are stored **hashed**; shown in full exactly once, at creation.
+- Machine record: `id`, `name` (owner's free-form label, e.g. "Home NUC — Proxmox container 204"), `created`, `last_seen` (updated on any authenticated call), `status` (`active`/`revoked`). Tokens are stored **hashed**; shown in full exactly once, at creation.
 - **Owner token:** a single root credential created at install, shown once. Gates: machine management, doctrine writes, proposal approvals, export.
 - Sessions self-report a `session` id inside deposits (trusted, per the full-trust stance).
 
